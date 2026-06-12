@@ -1,0 +1,83 @@
+# AlphaZero Chess Engine Configuration
+
+# --- Network Architecture ---
+network:
+  num_residual_blocks: 4
+  num_filters: 64
+  num_policy_channels: 32
+  num_value_channels: 16
+  value_fc_size: 256
+
+# --- MCTS ---
+mcts:
+  num_simulations: 200        # Per move (tunable: 50-800)
+  c_puct: 1.5                 # PUCT exploration constant
+  dirichlet_alpha: 0.3        # Dirichlet noise alpha
+  dirichlet_epsilon: 0.25     # Weight of noise vs prior
+
+# --- Self-Play ---
+selfplay:
+  network_source: latest      # "latest" (always use newest network) or "gated_best"
+  max_game_length: 150        # Max half-moves before adjudication
+  adjudicate_material: true   # When max length hit, judge by material instead of draw
+  # Material values for adjudication
+  piece_values:
+    P: 1
+    N: 3
+    B: 3
+    R: 5
+    Q: 9
+  temperature_threshold: 30   # Move number to switch from high to low temperature
+  temperature_high: 1.0
+  temperature_low: 0.1
+
+# --- Replay Buffer ---
+buffer:
+  max_size: 100000            # Max positions in replay buffer
+
+# --- Training ---
+training:
+  batch_size: 256
+  learning_rate: 0.001
+  momentum: 0.9
+  weight_decay: 1e-4
+  num_batches_per_step: 10    # Training steps between self-play batches
+  checkpoint_interval: 50     # Save checkpoint every N training steps
+  training_steps_per_iteration: 5  # Training steps per outer loop iteration
+
+# --- Evaluation ---
+evaluation:
+  eval_interval: 50           # Run eval every N self-play games
+  gate_games: 20              # Games for network-vs-network gating
+  gate_win_threshold: 0.55    # Win rate needed to promote
+  ref_opponent_games: 20      # Games vs alpha-beta reference
+  elo_k_factor: 32            # Elo K-factor
+
+# --- Alpha-Beta Reference Opponent ---
+alpha_beta:
+  depth: 2
+  # Piece values for evaluation
+  piece_values:
+    P: 1
+    N: 3
+    B: 3
+    R: 5
+    Q: 9
+  # Positional bonuses (optional, simple)
+  checkmate_score: 10000
+
+# --- Statistics ---
+stats:
+  db_path: "stats.db"
+  log_interval: 1             # Log stats every N self-play games
+
+# --- GUI ---
+gui:
+  host: "127.0.0.1"
+  port: 5000
+  refresh_interval: 1.0       # Seconds between live updates
+
+# --- Main ---
+main:
+  run_name: "default"         # Name for this run (affects output directories)
+  output_dir: "output"

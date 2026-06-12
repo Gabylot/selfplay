@@ -1,0 +1,221 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AlphaZero Chess Engine — Dashboard</title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body { font-family: 'Segoe UI', Arial, sans-serif; background: #1a1a2e; color: #e0e0e0; }
+        .header { background: #16213e; padding: 16px 24px; border-bottom: 2px solid #0f3460; }
+        .header h1 { font-size: 22px; color: #e94560; }
+        .header .sub { font-size: 13px; color: #888; margin-top: 4px; }
+        .container { max-width: 1400px; margin: 0 auto; padding: 16px; }
+        .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-bottom: 16px; }
+        .card { background: #16213e; border-radius: 8px; padding: 16px; border: 1px solid #0f3460; }
+        .card h2 { font-size: 15px; color: #e94560; margin-bottom: 12px; text-transform: uppercase; letter-spacing: 1px; }
+        .stats-row { display: flex; gap: 16px; flex-wrap: wrap; margin-bottom: 16px; }
+        .stat-box { background: #0f3460; border-radius: 6px; padding: 12px 16px; flex: 1; min-width: 120px; text-align: center; }
+        .stat-box .label { font-size: 11px; color: #888; text-transform: uppercase; letter-spacing: 1px; }
+        .stat-box .value { font-size: 24px; font-weight: bold; color: #e94560; margin-top: 4px; }
+        .stat-box .value.blue { color: #53a0ff; }
+        .stat-box .value.green { color: #47d147; }
+        .stat-box .value.orange { color: #ff9500; }
+        .stat-box .value.purple { color: #b57bff; }
+        .chart-container { position: relative; height: 300px; }
+        .status-bar { background: #0f3460; padding: 8px 16px; border-radius: 6px; margin-bottom: 16px; display: flex; justify-content: space-between; align-items: center; font-size: 12px; }
+        .status-bar .dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; margin-right: 6px; }
+        .status-bar .dot.green { background: #47d147; }
+        .status-bar .dot.red { background: #e94560; }
+        table { width: 100%; border-collapse: collapse; font-size: 12px; }
+        th, td { padding: 6px 10px; text-align: left; border-bottom: 1px solid #0f3460; }
+        th { color: #e94560; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px; font-size: 11px; }
+        tr:hover { background: #0f3460; }
+        .outcome-bar { display: flex; height: 8px; border-radius: 4px; overflow: hidden; margin-top: 4px; }
+        .outcome-bar .white { background: #53a0ff; }
+        .outcome-bar .draw { background: #888; }
+        .outcome-bar .black { background: #e94560; }
+        @media (max-width: 900px) { .grid { grid-template-columns: 1fr; } }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>AlphaZero Chess Engine</h1>
+        <div class="sub">Self-play training dashboard &mdash; auto-refreshing every 2s</div>
+    </div>
+    <div class="container">
+        <div class="status-bar">
+            <div><span class="dot green" id="status-dot"></span><span id="status-text">Connecting...</span></div>
+            <div>Step: <strong id="stat-step">0</strong> | Games: <strong id="stat-games">0</strong> | Buffer: <strong id="stat-buffer">0</strong></div>
+        </div>
+        <div class="stats-row">
+            <div class="stat-box"><div class="label">Total Games</div><div class="value" id="sum-games">0</div></div>
+            <div class="stat-box"><div class="label">White Wins</div><div class="value blue" id="sum-white">0</div></div>
+            <div class="stat-box"><div class="label">Black Wins</div><div class="value orange" id="sum-black">0</div></div>
+            <div class="stat-box"><div class="label">Draws</div><div class="value" id="sum-draws" style="color:#888">0</div></div>
+            <div class="stat-box"><div class="label">Current Elo</div><div class="value green" id="sum-elo">1000</div></div>
+            <div class="stat-box"><div class="label">Policy Loss</div><div class="value purple" id="sum-pol-loss">-</div></div>
+            <div class="stat-box"><div class="label">Value Loss</div><div class="value purple" id="sum-val-loss">-</div></div>
+            <div class="stat-box"><div class="label">Avg Game Length</div><div class="value" id="sum-avg-len" style="color:#53a0ff">-</div></div>
+        </div>
+        <div class="card" style="margin-bottom:16px">
+            <h2>Game Outcomes</h2>
+            <div class="outcome-bar" id="outcome-bar"><div class="white" style="width:33%"></div><div class="draw" style="width:34%"></div><div class="black" style="width:33%"></div></div>
+            <div style="display:flex;justify-content:space-between;margin-top:4px;font-size:11px;color:#888">
+                <span>White <span id="outcome-white-pct">0%</span></span>
+                <span>Draw <span id="outcome-draw-pct">0%</span></span>
+                <span>Black <span id="outcome-black-pct">0%</span></span>
+            </div>
+        </div>
+        <div class="grid">
+            <div class="card"><h2>Training Losses (Separate)</h2><div class="chart-container"><canvas id="chart-loss"></canvas></div></div>
+            <div class="card"><h2>Elo Rating Over Time</h2><div class="chart-container"><canvas id="chart-elo"></canvas></div></div>
+            <div class="card"><h2>Average Game Length</h2><div class="chart-container"><canvas id="chart-gamelen"></canvas></div></div>
+            <div class="card"><h2>Network Confidence</h2><div class="chart-container"><canvas id="chart-confidence"></canvas></div></div>
+        </div>
+        <div class="grid">
+            <div class="card"><h2>Replay Buffer Composition</h2><div class="chart-container"><canvas id="chart-buffer"></canvas></div></div>
+            <div class="card"><h2>Win/Draw/Loss Rates Over Time</h2><div class="chart-container"><canvas id="chart-rates"></canvas></div></div>
+        </div>
+        <div class="card" style="margin-bottom:16px">
+            <h2>Promotion Attempts (Gate Stagnation Diagnostics)</h2>
+            <table><thead><tr><th>Step</th><th>Promoted</th><th>Win Rate</th><th>W/L/D</th><th>Old Elo</th><th>New Elo</th></tr></thead>
+            <tbody id="promo-table-body"><tr><td colspan="6" style="color:#888;text-align:center">No data yet</td></tr></tbody></table>
+        </div>
+        <div class="card" style="margin-bottom:16px">
+            <h2>Recent Game Outcomes</h2>
+            <table><thead><tr><th>Game</th><th>Result</th><th>Length</th><th>Termination</th><th>Step</th><th>MCTS Depth</th></tr></thead>
+            <tbody id="game-table-body"><tr><td colspan="6" style="color:#888;text-align:center">No games yet</td></tr></tbody></table>
+        </div>
+        <div class="card" style="margin-bottom:16px">
+            <h2>MCTS Statistics</h2>
+            <div class="chart-container"><canvas id="chart-mcts"></canvas></div>
+        </div>
+    </div>
+    <script>
+        const chartDefaults = {
+            responsive: true, maintainAspectRatio: false,
+            plugins: { legend: { labels: { color: '#e0e0e0', font: { size: 11 } } } },
+            scales: {
+                x: { ticks: { color: '#888', font: { size: 10 } }, grid: { color: '#1a1a2e' } },
+                y: { ticks: { color: '#888', font: { size: 10 } }, grid: { color: '#1a1a2e' } },
+            },
+        };
+        const lossChart = new Chart(document.getElementById('chart-loss'), {
+            type: 'line',
+            data: { labels: [], datasets: [
+                { label: 'Policy Loss', data: [], borderColor: '#e94560', fill: false, pointRadius: 1 },
+                { label: 'Value Loss', data: [], borderColor: '#53a0ff', fill: false, pointRadius: 1 },
+                { label: 'Total Loss', data: [], borderColor: '#b57bff', fill: false, pointRadius: 1, borderDash: [4,2] },
+            ]}, options: { ...chartDefaults },
+        });
+        const eloChart = new Chart(document.getElementById('chart-elo'), {
+            type: 'line',
+            data: { labels: [], datasets: [{ label: 'Elo', data: [], borderColor: '#47d147', backgroundColor: 'rgba(71,209,71,0.1)', fill: true, pointRadius: 1 }] },
+            options: { ...chartDefaults },
+        });
+        const gamelenChart = new Chart(document.getElementById('chart-gamelen'), {
+            type: 'line',
+            data: { labels: [], datasets: [{ label: 'Avg Length', data: [], borderColor: '#ff9500', fill: false, pointRadius: 1 }] },
+            options: { ...chartDefaults },
+        });
+        const confidenceChart = new Chart(document.getElementById('chart-confidence'), {
+            type: 'line',
+            data: { labels: [], datasets: [
+                { label: 'Avg Max Policy', data: [], borderColor: '#e94560', fill: false, pointRadius: 1 },
+                { label: 'Avg |Value|', data: [], borderColor: '#53a0ff', fill: false, pointRadius: 1 },
+            ]}, options: { ...chartDefaults },
+        });
+        const bufferChart = new Chart(document.getElementById('chart-buffer'), {
+            type: 'line',
+            data: { labels: [], datasets: [
+                { label: 'White Wins', data: [], borderColor: '#53a0ff', backgroundColor: 'rgba(83,160,255,0.15)', fill: true, pointRadius: 0 },
+                { label: 'Draws', data: [], borderColor: '#888', backgroundColor: 'rgba(136,136,136,0.15)', fill: true, pointRadius: 0 },
+                { label: 'Black Wins', data: [], borderColor: '#e94560', backgroundColor: 'rgba(233,69,96,0.15)', fill: true, pointRadius: 0 },
+            ]}, options: { ...chartDefaults },
+        });
+        const ratesChart = new Chart(document.getElementById('chart-rates'), {
+            type: 'line',
+            data: { labels: [], datasets: [
+                { label: 'White Win %', data: [], borderColor: '#53a0ff', fill: false, pointRadius: 1 },
+                { label: 'Draw %', data: [], borderColor: '#888', fill: false, pointRadius: 1 },
+                { label: 'Black Win %', data: [], borderColor: '#e94560', fill: false, pointRadius: 1 },
+            ]}, options: { ...chartDefaults, scales: { ...chartDefaults.scales, y: { ...chartDefaults.scales.y, min: 0, max: 100 } } },
+        });
+        const mctsChart = new Chart(document.getElementById('chart-mcts'), {
+            type: 'line',
+            data: { labels: [], datasets: [{ label: 'Avg MCTS Depth', data: [], borderColor: '#b57bff', fill: false, pointRadius: 1 }] },
+            options: { ...chartDefaults },
+        });
+
+        async function fetchJSON(url) { try { const r = await fetch(url); return r.ok ? await r.json() : null; } catch(e) { return null; } }
+
+        function updateSummary(d) {
+            if (!d) return;
+            document.getElementById('sum-games').textContent = d.total_games||0;
+            document.getElementById('sum-white').textContent = d.white_wins||0;
+            document.getElementById('sum-black').textContent = d.black_wins||0;
+            document.getElementById('sum-draws').textContent = d.draws||0;
+            document.getElementById('sum-elo').textContent = Math.round(d.current_elo||1000);
+            document.getElementById('sum-pol-loss').textContent = d.latest_policy_loss ? d.latest_policy_loss.toFixed(4) : '-';
+            document.getElementById('sum-val-loss').textContent = d.latest_value_loss ? d.latest_value_loss.toFixed(4) : '-';
+            document.getElementById('sum-avg-len').textContent = d.avg_game_length ? d.avg_game_length.toFixed(1) : '-';
+            document.getElementById('stat-step').textContent = d.current_step||0;
+            document.getElementById('stat-games').textContent = d.total_games||0;
+            document.getElementById('status-text').textContent = 'Connected \u2014 '+(d.total_games||0)+' games';
+            document.getElementById('status-dot').className = 'dot green';
+            var t = (d.white_wins||0)+(d.black_wins||0)+(d.draws||0);
+            if (t>0) {
+                var wp=(d.white_wins/t*100).toFixed(1), dp=(d.draws/t*100).toFixed(1), bp=(d.black_wins/t*100).toFixed(1);
+                document.getElementById('outcome-bar').innerHTML = '<div class="white" style="width:'+wp+'%"></div><div class="draw" style="width:'+dp+'%"></div><div class="black" style="width:'+bp+'%"></div>';
+                document.getElementById('outcome-white-pct').textContent=wp+'%';
+                document.getElementById('outcome-draw-pct').textContent=dp+'%';
+                document.getElementById('outcome-black-pct').textContent=bp+'%';
+            }
+        }
+        function updateChart(chart, data, keys, dsKeys) {
+            if (!data||!data.length) return;
+            chart.data.labels = data.map(function(d){return d.step||d.game_id||0;});
+            dsKeys.forEach(function(k,i){chart.data.datasets[i].data=data.map(function(d){return d[k];});});
+            chart.update('none');
+        }
+
+        async function refreshAll() {
+            var s=await Promise.all([
+                fetchJSON('/api/summary'), fetchJSON('/api/training_losses'),
+                fetchJSON('/api/game_outcomes'), fetchJSON('/api/elo_history'),
+                fetchJSON('/api/promotion_history'), fetchJSON('/api/network_stats'),
+                fetchJSON('/api/buffer_stats'), fetchJSON('/api/mcts_stats')
+            ]);
+            var summary=s[0], losses=s[1], games=s[2], elo=s[3], promos=s[4], netStats=s[5], bufStats=s[6], mctsData=s[7];
+            updateSummary(summary);
+            updateChart(lossChart,losses,null,['policy_loss','value_loss','total_loss']);
+            updateChart(gamelenChart,games,null,['length']);
+            updateChart(eloChart,elo,null,['elo']);
+            updateChart(confidenceChart,netStats,null,['avg_max_policy','avg_abs_value']);
+            updateChart(bufferChart,bufStats,null,['white_wins','draws','black_wins']);
+            updateChart(mctsChart,mctsData,null,['avg_depth']);
+            // Promo table
+            var pt=document.getElementById('promo-table-body');
+            if(!promos||!promos.length){pt.innerHTML='<tr><td colspan="6" style="color:#888;text-align:center">No data yet</td></tr>';}
+            else{pt.innerHTML=promos.slice(-20).reverse().map(function(d){
+                return '<tr><td>'+d.step+'</td><td style="color:'+(d.promoted?'#47d147':'#e94560')+'">'+(d.promoted?'YES':'NO')+'</td><td>'+(d.win_rate*100).toFixed(1)+'%</td><td>'+d.wins+'W/'+d.losses+'L/'+d.draws+'D</td><td>'+(d.old_elo?Math.round(d.old_elo):'-')+'</td><td>'+(d.new_elo?Math.round(d.new_elo):'-')+'</td></tr>';
+            }).join('');}
+            // Game table
+            var gt=document.getElementById('game-table-body');
+            if(!games||!games.length){gt.innerHTML='<tr><td colspan="6" style="color:#888;text-align:center">No games yet</td></tr>';}
+            else{gt.innerHTML=games.slice(-25).reverse().map(function(d){
+                var r=d.result===1?'1-0':d.result===-1?'0-1':'1/2-1/2';
+                var c=d.result===1?'#53a0ff':d.result===-1?'#e94560':'#888';
+                return '<tr><td>'+d.game_id+'</td><td style="color:'+c+'">'+r+'</td><td>'+d.length+'</td><td>'+d.termination+'</td><td>'+d.step+'</td><td>'+(d.avg_mcts_depth?d.avg_mcts_depth.toFixed(1):'-')+'</td></tr>';
+            }).join('');}
+            // Rates chart
+            if(games&&games.length){var rc=[];var ws=20;for(var i=0;i<games.length;i+=ws){var w2=games.slice(Math.max(0,i-ws),i+ws);var tot=w2.length||1;var ww=w2.filter(function(g){return g.result>0;}).length;var bw=w2.filter(function(g){return g.result<0;}).length;var dr=w2.filter(function(g){return g.result===0;}).length;rc.push({step:games[i].step,white_win_pct:ww/tot*100,draw_pct:dr/tot*100,black_win_pct:bw/tot*100});}updateChart(ratesChart,rc,null,['white_win_pct','draw_pct','black_win_pct']);}
+            if(bufStats&&bufStats.length){document.getElementById('stat-buffer').textContent=bufStats[bufStats.length-1].buffer_size||0;}
+        }
+        refreshAll();
+        setInterval(refreshAll, 2000);
+    </script>
+</body>
+</html>
