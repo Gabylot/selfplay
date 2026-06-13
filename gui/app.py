@@ -15,10 +15,11 @@ import time
 import threading
 from pathlib import Path
 
-from flask import Flask, render_template, jsonify
+from flask import Flask, render_template, jsonify, send_from_directory
 from flask_socketio import SocketIO
 
 from stats import StatsLogger
+from gui.live_game import LiveGameState
 
 
 app = Flask(__name__, 
@@ -26,9 +27,17 @@ app = Flask(__name__,
 app.config['SECRET_KEY'] = 'alphazero-chess-engine'
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading')
 
+
+@app.route('/chess_pieces/<path:filename>')
+def chess_piece(filename):
+    """Serve chess piece images from the chess_pieces directory."""
+    pieces_dir = str(Path(__file__).parent.parent / "chess_pieces")
+    return send_from_directory(pieces_dir, filename)
+
 # Global references (set when starting the server)
 _stats: StatsLogger = None
 _config = None
+_live_game: LiveGameState = None
 
 
 @app.route('/')
@@ -123,16 +132,57 @@ def handle_request_update():
         socketio.emit('update', summary)
 
 
-def start_gui_server(stats=None, config=None):
+@socketio.on('request_live_state')
+def handle_request_live_state():
+    """Handle client request for current live game state."""
+    if _live_game is not None:
+        state = _live_game.get_state()
+        socketio.emit('live_game_update', state)
+
+
+@socketio.on('request_game_history')
+def handle_request_game_history():
+    """Handle client request for completed game history."""
+    if _live_game is not None:
+        history = _live_game.get_game_history()
+        socketio.emit('game_history', history)
+
+
+@socketio.on('request_replay_game')
+def handle_request_replay_game(data):
+    """Handle client request to replay a specific completed game."""
+    if _live_game is not None:
+        game_id = data.get('game_id')
+        game = _live_game.get_game_by_id(game_id)
+        if game is not None:
+            socketio.emit('replay_game', {
+                'game_id': game['game_id'],
+                'step': game['step'],
+                'moves': game['moves'],
+                'fens': game['fens'],
+                'start_fen': game['start_fen'],
+                'result': game['result'],
+                'termination': game['termination'],
+                'num_moves': game['num_moves'],
+            })
+
+
+def start_gui_server(stats=None, config=None, live_game=None):
     """Start the Flask + SocketIO GUI server.
     
     Args:
         stats: StatsLogger instance for reading data (or None to read from existing DB)
         config: Config object for server settings
+        live_game: LiveGameState instance for live board viewing
     """
-    global _stats, _config
+    global _stats, _config, _live_game
     _stats = stats
     _config = config
+    _live_game = live_game
+    
+    # Connect the socketio instance to the live game state
+    if _live_game is not None:
+        _live_game.set_socketio(socketio)
     
     host = config.gui.host if config else "127.0.0.1"
     port = config.gui.port if config else 5000

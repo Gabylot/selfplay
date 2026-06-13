@@ -5,6 +5,10 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>AlphaZero Chess Engine — Dashboard</title>
     <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/chess.js/0.10.3/chess.min.js"></script>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@chrisoakman/chessboardjs@1.0.0/dist/chessboard-1.0.0.min.css" />
+    <script src="https://code.jquery.com/jquery-3.7.1.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@chrisoakman/chessboardjs@1.0.0/dist/chessboard-1.0.0.min.js"></script>
     <style>
         * { box-sizing: border-box; margin: 0; padding: 0; }
         body { font-family: 'Segoe UI', Arial, sans-serif; background: #1a1a2e; color: #e0e0e0; }
@@ -37,6 +41,42 @@
         .outcome-bar .draw { background: #888; }
         .outcome-bar .black { background: #e94560; }
         @media (max-width: 900px) { .grid { grid-template-columns: 1fr; } }
+
+        /* Live Game Board Styles */
+        .live-section { margin-bottom: 16px; }
+        .live-grid { display: grid; grid-template-columns: auto 1fr; gap: 16px; margin-bottom: 16px; }
+        @media (max-width: 900px) { .live-grid { grid-template-columns: 1fr; } }
+        .board-wrapper { background: #0f3460; border-radius: 8px; padding: 12px; }
+        .board-info { display: flex; flex-direction: column; gap: 12px; }
+        .game-controls { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+        .game-controls button { background: #0f3460; color: #e0e0e0; border: 1px solid #1a3a6e; border-radius: 4px; padding: 6px 14px; cursor: pointer; font-size: 12px; transition: background 0.2s; }
+        .game-controls button:hover { background: #1a4a8e; }
+        .game-controls button.active { background: #e94560; border-color: #e94560; }
+        .speed-control { display: flex; align-items: center; gap: 8px; font-size: 12px; color: #888; }
+        .speed-control input[type=range] { width: 120px; accent-color: #e94560; }
+        .move-list { background: #0a0a1a; border-radius: 6px; padding: 10px; max-height: 340px; overflow-y: auto; font-family: 'Courier New', monospace; font-size: 12px; line-height: 1.6; }
+        .move-list .move-pair { display: flex; gap: 4px; }
+        .move-list .move-num { color: #555; min-width: 30px; text-align: right; margin-right: 4px; }
+        .move-list .move { padding: 1px 4px; border-radius: 3px; cursor: default; }
+        .move-list .move.current { background: #e94560; color: #fff; }
+        .move-list .move.white-move { color: #ccc; }
+        .move-list .move.black-move { color: #53a0ff; }
+        .game-status { font-size: 13px; color: #888; }
+        .game-status .result { font-weight: bold; font-size: 15px; }
+        .game-status .result.white { color: #53a0ff; }
+        .game-status .result.black { color: #e94560; }
+        .game-status .result.draw { color: #888; }
+        .game-history-list { background: #0a0a1a; border-radius: 6px; padding: 10px; max-height: 180px; overflow-y: auto; font-size: 12px; }
+        .game-history-item { padding: 4px 8px; border-radius: 4px; cursor: pointer; display: flex; justify-content: space-between; margin-bottom: 2px; }
+        .game-history-item:hover { background: #0f3460; }
+        .game-history-item .result-tag { font-weight: bold; }
+        .game-history-item .result-tag.white { color: #53a0ff; }
+        .game-history-item .result-tag.black { color: #e94560; }
+        .game-history-item .result-tag.draw { color: #888; }
+        .board-status-badge { display: inline-block; padding: 3px 10px; border-radius: 12px; font-size: 11px; font-weight: bold; text-transform: uppercase; letter-spacing: 1px; }
+        .board-status-badge.playing { background: #47d147; color: #000; }
+        .board-status-badge.finished { background: #e94560; color: #fff; }
+        .board-status-badge.idle { background: #555; color: #ccc; }
     </style>
 </head>
 <body>
@@ -45,6 +85,45 @@
         <div class="sub">Self-play training dashboard &mdash; auto-refreshing every 2s</div>
     </div>
     <div class="container">
+        <!-- Live Game Board -->
+        <div class="card live-section">
+            <h2>Live Self-Play Board</h2>
+            <div class="live-grid">
+                <div class="board-wrapper">
+                    <div id="chess-board" style="width: 400px"></div>
+                </div>
+                <div class="board-info">
+                    <div style="display:flex;gap:12px;align-items:center;flex-wrap:wrap">
+                        <span class="game-status">Game <strong id="lg-game-id">—</strong> &nbsp;|&nbsp; Move <strong id="lg-move-num">0</strong></span>
+                        <span class="board-status-badge idle" id="lg-status-badge">IDLE</span>
+                    </div>
+                    <div class="game-status" id="lg-turn-info"></div>
+                    <div class="game-controls">
+                        <button id="btn-pause" class="active" onclick="togglePause()">⏸ Pause</button>
+                        <button onclick="stepBack()">◀ Back</button>
+                        <button onclick="stepForward()">▶ Fwd</button>
+                        <button onclick="goToStart()">⏮ Start</button>
+                        <button onclick="goToEnd()">⏭ End</button>
+                        <button id="btn-live" onclick="goLive()" style="display:none">🔴 Live</button>
+                        <div class="speed-control">
+                            <span>Speed:</span>
+                            <input type="range" id="speed-slider" min="100" max="3000" value="500" step="100" oninput="updateSpeed()">
+                            <span id="speed-label">500ms</span>
+                        </div>
+                    </div>
+                    <div class="game-status" id="lg-result" style="display:none"></div>
+                    <div class="move-list" id="move-list"></div>
+                    <div>
+                        <h2 style="font-size:12px;margin-bottom:6px">Recent Games</h2>
+                        <div class="game-history-list" id="game-history-list">
+                            <div style="color:#555;text-align:center">No completed games yet</div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Stats Section -->
         <div class="status-bar">
             <div><span class="dot green" id="status-dot"></span><span id="status-text">Connecting...</span></div>
             <div>Step: <strong id="stat-step">0</strong> | Games: <strong id="stat-games">0</strong> | Buffer: <strong id="stat-buffer">0</strong></div>
@@ -93,7 +172,301 @@
             <div class="chart-container"><canvas id="chart-mcts"></canvas></div>
         </div>
     </div>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.7.4/socket.io.min.js"></script>
     <script>
+        // ===== Chessboard Setup =====
+        var board = null;
+        var chess = new Chess();
+        var liveState = { moves: [], fens: [], status: 'idle', currentViewIndex: -1 };
+        var isPaused = false;
+        var playInterval = null;
+        var playSpeed = 500;
+        var latestGameState = null;
+        var isReplaying = false;
+        var replayGameId = null;
+
+        function initBoard() {
+            board = Chessboard('chess-board', {
+                position: 'start',
+                showNotation: true,
+                pieceTheme: '/chess_pieces/{piece}.png'
+            });
+            $(window).resize(function() { board.resize(); });
+        }
+
+        function updateBoard() {
+            if (!board) return;
+            // Preserve page scroll position across DOM updates
+            var pageScroll = window.scrollY || window.pageYOffset;
+            if (liveState.currentViewIndex >= 0 && liveState.currentViewIndex < liveState.fens.length) {
+                board.position(liveState.fens[liveState.currentViewIndex], false);
+            } else if (liveState.fens.length === 0) {
+                board.position('start', false);
+            }
+            updateMoveList();
+            updateTurnInfo();
+            window.scrollTo(0, pageScroll);
+        }
+
+        function updateMoveList() {
+            var ml = document.getElementById('move-list');
+            var html = '';
+            for (var i = 0; i < liveState.moves.length; i += 2) {
+                var moveNum = Math.floor(i / 2) + 1;
+                var whiteMove = liveState.moves[i];
+                var blackMove = (i + 1 < liveState.moves.length) ? liveState.moves[i + 1] : null;
+                var wClass = 'move white-move';
+                var bClass = 'move black-move';
+                if (i === liveState.currentViewIndex) wClass += ' current';
+                if (i + 1 === liveState.currentViewIndex) bClass += ' current';
+                html += '<div class="move-pair"><span class="move-num">' + moveNum + '.</span>';
+                html += '<span class="' + wClass + '">' + whiteMove + '</span>';
+                if (blackMove) {
+                    html += '<span class="' + bClass + '">' + blackMove + '</span>';
+                }
+                html += '</div>';
+            }
+            ml.innerHTML = html;
+            // Scroll within the move-list container only (not the page)
+            var currentEl = ml.querySelector('.move.current');
+            if (currentEl) {
+                var elTop = currentEl.offsetTop;
+                var elHeight = currentEl.offsetHeight;
+                var containerHeight = ml.clientHeight;
+                var newScrollTop = elTop - (containerHeight / 2) + (elHeight / 2);
+                if (newScrollTop < 0) newScrollTop = 0;
+                ml.scrollTop = newScrollTop;
+            }
+        }
+
+        function updateTurnInfo() {
+            var el = document.getElementById('lg-turn-info');
+            var badge = document.getElementById('lg-status-badge');
+            var gameEl = document.getElementById('lg-game-id');
+            var moveEl = document.getElementById('lg-move-num');
+            gameEl.textContent = latestGameState ? ('#' + latestGameState.game_id) : '—';
+            moveEl.textContent = liveState.currentViewIndex + 1;
+
+            badge.className = 'board-status-badge ' + liveState.status;
+            badge.textContent = liveState.status.toUpperCase();
+
+            if (liveState.status === 'playing') {
+                var turn = (liveState.currentViewIndex + 1) % 2 === 0 ? 'White' : 'Black';
+                if (liveState.currentViewIndex === -1) turn = 'White';
+                el.textContent = turn + ' to move';
+                el.style.color = turn === 'White' ? '#ccc' : '#53a0ff';
+            } else if (liveState.status === 'finished') {
+                el.textContent = 'Game over';
+                el.style.color = '#888';
+            } else {
+                el.textContent = 'Waiting for game...';
+                el.style.color = '#555';
+            }
+        }
+
+        function updateResult() {
+            var el = document.getElementById('lg-result');
+            if (latestGameState && latestGameState.result) {
+                var resultText = latestGameState.result;
+                var termText = latestGameState.termination || '';
+                var cls = 'draw';
+                if (resultText === '1-0') cls = 'white';
+                else if (resultText === '0-1') cls = 'black';
+                el.innerHTML = '<span class="result ' + cls + '">' + resultText + '</span> &mdash; ' + termText;
+                el.style.display = 'block';
+            } else {
+                el.style.display = 'none';
+            }
+        }
+
+        // ===== Playback Controls =====
+        function togglePause() {
+            isPaused = !isPaused;
+            var btn = document.getElementById('btn-pause');
+            if (isPaused) {
+                btn.textContent = '▶ Play';
+                btn.classList.remove('active');
+                stopAutoPlay();
+            } else {
+                btn.textContent = '⏸ Pause';
+                btn.classList.add('active');
+                startAutoPlay();
+            }
+        }
+
+        function startAutoPlay() {
+            stopAutoPlay();
+            playInterval = setInterval(function() {
+                if (liveState.currentViewIndex < liveState.fens.length - 1) {
+                    liveState.currentViewIndex++;
+                    updateBoard();
+                } else {
+                    stopAutoPlay();
+                }
+            }, playSpeed);
+        }
+
+        function stopAutoPlay() {
+            if (playInterval) { clearInterval(playInterval); playInterval = null; }
+        }
+
+        function stepBack() {
+            if (liveState.currentViewIndex > 0) {
+                liveState.currentViewIndex--;
+                updateBoard();
+            } else if (liveState.currentViewIndex === 0) {
+                liveState.currentViewIndex = -1;
+                board.position('start', true);
+                updateMoveList();
+                updateTurnInfo();
+            }
+        }
+
+        function stepForward() {
+            if (liveState.currentViewIndex < liveState.fens.length - 1) {
+                liveState.currentViewIndex++;
+                updateBoard();
+            }
+        }
+
+        function goToStart() {
+            liveState.currentViewIndex = -1;
+            board.position('start', true);
+            updateMoveList();
+            updateTurnInfo();
+        }
+
+        function goToEnd() {
+            if (liveState.fens.length > 0) {
+                liveState.currentViewIndex = liveState.fens.length - 1;
+                updateBoard();
+            }
+        }
+
+        function updateSpeed() {
+            playSpeed = parseInt(document.getElementById('speed-slider').value);
+            document.getElementById('speed-label').textContent = playSpeed + 'ms';
+            if (!isPaused) {
+                startAutoPlay();
+            }
+        }
+
+        // ===== Socket.IO Live Game Updates =====
+        var socket = io();
+        var lastGameId = 0;
+        var movesReplayedUpTo = -1;  // How many moves of the latest game have been replayed
+
+        socket.on('connect', function() {
+            console.log('Connected to GUI server');
+            socket.emit('request_live_state');
+        });
+
+        socket.on('live_game_update', function(data) {
+            latestGameState = data;
+
+            // If user is watching a replay, don't overwrite their view
+            if (isReplaying) {
+                return;
+            }
+
+            if (data.game_id !== lastGameId) {
+                // New game started
+                lastGameId = data.game_id;
+                liveState = { moves: [], fens: [], status: data.status, currentViewIndex: -1 };
+                movesReplayedUpTo = -1;
+                document.getElementById('lg-result').style.display = 'none';
+                board.position('start', false);
+            }
+
+            liveState.status = data.status;
+
+            // Append new moves (incremental update)
+            while (movesReplayedUpTo < data.moves.length - 1) {
+                movesReplayedUpTo++;
+                liveState.moves.push(data.moves[movesReplayedUpTo]);
+                liveState.fens.push(data.fens[movesReplayedUpTo]);
+            }
+
+            // Only auto-advance if not paused
+            if (!isPaused) {
+                liveState.currentViewIndex = liveState.fens.length - 1;
+                updateBoard();
+            }
+            updateResult();
+            // Throttle game history refresh to avoid unnecessary DOM rebuilds
+            if (!window._gameHistoryPending) {
+                window._gameHistoryPending = true;
+                setTimeout(function() {
+                    window._gameHistoryPending = false;
+                    refreshGameHistory();
+                }, 2000);
+            }
+        });
+
+        socket.on('game_history', function(history) {
+            var sv = window.scrollY;
+            document.documentElement.style.overflow = 'hidden';
+            window._gameHistoryCache = history;
+            updateGameHistoryList(history);
+            document.documentElement.style.overflow = '';
+            window.scrollTo(0, sv);
+        });
+
+        socket.on('replay_game', function(data) {
+            // Replay a completed game on the board
+            lastGameId = data.game_id;
+            liveState = { moves: [], fens: [], status: 'finished', currentViewIndex: -1 };
+            movesReplayedUpTo = data.moves.length - 1;
+            liveState.moves = data.moves.slice();
+            liveState.fens = data.fens.slice();
+            latestGameState = data;
+            board.position('start', false);
+            // Start auto-replay from the beginning
+            liveState.currentViewIndex = -1;
+            updateBoard();
+            document.getElementById('lg-result').style.display = 'none';
+            if (isPaused) togglePause();
+        });
+
+        function refreshGameHistory() {
+            socket.emit('request_game_history');
+        }
+
+        function updateGameHistoryList(history) {
+            var el = document.getElementById('game-history-list');
+            if (!history || history.length === 0) {
+                el.innerHTML = '<div style="color:#555;text-align:center">No completed games yet</div>';
+                return;
+            }
+            var html = '';
+            history.forEach(function(g) {
+                var r = g.result || '*';
+                var cls = 'draw';
+                if (r === '1-0') cls = 'white';
+                else if (r === '0-1') cls = 'black';
+                html += '<div class="game-history-item" onclick="replayGame(' + g.game_id + ')">';
+                html += '<span>Game #' + g.game_id + ' <span style="color:#555">(' + g.num_moves + ' moves)</span></span>';
+                html += '<span class="result-tag ' + cls + '">' + r + '</span>';
+                html += '</div>';
+            });
+            el.innerHTML = html;
+        }
+
+        function replayGame(gameId) {
+            isReplaying = true;
+            replayGameId = gameId;
+            socket.emit('request_replay_game', { game_id: gameId });
+            document.getElementById('btn-live').style.display = '';
+        }
+
+        function goLive() {
+            isReplaying = false;
+            replayGameId = null;
+            document.getElementById('btn-live').style.display = 'none';
+            socket.emit('request_live_state');
+        }
+
+        // ===== Chart Defaults & Updates =====
         const chartDefaults = {
             responsive: true, maintainAspectRatio: false,
             plugins: { legend: { labels: { color: '#e0e0e0', font: { size: 11 } } } },
@@ -163,6 +536,7 @@
             document.getElementById('sum-avg-len').textContent = d.avg_game_length ? d.avg_game_length.toFixed(1) : '-';
             document.getElementById('stat-step').textContent = d.current_step||0;
             document.getElementById('stat-games').textContent = d.total_games||0;
+            document.getElementById('stat-buffer').textContent = d.buffer_size||0;
             document.getElementById('status-text').textContent = 'Connected \u2014 '+(d.total_games||0)+' games';
             document.getElementById('status-dot').className = 'dot green';
             var t = (d.white_wins||0)+(d.black_wins||0)+(d.draws||0);
@@ -182,6 +556,9 @@
         }
 
         async function refreshAll() {
+            var savedScroll = window.scrollY || window.pageYOffset;
+            // Temporarily prevent page scroll during DOM updates
+            document.documentElement.style.overflow = 'hidden';
             var s=await Promise.all([
                 fetchJSON('/api/summary'), fetchJSON('/api/training_losses'),
                 fetchJSON('/api/game_outcomes'), fetchJSON('/api/elo_history'),
@@ -213,9 +590,17 @@
             // Rates chart
             if(games&&games.length){var rc=[];var ws=20;for(var i=0;i<games.length;i+=ws){var w2=games.slice(Math.max(0,i-ws),i+ws);var tot=w2.length||1;var ww=w2.filter(function(g){return g.result>0;}).length;var bw=w2.filter(function(g){return g.result<0;}).length;var dr=w2.filter(function(g){return g.result===0;}).length;rc.push({step:games[i].step,white_win_pct:ww/tot*100,draw_pct:dr/tot*100,black_win_pct:bw/tot*100});}updateChart(ratesChart,rc,null,['white_win_pct','draw_pct','black_win_pct']);}
             if(bufStats&&bufStats.length){document.getElementById('stat-buffer').textContent=bufStats[bufStats.length-1].buffer_size||0;}
+            // Restore scroll position after all DOM updates
+            document.documentElement.style.overflow = '';
+            window.scrollTo(0, savedScroll);
         }
         refreshAll();
-        setInterval(refreshAll, 2000);
+        setInterval(refreshAll, 5000);
+
+        // Init board on page load
+        $(document).ready(function() {
+            initBoard();
+        });
     </script>
 </body>
 </html>

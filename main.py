@@ -29,6 +29,7 @@ from selfplay import self_play_game, ReplayBuffer
 from training import train_one_step, create_optimizer
 from evaluation import Evaluator
 from stats import StatsLogger
+from gui.live_game import LiveGameState
 
 
 # Global flag for graceful shutdown
@@ -65,6 +66,9 @@ def run_training(config, gui_enabled: bool = False):
     stats = StatsLogger(str(stats_db_path))
     print(f"[INFO] Stats database: {stats_db_path}")
     
+    # Setup live game state
+    live_game = LiveGameState(max_history=20)
+    
     # Setup replay buffer
     buffer = ReplayBuffer(max_size=config.buffer.max_size)
     
@@ -96,7 +100,7 @@ def run_training(config, gui_enabled: bool = False):
     gui_thread = None
     if gui_enabled:
         from gui.app import start_gui_server
-        gui_thread = threading.Thread(target=start_gui_server, args=(stats, config), daemon=True)
+        gui_thread = threading.Thread(target=start_gui_server, args=(stats, config, live_game), daemon=True)
         gui_thread.start()
         print(f"[INFO] GUI server started at http://{config.gui.host}:{config.gui.port}")
     
@@ -133,10 +137,21 @@ def run_training(config, gui_enabled: bool = False):
             if _shutdown:
                 break
             
-            game_data, game_info = self_play_game(current_net, config)
+            # Notify live game viewer that a new game is starting
+            live_game.start_game(game_id + 1, step)
+            
+            # Create on_move callback for live board updates
+            def _on_move(fen, uci, move_num, _gid=game_id+1, _step=step):
+                live_game.update(fen, uci, move_num)
+            
+            game_data, game_info = self_play_game(current_net, config, on_move=_on_move)
             buffer.add_game(game_data)
             
             game_id += 1
+            
+            # Notify live game viewer that the game is over
+            result_str = game_info['result_str']
+            live_game.game_over(result_str, game_info['termination'])
             
             # Log game to stats
             stats.log_game(

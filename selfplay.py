@@ -154,7 +154,8 @@ def play_one_game(mcts_engine: MCTS,
                    temp_threshold: int = 30,
                    temp_high: float = 1.0,
                    temp_low: float = 0.1,
-                   verbose: bool = False) -> Tuple[List[Tuple], dict]:
+                   verbose: bool = False,
+                   on_move=None) -> Tuple[List[Tuple], dict]:
     """Play a single self-play game using MCTS.
     
     Args:
@@ -166,6 +167,8 @@ def play_one_game(mcts_engine: MCTS,
         temp_high: High temperature
         temp_low: Low temperature
         verbose: Print progress
+        on_move: Optional callback called after each move with
+                 (board_fen: str, move_uci: str, move_number: int)
     
     Returns:
         game_data: List of (state, policy, value) tuples for each position
@@ -178,7 +181,7 @@ def play_one_game(mcts_engine: MCTS,
     game_states = []  # (state_tensor, policy, current_player)
     mcts_stats_list = []
     move_count = 0
-    termination = "checkmate"
+    termination = "unknown"
     outcome = 0.0  # Default to draw if something goes wrong
     
     while not board.is_game_over() and move_count < max_game_length:
@@ -205,6 +208,10 @@ def play_one_game(mcts_engine: MCTS,
         # Make the move
         board.push(selected_move)
         move_count += 1
+        
+        # Notify caller of the new position
+        if on_move is not None:
+            on_move(board.fen(), selected_move.uci(), move_count)
         
         if verbose and move_count % 10 == 0:
             print(f"  Move {move_count}: {selected_move} (visits={int(visit_policy.max() * sum(1 for c in root.children.values() for _ in range(c.N)))}...)")
@@ -238,6 +245,31 @@ def play_one_game(mcts_engine: MCTS,
                 termination = "material_black"
         else:
             outcome = 0.0  # Draw by max length
+    else:
+        # Game ended prematurely (e.g. MCTS could not find a move)
+        # Determine result from current board state
+        if board.is_game_over():
+            result = board.result()
+            if result == "1-0":
+                outcome = 1.0
+                termination = "checkmate" if board.is_checkmate() else "other"
+            elif result == "0-1":
+                outcome = -1.0
+                termination = "checkmate" if board.is_checkmate() else "other"
+            else:
+                outcome = 0.0
+                if board.is_repetition():
+                    termination = "repetition"
+                elif board.is_fifty_moves():
+                    termination = "fifty_moves"
+                elif board.is_insufficient_material():
+                    termination = "insufficient_material"
+                else:
+                    termination = "stalemate"
+        else:
+            # Board is not in game-over state; force draw with proper termination
+            outcome = 0.0
+            termination = "max_length" if move_count >= max_game_length else "unknown"
     
     # Assign values to all positions from each player's perspective
     game_data = []
@@ -264,10 +296,16 @@ def play_one_game(mcts_engine: MCTS,
     return game_data, game_info
 
 
-def self_play_game(network: AlphaZeroNet, config) -> Tuple[List[Tuple], dict]:
+def self_play_game(network: AlphaZeroNet, config, on_move=None) -> Tuple[List[Tuple], dict]:
     """Play a single self-play game with settings from config.
     
     Convenience wrapper around play_one_game that reads config.
+    
+    Args:
+        network: The neural network for position evaluation
+        config: Config object with self-play settings
+        on_move: Optional callback called after each move with
+                 (board_fen, move_uci, move_number)
     """
     mcts_engine = MCTS(
         network=network,
@@ -285,4 +323,5 @@ def self_play_game(network: AlphaZeroNet, config) -> Tuple[List[Tuple], dict]:
         temp_threshold=config.selfplay.temperature_threshold,
         temp_high=config.selfplay.temperature_high,
         temp_low=config.selfplay.temperature_low,
+        on_move=on_move,
     )

@@ -243,7 +243,7 @@ class StatsLogger:
     
     def get_game_outcomes(self, last_n: int = None) -> List[Dict]:
         """Get game outcomes over time."""
-        query = "SELECT game_id, step, result, length, termination, timestamp FROM game_log"
+        query = "SELECT game_id, step, result, length, termination, avg_mcts_depth, timestamp FROM game_log"
         if last_n:
             query += f" ORDER BY id DESC LIMIT {last_n}"
             rows = self.conn.execute(query).fetchall()
@@ -251,7 +251,7 @@ class StatsLogger:
         else:
             rows = self.conn.execute(query + " ORDER BY id ASC").fetchall()
         return [{'game_id': r[0], 'step': r[1], 'result': r[2], 'length': r[3],
-                 'termination': r[4], 'timestamp': r[5]} for r in rows]
+                 'termination': r[4], 'avg_mcts_depth': r[5], 'timestamp': r[6]} for r in rows]
     
     def get_elo_history(self) -> List[Dict]:
         """Get Elo rating history."""

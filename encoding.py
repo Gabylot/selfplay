@@ -67,9 +67,12 @@ KNIGHT_OFFSETS = [
 # direction: 0=forward, 1=forward-left, 2=forward-right
 UNDERPROMOTION_OFFSETS = {
     # (dr, dc) for white pawn moving forward (toward rank 8)
-    "forward":      (-1, 0),
-    "forward_left": (-1, -1),
-    "forward_right": (-1, +1),
+    # chess.square_rank(): rank 0 = rank 1, rank 7 = rank 8
+    # Forward for white = increasing rank = +dr
+    # Forward for black = decreasing rank = -dr (inverted in policy_index_to_move)
+    "forward":      (1, 0),
+    "forward_left": (1, -1),
+    "forward_right": (1, +1),
 }
 UNDERPROMOTION_DIRS = ["forward", "forward_left", "forward_right"]
 UNDERPROMOTION_PIECES = [chess.KNIGHT, chess.BISHOP, chess.ROOK]
