@@ -189,6 +189,9 @@ def play_one_game(mcts_engine: MCTS,
         root = mcts_engine.get_root(board)
         visit_policy, best_move, stats = mcts_engine.search(root)
         
+        # Capture all root child stats (all candidates with visits)
+        move_candidates = mcts_engine.get_root_child_stats(root)
+        
         # Select move with temperature
         temperature = get_temperature(move_count, temp_threshold, temp_high, temp_low)
         visit_policy, selected_move = mcts_engine.select_move_with_temperature(root, temperature)
@@ -205,13 +208,19 @@ def play_one_game(mcts_engine: MCTS,
         game_states.append((state_tensor, visit_policy.copy(), current_player))
         mcts_stats_list.append(stats)
         
+        # Store per-move MCTS candidate stats
+        mcts_move_data = {
+            'selected_move': selected_move.uci(),
+            'candidates': move_candidates,
+        }
+        
         # Make the move
         board.push(selected_move)
         move_count += 1
         
         # Notify caller of the new position
         if on_move is not None:
-            on_move(board.fen(), selected_move.uci(), move_count)
+            on_move(board.fen(), selected_move.uci(), move_count, mcts_move_data)
         
         if verbose and move_count % 10 == 0:
             print(f"  Move {move_count}: {selected_move} (visits={int(visit_policy.max() * sum(1 for c in root.children.values() for _ in range(c.N)))}...)")

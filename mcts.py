@@ -270,6 +270,29 @@ class MCTS:
         
         return visit_probs, best_move
     
+    def get_root_child_stats(self, root: MCTSNode) -> list:
+        """Get stats for all root children that got at least one visit.
+        
+        Returns:
+            List of dicts sorted by visit count descending, each with:
+                move: UCI string of the move
+                N: visit count
+                W: total value
+                Q: mean value
+                P: prior probability
+        """
+        stats = []
+        for action_idx, child in root.children.items():
+            if child.N > 0:
+                stats.append({
+                    'move': child.move.uci() if child.move else None,
+                    'N': child.N,
+                    'W': child.W,
+                    'Q': child.Q,
+                    'P': child.P,
+                })
+        return sorted(stats, key=lambda x: x['N'], reverse=True)
+
     def select_move_with_temperature(self, root: MCTSNode, temperature: float) -> Tuple[np.ndarray, chess.Move]:
         """Select a move using the given temperature.
         

@@ -61,6 +61,18 @@
         .move-list .move.current { background: #e94560; color: #fff; }
         .move-list .move.white-move { color: #ccc; }
         .move-list .move.black-move { color: #53a0ff; }
+
+        /* MCTS Candidates Box */
+        .mcts-candidates { background: #0a0a1a; border-radius: 6px; padding: 10px; max-height: 200px; overflow-y: auto; font-family: 'Courier New', monospace; font-size: 11px; line-height: 1.6; }
+        .mcts-candidates table { width: 100%; font-size: 11px; }
+        .mcts-candidates th { font-size: 10px; color: #e94560; padding: 2px 6px; text-align: right; }
+        .mcts-candidates th:first-child { text-align: left; }
+        .mcts-candidates td { padding: 2px 6px; text-align: right; color: #ccc; }
+        .mcts-candidates td:first-child { text-align: left; color: #e0e0e0; }
+        .mcts-candidates tr.selected { background: #1a4a2e; }
+        .mcts-candidates tr.selected td { color: #47d147; font-weight: bold; }
+        .mcts-candidates .mcts-cand-label { font-size: 10px; color: #555; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 4px; }
+
         .game-status { font-size: 13px; color: #888; }
         .game-status .result { font-weight: bold; font-size: 15px; }
         .game-status .result.white { color: #53a0ff; }
@@ -77,6 +89,8 @@
         .board-status-badge.playing { background: #47d147; color: #000; }
         .board-status-badge.finished { background: #e94560; color: #fff; }
         .board-status-badge.idle { background: #555; color: #ccc; }
+        .mcts-stats-inline { font-size: 10px; color: #666; margin-left: 4px; }
+        .move-list .move.current .mcts-stats-inline { color: #aaa; }
     </style>
 </head>
 <body>
@@ -112,7 +126,19 @@
                         </div>
                     </div>
                     <div class="game-status" id="lg-result" style="display:none"></div>
-                    <div class="move-list" id="move-list"></div>
+                    <!-- Move List and MCTS Candidates side by side -->
+                    <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;">
+                        <div>
+                            <div style="font-size:11px;color:#555;text-transform:uppercase;letter-spacing:1px;margin-bottom:4px;">Move List</div>
+                            <div class="move-list" id="move-list"></div>
+                        </div>
+                        <div>
+                            <div style="font-size:11px;color:#555;text-transform:uppercase;letter-spacing:1px;margin-bottom:4px;">MCTS Candidates (N W Q P)</div>
+                            <div class="mcts-candidates" id="mcts-candidates">
+                                <div style="color:#555;text-align:center;">No MCTS data for this position</div>
+                            </div>
+                        </div>
+                    </div>
                     <div>
                         <h2 style="font-size:12px;margin-bottom:6px">Recent Games</h2>
                         <div class="game-history-list" id="game-history-list">
@@ -177,7 +203,7 @@
         // ===== Chessboard Setup =====
         var board = null;
         var chess = new Chess();
-        var liveState = { moves: [], fens: [], status: 'idle', currentViewIndex: -1 };
+        var liveState = { moves: [], fens: [], mctsStats: [], status: 'idle', currentViewIndex: -1 };
         var isPaused = false;
         var playInterval = null;
         var playSpeed = 500;
@@ -204,6 +230,7 @@
                 board.position('start', false);
             }
             updateMoveList();
+            updateMctsCandidates();
             updateTurnInfo();
             window.scrollTo(0, pageScroll);
         }
@@ -219,10 +246,15 @@
                 var bClass = 'move black-move';
                 if (i === liveState.currentViewIndex) wClass += ' current';
                 if (i + 1 === liveState.currentViewIndex) bClass += ' current';
+                
+                // Build inline MCTS stats text
+                var wStats = getMctsInlineStats(i);
+                var bStats = blackMove ? getMctsInlineStats(i + 1) : '';
+                
                 html += '<div class="move-pair"><span class="move-num">' + moveNum + '.</span>';
-                html += '<span class="' + wClass + '">' + whiteMove + '</span>';
+                html += '<span class="' + wClass + '" onclick="onMoveClick(' + i + ')">' + whiteMove + '<span class="mcts-stats-inline">' + wStats + '</span></span>';
                 if (blackMove) {
-                    html += '<span class="' + bClass + '">' + blackMove + '</span>';
+                    html += '<span class="' + bClass + '" onclick="onMoveClick(' + (i + 1) + ')">' + blackMove + '<span class="mcts-stats-inline">' + bStats + '</span></span>';
                 }
                 html += '</div>';
             }
@@ -237,6 +269,57 @@
                 if (newScrollTop < 0) newScrollTop = 0;
                 ml.scrollTop = newScrollTop;
             }
+        }
+
+        function getMctsInlineStats(moveIndex) {
+            if (!liveState.mctsStats || moveIndex >= liveState.mctsStats.length) return '';
+            var ms = liveState.mctsStats[moveIndex];
+            if (!ms || !ms.selected_move) return '';
+            // Find the candidate matching the selected move
+            var cands = ms.candidates || [];
+            var selected = null;
+            for (var k = 0; k < cands.length; k++) {
+                if (cands[k].move === ms.selected_move) {
+                    selected = cands[k];
+                    break;
+                }
+            }
+            if (!selected) return '';
+            return ' (N:' + selected.N + ' Q:' + selected.Q.toFixed(2) + ')';
+        }
+
+        function onMoveClick(moveIndex) {
+            liveState.currentViewIndex = moveIndex;
+            updateBoard();
+        }
+
+        function updateMctsCandidates() {
+            var el = document.getElementById('mcts-candidates');
+            var moveIdx = liveState.currentViewIndex;
+            if (moveIdx < 0 || !liveState.mctsStats || moveIdx >= liveState.mctsStats.length) {
+                el.innerHTML = '<div style="color:#555;text-align:center;">No MCTS data for this position</div>';
+                return;
+            }
+            var ms = liveState.mctsStats[moveIdx];
+            if (!ms || !ms.candidates || ms.candidates.length === 0) {
+                el.innerHTML = '<div style="color:#555;text-align:center;">No MCTS data for this position</div>';
+                return;
+            }
+            var cands = ms.candidates;
+            var selectedMove = ms.selected_move;
+            var html = '<table><thead><tr><th>Move</th><th>N</th><th>W</th><th>Q</th><th>P</th></tr></thead><tbody>';
+            for (var i = 0; i < cands.length; i++) {
+                var c = cands[i];
+                var cls = (c.move === selectedMove) ? ' class="selected"' : '';
+                html += '<tr' + cls + '><td>' + c.move + '</td><td>' + c.N + '</td><td>' + c.W.toFixed(2) + '</td><td>' + c.Q.toFixed(2) + '</td><td>' + c.P.toFixed(3) + '</td></tr>';
+            }
+            // If the selected move is not in the candidates list (possible if all visits = 0)
+            var found = cands.some(function(c) { return c.move === selectedMove; });
+            if (!found && selectedMove) {
+                html += '<tr class="selected"><td>' + selectedMove + '</td><td>0</td><td>0.00</td><td>0.00</td><td>0.000</td></tr>';
+            }
+            html += '</tbody></table>';
+            el.innerHTML = html;
         }
 
         function updateTurnInfo() {
@@ -318,6 +401,7 @@
                 liveState.currentViewIndex = -1;
                 board.position('start', true);
                 updateMoveList();
+                updateMctsCandidates();
                 updateTurnInfo();
             }
         }
@@ -333,6 +417,7 @@
             liveState.currentViewIndex = -1;
             board.position('start', true);
             updateMoveList();
+            updateMctsCandidates();
             updateTurnInfo();
         }
 
@@ -372,7 +457,7 @@
             if (data.game_id !== lastGameId) {
                 // New game started
                 lastGameId = data.game_id;
-                liveState = { moves: [], fens: [], status: data.status, currentViewIndex: -1 };
+                liveState = { moves: [], fens: [], mctsStats: [], status: data.status, currentViewIndex: -1 };
                 movesReplayedUpTo = -1;
                 document.getElementById('lg-result').style.display = 'none';
                 board.position('start', false);
@@ -385,6 +470,10 @@
                 movesReplayedUpTo++;
                 liveState.moves.push(data.moves[movesReplayedUpTo]);
                 liveState.fens.push(data.fens[movesReplayedUpTo]);
+                // Append MCTS stats if available
+                if (data.mcts_stats_per_move && movesReplayedUpTo < data.mcts_stats_per_move.length) {
+                    liveState.mctsStats.push(data.mcts_stats_per_move[movesReplayedUpTo]);
+                }
             }
 
             // Only auto-advance if not paused
@@ -415,10 +504,14 @@
         socket.on('replay_game', function(data) {
             // Replay a completed game on the board
             lastGameId = data.game_id;
-            liveState = { moves: [], fens: [], status: 'finished', currentViewIndex: -1 };
+            liveState = { moves: [], fens: [], mctsStats: [], status: 'finished', currentViewIndex: -1 };
             movesReplayedUpTo = data.moves.length - 1;
             liveState.moves = data.moves.slice();
             liveState.fens = data.fens.slice();
+            // Load MCTS stats if available
+            if (data.mcts_stats_per_move) {
+                liveState.mctsStats = data.mcts_stats_per_move.slice();
+            }
             latestGameState = data;
             board.position('start', false);
             // Start auto-replay from the beginning

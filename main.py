@@ -141,8 +141,8 @@ def run_training(config, gui_enabled: bool = False):
             live_game.start_game(game_id + 1, step)
             
             # Create on_move callback for live board updates
-            def _on_move(fen, uci, move_num, _gid=game_id+1, _step=step):
-                live_game.update(fen, uci, move_num)
+            def _on_move(fen, uci, move_num, mcts_stats=None, _gid=game_id+1, _step=step):
+                live_game.update(fen, uci, move_num, mcts_stats=mcts_stats)
             
             game_data, game_info = self_play_game(current_net, config, on_move=_on_move)
             buffer.add_game(game_data)

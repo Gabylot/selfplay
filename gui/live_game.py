@@ -36,6 +36,7 @@ class LiveGameState:
         self._result: Optional[str] = None   # "1-0", "0-1", "1/2-1/2", None
         self._termination: Optional[str] = None
         self._move_number: int = 0
+        self._mcts_stats: List[dict] = []    # Per-move MCTS candidate stats
         
         # Completed games history (for replay)
         self._game_history: deque = deque(maxlen=max_history)
@@ -51,6 +52,7 @@ class LiveGameState:
             self._step = step
             self._moves = []
             self._fens = []
+            self._mcts_stats = []
             self._start_fen = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"
             self._status = "playing"
             self._result = None
@@ -59,18 +61,22 @@ class LiveGameState:
         
         self._emit_update()
     
-    def update(self, board_fen: str, move_uci: str, move_number: int):
+    def update(self, board_fen: str, move_uci: str, move_number: int,
+               mcts_stats: dict = None):
         """Called after each move in the self-play game.
         
         Args:
             board_fen: FEN of the board AFTER the move
             move_uci: UCI string of the move that was just played (e.g. "e2e4")
             move_number: Current half-move count
+            mcts_stats: Dict with 'selected_move' and 'candidates' list
         """
         with self._lock:
             self._moves.append(move_uci)
             self._fens.append(board_fen)
             self._move_number = move_number
+            if mcts_stats is not None:
+                self._mcts_stats.append(mcts_stats)
         
         self._emit_update()
     
@@ -98,6 +104,7 @@ class LiveGameState:
             'step': self._step,
             'moves': list(self._moves),
             'fens': list(self._fens),
+            'mcts_stats_per_move': list(self._mcts_stats),
             'start_fen': self._start_fen,
             'result': self._result,
             'termination': self._termination,
@@ -113,6 +120,7 @@ class LiveGameState:
                 'step': self._step,
                 'moves': list(self._moves),
                 'fens': list(self._fens),
+                'mcts_stats_per_move': list(self._mcts_stats),
                 'start_fen': self._start_fen,
                 'status': self._status,
                 'result': self._result,

@@ -155,7 +155,7 @@ def handle_request_replay_game(data):
         game_id = data.get('game_id')
         game = _live_game.get_game_by_id(game_id)
         if game is not None:
-            socketio.emit('replay_game', {
+            emit_data = {
                 'game_id': game['game_id'],
                 'step': game['step'],
                 'moves': game['moves'],
@@ -164,7 +164,11 @@ def handle_request_replay_game(data):
                 'result': game['result'],
                 'termination': game['termination'],
                 'num_moves': game['num_moves'],
-            })
+            }
+            # Include MCTS stats if available
+            if 'mcts_stats_per_move' in game:
+                emit_data['mcts_stats_per_move'] = game['mcts_stats_per_move']
+            socketio.emit('replay_game', emit_data)
 
 
 def start_gui_server(stats=None, config=None, live_game=None):
