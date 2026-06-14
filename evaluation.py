@@ -174,7 +174,10 @@ def play_game_alpha_beta_vs_alpha_beta(depth: int = 2,
 def play_match(network_a: AlphaZeroNet, network_b: AlphaZeroNet,
                config, num_games: int = 20, 
                network_a_color: str = "alternating",
-               verbose: bool = False) -> dict:
+               verbose: bool = False,
+               on_move=None,
+               live_game=None,
+               game_counter: int = 0) -> dict:
     """Play a match between two networks.
     
     Args:
@@ -184,6 +187,9 @@ def play_match(network_a: AlphaZeroNet, network_b: AlphaZeroNet,
         num_games: Number of games to play
         network_a_color: "alternating", "white", or "black"
         verbose: Print progress
+        on_move: Optional callback(board_fen, move_uci, move_number, mcts_stats)
+        live_game: Optional LiveGameState for live viewing
+        game_counter: Starting game ID for live game tracking
     
     Returns:
         Dict with wins_a, wins_b, draws, results list
@@ -209,6 +215,8 @@ def play_match(network_a: AlphaZeroNet, network_b: AlphaZeroNet,
             c_puct=config.mcts.c_puct,
             dirichlet_alpha=0.0,  # No Dirichlet noise in evaluation
             dirichlet_epsilon=0.0,
+            batch_size=getattr(config.mcts, 'batch_size', 1),
+            c_virtual_loss=getattr(config.mcts, 'c_virtual_loss', 0.5),
         )
         mcts_b = MCTS(
             network=network_b,
@@ -216,10 +224,23 @@ def play_match(network_a: AlphaZeroNet, network_b: AlphaZeroNet,
             c_puct=config.mcts.c_puct,
             dirichlet_alpha=0.0,
             dirichlet_epsilon=0.0,
+            batch_size=getattr(config.mcts, 'batch_size', 1),
+            c_virtual_loss=getattr(config.mcts, 'c_virtual_loss', 0.5),
         )
         
+        # Notify live game viewer of new game
+        if live_game is not None:
+            live_game.start_game(game_counter + game_idx, config.get('step', 0) if hasattr(config, 'get') else 0,
+                                 game_type="gating",
+                                 match_info=f"Gating Game {game_idx+1}/{num_games}")
+        
         result = _play_evaluation_game(mcts_a, mcts_b, a_is_white, 
-                                        max_moves=config.selfplay.max_game_length)
+                                        max_moves=config.selfplay.max_game_length,
+                                        on_move=on_move)
+        
+        # Notify live game viewer that game is over
+        if live_game is not None:
+            live_game.game_over(result, 'gating_game')
         
         if result == "1-0":
             if a_is_white:
@@ -252,7 +273,10 @@ def play_match(network_a: AlphaZeroNet, network_b: AlphaZeroNet,
 def play_match_vs_alpha_beta(network: AlphaZeroNet, config,
                               num_games: int = 20,
                               network_color: str = "alternating",
-                              verbose: bool = False) -> dict:
+                              verbose: bool = False,
+                              on_move=None,
+                              live_game=None,
+                              game_counter: int = 0) -> dict:
     """Play a match between a network and the alpha-beta reference opponent.
     
     Args:
@@ -278,6 +302,12 @@ def play_match_vs_alpha_beta(network: AlphaZeroNet, config,
         else:
             network_is_white = False
         
+        # Notify live game viewer of new game
+        if live_game is not None:
+            live_game.start_game(game_counter + game_idx, config.get('step', 0) if hasattr(config, 'get') else 0,
+                                 game_type="reference",
+                                 match_info=f"Reference Game {game_idx+1}/{num_games}")
+        
         board = chess.Board()
         move_count = 0
         
@@ -287,6 +317,8 @@ def play_match_vs_alpha_beta(network: AlphaZeroNet, config,
             c_puct=config.mcts.c_puct,
             dirichlet_alpha=0.0,
             dirichlet_epsilon=0.0,
+            batch_size=getattr(config.mcts, 'batch_size', 1),
+            c_virtual_loss=getattr(config.mcts, 'c_virtual_loss', 0.5),
         )
         
         while not board.is_game_over() and move_count < config.selfplay.max_game_length:
@@ -299,13 +331,19 @@ def play_match_vs_alpha_beta(network: AlphaZeroNet, config,
                 _, selected_move = mcts.select_move_with_temperature(root, temperature=0.1)
                 if selected_move is None:
                     break
+                # Build MCTS stats for callback
+                mcts_stats = _build_mcts_stats(root, selected_move) if on_move else None
                 board.push(selected_move)
+                if on_move:
+                    on_move(board.fen(), selected_move.uci(), move_count, mcts_stats=mcts_stats)
             else:
                 # Alpha-beta's turn
                 move = alpha_beta_best_move(board, ab_depth)
                 if move is None:
                     break
                 board.push(move)
+                if on_move:
+                    on_move(board.fen(), move.uci(), move_count)
             
             move_count += 1
         
@@ -322,6 +360,10 @@ def play_match_vs_alpha_beta(network: AlphaZeroNet, config,
                 wins += 1
         else:
             draws += 1
+        
+        # Notify live game viewer that game is over
+        if live_game is not None:
+            live_game.game_over(result, 'reference_game')
         
         if verbose:
             print(f"  Game {game_idx+1}/{num_games}: {result} "
@@ -342,8 +384,26 @@ def play_match_vs_alpha_beta(network: AlphaZeroNet, config,
 # Internal Helpers
 # ============================================================
 
+def _build_mcts_stats(root, selected_move):
+    """Build MCTS candidate stats dict from a search root."""
+    candidates = []
+    if root.children:
+        for move, child in sorted(root.children.items(), key=lambda x: x[1].N, reverse=True)[:10]:
+            candidates.append({
+                'move': move.uci(),
+                'N': child.N,
+                'W': float(child.W),
+                'Q': float(child.Q),
+                'P': float(child.P),
+            })
+    return {
+        'selected_move': selected_move.uci(),
+        'candidates': candidates,
+    }
+
+
 def _play_evaluation_game(mcts_a: MCTS, mcts_b: MCTS, a_is_white: bool,
-                           max_moves: int = 150) -> str:
+                           max_moves: int = 150, on_move=None) -> str:
     """Play a single evaluation game between two MCTS agents."""
     board = chess.Board()
     move_count = 0
@@ -359,8 +419,14 @@ def _play_evaluation_game(mcts_a: MCTS, mcts_b: MCTS, a_is_white: bool,
         if selected_move is None:
             break
         
+        # Build MCTS stats for callback
+        mcts_stats = _build_mcts_stats(root, selected_move) if on_move else None
+        
         board.push(selected_move)
         move_count += 1
+        
+        if on_move:
+            on_move(board.fen(), selected_move.uci(), move_count, mcts_stats=mcts_stats)
     
     return board.result() if board.is_game_over() else "*"
 
@@ -372,24 +438,40 @@ def _play_evaluation_game(mcts_a: MCTS, mcts_b: MCTS, a_is_white: bool,
 class Evaluator:
     """Manages periodic evaluation: gating matches, reference matches, Elo tracking."""
     
-    def __init__(self, config, stats_logger):
+    def __init__(self, config, stats_logger, live_game=None):
         self.config = config
         self.stats = stats_logger
         self.best_elo = 1000.0
         self.ref_elo = 800.0  # Starting Elo for the alpha-beta reference
+        self.live_game = live_game  # LiveGameState for eval game viewing
     
     def run_gating_match(self, latest_network: AlphaZeroNet, 
                          best_network: AlphaZeroNet,
-                         step: int, verbose: bool = False) -> dict:
+                         step: int, verbose: bool = False,
+                         game_counter: int = 0) -> dict:
         """Run a gating match between latest and best network.
+        
+        Args:
+            game_counter: Starting game index for numbering (for display)
         
         Returns dict with promotion result.
         """
         num_games = self.config.evaluation.gate_games
         
+        # Create per-game callbacks for live board updates if live_game is available
+        def _make_on_move(game_idx):
+            if self.live_game is None:
+                return None
+            def _on_move(fen, uci, move_num, mcts_stats=None):
+                self.live_game.update(fen, uci, move_num, mcts_stats=mcts_stats)
+            return _on_move
+        
         match_result = play_match(
             latest_network, best_network, self.config,
-            num_games=num_games, verbose=verbose
+            num_games=num_games, verbose=verbose,
+            on_move=_make_on_move(0),
+            live_game=self.live_game,
+            game_counter=game_counter,
         )
         
         win_rate = match_result['win_rate_a']
@@ -430,13 +512,29 @@ class Evaluator:
         }
     
     def run_reference_match(self, network: AlphaZeroNet,
-                            step: int, verbose: bool = False) -> dict:
-        """Run evaluation matches against the alpha-beta reference opponent."""
+                            step: int, verbose: bool = False,
+                            game_counter: int = 0) -> dict:
+        """Run evaluation matches against the alpha-beta reference opponent.
+        
+        Args:
+            game_counter: Starting game index for numbering (for display)
+        """
         num_games = self.config.evaluation.ref_opponent_games
+        
+        # Create per-game callbacks for live board updates if live_game is available
+        def _make_on_move_ref(game_idx):
+            if self.live_game is None:
+                return None
+            def _on_move_ref(fen, uci, move_num, mcts_stats=None):
+                self.live_game.update(fen, uci, move_num, mcts_stats=mcts_stats)
+            return _on_move_ref
         
         match_result = play_match_vs_alpha_beta(
             network, self.config,
-            num_games=num_games, verbose=verbose
+            num_games=num_games, verbose=verbose,
+            on_move=_make_on_move_ref(0),
+            live_game=self.live_game,
+            game_counter=game_counter,
         )
         
         # Log evaluation

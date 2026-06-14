@@ -10,10 +10,12 @@ network:
 
 # --- MCTS ---
 mcts:
-  num_simulations: 200        # Per move (tunable: 50-800)
-  c_puct: 1.5                 # PUCT exploration constant
+  num_simulations: 400       # Per move (tunable: 50-800)
+  c_puct: 3.0                # PUCT exploration constant
   dirichlet_alpha: 0.3        # Dirichlet noise alpha
-  dirichlet_epsilon: 0.25     # Weight of noise vs prior
+  dirichlet_epsilon: 0.4     # Weight of noise vs prior
+  batch_size: 8               # Batch size for tree-parallel MCTS (1 = sequential, no virtual loss)
+  c_virtual_loss: 0.5         # Virtual loss penalty for batch MCTS
 
 # --- Self-Play ---
 selfplay:

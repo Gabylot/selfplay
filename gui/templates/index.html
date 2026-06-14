@@ -91,6 +91,14 @@
         .board-status-badge.idle { background: #555; color: #ccc; }
         .mcts-stats-inline { font-size: 10px; color: #666; margin-left: 4px; }
         .move-list .move.current .mcts-stats-inline { color: #aaa; }
+
+        /* Eval Board Styles */
+        .eval-section { margin-bottom: 16px; border: 1px solid #e94560; }
+        .eval-section .card h2 { color: #ff9500; }
+        .eval-match-info { font-size: 13px; color: #ff9500; font-weight: bold; }
+        .eval-game-history-item .type-tag { font-size: 10px; padding: 1px 6px; border-radius: 8px; margin-right: 6px; font-weight: bold; }
+        .eval-game-history-item .type-tag.gating { background: #e94560; color: #fff; }
+        .eval-game-history-item .type-tag.reference { background: #53a0ff; color: #fff; }
     </style>
 </head>
 <body>
@@ -143,6 +151,56 @@
                         <h2 style="font-size:12px;margin-bottom:6px">Recent Games</h2>
                         <div class="game-history-list" id="game-history-list">
                             <div style="color:#555;text-align:center">No completed games yet</div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Evaluation Live Board -->
+        <div class="card live-section eval-section">
+            <h2>Evaluation Games</h2>
+            <div class="live-grid">
+                <div class="board-wrapper">
+                    <div id="eval-chess-board" style="width: 400px"></div>
+                </div>
+                <div class="board-info">
+                    <div style="display:flex;gap:12px;align-items:center;flex-wrap:wrap">
+                        <span class="game-status">Eval Game <strong id="eval-lg-game-id">—</strong> &nbsp;|&nbsp; Move <strong id="eval-lg-move-num">0</strong></span>
+                        <span class="board-status-badge idle" id="eval-lg-status-badge">IDLE</span>
+                        <span class="eval-match-info" id="eval-match-info"></span>
+                    </div>
+                    <div class="game-status" id="eval-lg-turn-info"></div>
+                    <div class="game-controls">
+                        <button id="eval-btn-pause" class="active" onclick="evalTogglePause()">⏸ Pause</button>
+                        <button onclick="evalStepBack()">◀ Back</button>
+                        <button onclick="evalStepForward()">▶ Fwd</button>
+                        <button onclick="evalGoToStart()">⏮ Start</button>
+                        <button onclick="evalGoToEnd()">⏭ End</button>
+                        <button id="eval-btn-live" onclick="evalGoLive()" style="display:none">🔴 Live</button>
+                        <div class="speed-control">
+                            <span>Speed:</span>
+                            <input type="range" id="eval-speed-slider" min="100" max="3000" value="500" step="100" oninput="evalUpdateSpeed()">
+                            <span id="eval-speed-label">500ms</span>
+                        </div>
+                    </div>
+                    <div class="game-status" id="eval-lg-result" style="display:none"></div>
+                    <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;">
+                        <div>
+                            <div style="font-size:11px;color:#555;text-transform:uppercase;letter-spacing:1px;margin-bottom:4px;">Move List</div>
+                            <div class="move-list" id="eval-move-list"></div>
+                        </div>
+                        <div>
+                            <div style="font-size:11px;color:#555;text-transform:uppercase;letter-spacing:1px;margin-bottom:4px;">MCTS Candidates (N W Q P)</div>
+                            <div class="mcts-candidates" id="eval-mcts-candidates">
+                                <div style="color:#555;text-align:center;">No MCTS data</div>
+                            </div>
+                        </div>
+                    </div>
+                    <div>
+                        <h2 style="font-size:12px;margin-bottom:6px">Recent Eval Games</h2>
+                        <div class="game-history-list" id="eval-game-history-list">
+                            <div style="color:#555;text-align:center">No completed eval games yet</div>
                         </div>
                     </div>
                 </div>
@@ -210,6 +268,7 @@
         var latestGameState = null;
         var isReplaying = false;
         var replayGameId = null;
+        var replayGameData = null;  // Full game data for the currently replayed game
 
         function initBoard() {
             board = Chessboard('chess-board', {
@@ -327,7 +386,9 @@
             var badge = document.getElementById('lg-status-badge');
             var gameEl = document.getElementById('lg-game-id');
             var moveEl = document.getElementById('lg-move-num');
-            gameEl.textContent = latestGameState ? ('#' + latestGameState.game_id) : '—';
+            // Use replay data if replaying, otherwise use live state
+            var stateForDisplay = (isReplaying && replayGameData) ? replayGameData : latestGameState;
+            gameEl.textContent = stateForDisplay ? ('#' + stateForDisplay.game_id) : '—';
             moveEl.textContent = liveState.currentViewIndex + 1;
 
             badge.className = 'board-status-badge ' + liveState.status;
@@ -349,9 +410,11 @@
 
         function updateResult() {
             var el = document.getElementById('lg-result');
-            if (latestGameState && latestGameState.result) {
-                var resultText = latestGameState.result;
-                var termText = latestGameState.termination || '';
+            // Use replay data if replaying, otherwise use live state
+            var stateForResult = (isReplaying && replayGameData) ? replayGameData : latestGameState;
+            if (stateForResult && stateForResult.result) {
+                var resultText = stateForResult.result;
+                var termText = stateForResult.termination || '';
                 var cls = 'draw';
                 if (resultText === '1-0') cls = 'white';
                 else if (resultText === '0-1') cls = 'black';
@@ -447,7 +510,10 @@
         });
 
         socket.on('live_game_update', function(data) {
-            latestGameState = data;
+            // Save latest live state, but don't overwrite the replay display
+            if (!isReplaying) {
+                latestGameState = data;
+            }
 
             // If user is watching a replay, don't overwrite their view
             if (isReplaying) {
@@ -503,6 +569,7 @@
 
         socket.on('replay_game', function(data) {
             // Replay a completed game on the board
+            replayGameData = data;  // Store for display purposes
             lastGameId = data.game_id;
             liveState = { moves: [], fens: [], mctsStats: [], status: 'finished', currentViewIndex: -1 };
             movesReplayedUpTo = data.moves.length - 1;
@@ -512,7 +579,10 @@
             if (data.mcts_stats_per_move) {
                 liveState.mctsStats = data.mcts_stats_per_move.slice();
             }
-            latestGameState = data;
+            // Only update latestGameState if not currently replaying anything new arrives here fresh
+            if (!isReplaying) {
+                latestGameState = data;
+            }
             board.position('start', false);
             // Start auto-replay from the beginning
             liveState.currentViewIndex = -1;
@@ -555,6 +625,7 @@
         function goLive() {
             isReplaying = false;
             replayGameId = null;
+            replayGameData = null;
             document.getElementById('btn-live').style.display = 'none';
             socket.emit('request_live_state');
         }
@@ -690,9 +761,282 @@
         refreshAll();
         setInterval(refreshAll, 5000);
 
-        // Init board on page load
+        // ===== Eval Board =====
+        var evalBoard = null;
+        var evalChess = new Chess();
+        var evalState = { moves: [], fens: [], mctsStats: [], status: 'idle', currentViewIndex: -1 };
+        var evalIsPaused = false;
+        var evalPlayInterval = null;
+        var evalPlaySpeed = 500;
+        var evalLatestState = null;
+        var evalIsReplaying = false;
+        var evalReplayGameData = null;
+        var evalLastGameId = 0;
+        var evalMovesReplayedUpTo = -1;
+
+        function evalInitBoard() {
+            evalBoard = Chessboard('eval-chess-board', {
+                position: 'start',
+                showNotation: true,
+                pieceTheme: '/chess_pieces/{piece}.png'
+            });
+        }
+
+        function evalUpdateBoard() {
+            if (!evalBoard) return;
+            if (evalState.currentViewIndex >= 0 && evalState.currentViewIndex < evalState.fens.length) {
+                evalBoard.position(evalState.fens[evalState.currentViewIndex], false);
+            } else if (evalState.fens.length === 0) {
+                evalBoard.position('start', false);
+            }
+            evalUpdateMoveList();
+            evalUpdateMctsCandidates();
+            evalUpdateTurnInfo();
+        }
+
+        function evalUpdateMoveList() {
+            var ml = document.getElementById('eval-move-list');
+            var html = '';
+            for (var i = 0; i < evalState.moves.length; i += 2) {
+                var moveNum = Math.floor(i / 2) + 1;
+                var whiteMove = evalState.moves[i];
+                var blackMove = (i + 1 < evalState.moves.length) ? evalState.moves[i + 1] : null;
+                var wClass = 'move white-move';
+                var bClass = 'move black-move';
+                if (i === evalState.currentViewIndex) wClass += ' current';
+                if (i + 1 === evalState.currentViewIndex) bClass += ' current';
+                html += '<div class="move-pair"><span class="move-num">' + moveNum + '.</span>';
+                html += '<span class="' + wClass + '" onclick="evalOnMoveClick(' + i + ')">' + whiteMove + '</span>';
+                if (blackMove) {
+                    html += '<span class="' + bClass + '" onclick="evalOnMoveClick(' + (i + 1) + ')">' + blackMove + '</span>';
+                }
+                html += '</div>';
+            }
+            ml.innerHTML = html;
+            var currentEl = ml.querySelector('.move.current');
+            if (currentEl) {
+                var elTop = currentEl.offsetTop;
+                var elHeight = currentEl.offsetHeight;
+                var containerHeight = ml.clientHeight;
+                var newScrollTop = elTop - (containerHeight / 2) + (elHeight / 2);
+                if (newScrollTop < 0) newScrollTop = 0;
+                ml.scrollTop = newScrollTop;
+            }
+        }
+
+        function evalOnMoveClick(moveIndex) {
+            evalState.currentViewIndex = moveIndex;
+            evalUpdateBoard();
+        }
+
+        function evalUpdateMctsCandidates() {
+            var el = document.getElementById('eval-mcts-candidates');
+            var moveIdx = evalState.currentViewIndex;
+            if (moveIdx < 0 || !evalState.mctsStats || moveIdx >= evalState.mctsStats.length) {
+                el.innerHTML = '<div style="color:#555;text-align:center;">No MCTS data</div>';
+                return;
+            }
+            var ms = evalState.mctsStats[moveIdx];
+            if (!ms || !ms.candidates || ms.candidates.length === 0) {
+                el.innerHTML = '<div style="color:#555;text-align:center;">No MCTS data</div>';
+                return;
+            }
+            var cands = ms.candidates;
+            var selectedMove = ms.selected_move;
+            var html = '<table><thead><tr><th>Move</th><th>N</th><th>W</th><th>Q</th><th>P</th></tr></thead><tbody>';
+            for (var i = 0; i < cands.length; i++) {
+                var c = cands[i];
+                var cls = (c.move === selectedMove) ? ' class="selected"' : '';
+                html += '<tr' + cls + '><td>' + c.move + '</td><td>' + c.N + '</td><td>' + c.W.toFixed(2) + '</td><td>' + c.Q.toFixed(2) + '</td><td>' + c.P.toFixed(3) + '</td></tr>';
+            }
+            html += '</tbody></table>';
+            el.innerHTML = html;
+        }
+
+        function evalUpdateTurnInfo() {
+            var el = document.getElementById('eval-lg-turn-info');
+            var badge = document.getElementById('eval-lg-status-badge');
+            var gameEl = document.getElementById('eval-lg-game-id');
+            var moveEl = document.getElementById('eval-lg-move-num');
+            var stateForDisplay = (evalIsReplaying && evalReplayGameData) ? evalReplayGameData : evalLatestState;
+            gameEl.textContent = stateForDisplay ? ('#' + stateForDisplay.game_id) : '\u2014';
+            moveEl.textContent = evalState.currentViewIndex + 1;
+            badge.className = 'board-status-badge ' + evalState.status;
+            badge.textContent = evalState.status.toUpperCase();
+            if (evalState.status === 'playing') {
+                var turn = (evalState.currentViewIndex + 1) % 2 === 0 ? 'White' : 'Black';
+                if (evalState.currentViewIndex === -1) turn = 'White';
+                el.textContent = turn + ' to move';
+                el.style.color = turn === 'White' ? '#ccc' : '#53a0ff';
+            } else if (evalState.status === 'finished') {
+                el.textContent = 'Game over';
+                el.style.color = '#888';
+            } else {
+                el.textContent = 'Waiting for eval game...';
+                el.style.color = '#555';
+            }
+            // Match info
+            var matchInfoEl = document.getElementById('eval-match-info');
+            if (stateForDisplay && stateForDisplay.match_info) {
+                matchInfoEl.textContent = stateForDisplay.match_info;
+            } else {
+                matchInfoEl.textContent = '';
+            }
+        }
+
+        function evalUpdateResult() {
+            var el = document.getElementById('eval-lg-result');
+            var stateForResult = (evalIsReplaying && evalReplayGameData) ? evalReplayGameData : evalLatestState;
+            if (stateForResult && stateForResult.result) {
+                var resultText = stateForResult.result;
+                var termText = stateForResult.termination || '';
+                var cls = 'draw';
+                if (resultText === '1-0') cls = 'white';
+                else if (resultText === '0-1') cls = 'black';
+                el.innerHTML = '<span class="result ' + cls + '">' + resultText + '</span> &mdash; ' + termText;
+                el.style.display = 'block';
+            } else {
+                el.style.display = 'none';
+            }
+        }
+
+        // Eval Playback Controls
+        function evalTogglePause() {
+            evalIsPaused = !evalIsPaused;
+            var btn = document.getElementById('eval-btn-pause');
+            if (evalIsPaused) {
+                btn.textContent = '\u25b6 Play';
+                btn.classList.remove('active');
+                evalStopAutoPlay();
+            } else {
+                btn.textContent = '\u23f8 Pause';
+                btn.classList.add('active');
+                evalStartAutoPlay();
+            }
+        }
+        function evalStartAutoPlay() {
+            evalStopAutoPlay();
+            evalPlayInterval = setInterval(function() {
+                if (evalState.currentViewIndex < evalState.fens.length - 1) {
+                    evalState.currentViewIndex++;
+                    evalUpdateBoard();
+                } else { evalStopAutoPlay(); }
+            }, evalPlaySpeed);
+        }
+        function evalStopAutoPlay() { if (evalPlayInterval) { clearInterval(evalPlayInterval); evalPlayInterval = null; } }
+        function evalStepBack() {
+            if (evalState.currentViewIndex > 0) { evalState.currentViewIndex--; evalUpdateBoard(); }
+            else if (evalState.currentViewIndex === 0) { evalState.currentViewIndex = -1; evalBoard.position('start', true); evalUpdateMoveList(); evalUpdateMctsCandidates(); evalUpdateTurnInfo(); }
+        }
+        function evalStepForward() { if (evalState.currentViewIndex < evalState.fens.length - 1) { evalState.currentViewIndex++; evalUpdateBoard(); } }
+        function evalGoToStart() { evalState.currentViewIndex = -1; evalBoard.position('start', true); evalUpdateMoveList(); evalUpdateMctsCandidates(); evalUpdateTurnInfo(); }
+        function evalGoToEnd() { if (evalState.fens.length > 0) { evalState.currentViewIndex = evalState.fens.length - 1; evalUpdateBoard(); } }
+        function evalUpdateSpeed() {
+            evalPlaySpeed = parseInt(document.getElementById('eval-speed-slider').value);
+            document.getElementById('eval-speed-label').textContent = evalPlaySpeed + 'ms';
+            if (!evalIsPaused) evalStartAutoPlay();
+        }
+
+        // Eval Socket.IO handlers
+        socket.on('connect', function() {
+            socket.emit('request_eval_live_state');
+        });
+
+        socket.on('eval_live_game_update', function(data) {
+            if (!evalIsReplaying) { evalLatestState = data; }
+            if (evalIsReplaying) { return; }
+            if (data.game_id !== evalLastGameId) {
+                evalLastGameId = data.game_id;
+                evalState = { moves: [], fens: [], mctsStats: [], status: data.status, currentViewIndex: -1 };
+                evalMovesReplayedUpTo = -1;
+                document.getElementById('eval-lg-result').style.display = 'none';
+                evalBoard.position('start', false);
+            }
+            evalState.status = data.status;
+            while (evalMovesReplayedUpTo < data.moves.length - 1) {
+                evalMovesReplayedUpTo++;
+                evalState.moves.push(data.moves[evalMovesReplayedUpTo]);
+                evalState.fens.push(data.fens[evalMovesReplayedUpTo]);
+                if (data.mcts_stats_per_move && evalMovesReplayedUpTo < data.mcts_stats_per_move.length) {
+                    evalState.mctsStats.push(data.mcts_stats_per_move[evalMovesReplayedUpTo]);
+                }
+            }
+            if (!evalIsPaused) {
+                evalState.currentViewIndex = evalState.fens.length - 1;
+                evalUpdateBoard();
+            }
+            evalUpdateResult();
+            if (!window._evalGameHistoryPending) {
+                window._evalGameHistoryPending = true;
+                setTimeout(function() {
+                    window._evalGameHistoryPending = false;
+                    evalRefreshGameHistory();
+                }, 2000);
+            }
+        });
+
+        socket.on('eval_game_history', function(history) {
+            evalUpdateGameHistoryList(history);
+        });
+
+        socket.on('replay_eval_game', function(data) {
+            evalReplayGameData = data;
+            evalLastGameId = data.game_id;
+            evalState = { moves: [], fens: [], mctsStats: [], status: 'finished', currentViewIndex: -1 };
+            evalMovesReplayedUpTo = data.moves.length - 1;
+            evalState.moves = data.moves.slice();
+            evalState.fens = data.fens.slice();
+            if (data.mcts_stats_per_move) { evalState.mctsStats = data.mcts_stats_per_move.slice(); }
+            if (!evalIsReplaying) { evalLatestState = data; }
+            evalBoard.position('start', false);
+            evalState.currentViewIndex = -1;
+            evalUpdateBoard();
+            document.getElementById('eval-lg-result').style.display = 'none';
+            if (evalIsPaused) evalTogglePause();
+        });
+
+        function evalRefreshGameHistory() { socket.emit('request_eval_game_history'); }
+
+        function evalUpdateGameHistoryList(history) {
+            var el = document.getElementById('eval-game-history-list');
+            if (!history || history.length === 0) {
+                el.innerHTML = '<div style="color:#555;text-align:center">No completed eval games yet</div>';
+                return;
+            }
+            var html = '';
+            history.forEach(function(g) {
+                var r = g.result || '*';
+                var cls = 'draw';
+                if (r === '1-0') cls = 'white';
+                else if (r === '0-1') cls = 'black';
+                var type = g.game_type || 'eval';
+                var typeCls = (type === 'gating') ? 'gating' : 'reference';
+                var info = g.match_info || type;
+                html += '<div class="game-history-item eval-game-history-item" onclick="evalReplayGame(' + g.game_id + ')">';
+                html += '<span><span class="type-tag ' + typeCls + '">' + type.toUpperCase() + '</span>Game #' + g.game_id + ' <span style="color:#555">(' + g.num_moves + ' moves) ' + info + '</span></span>';
+                html += '<span class="result-tag ' + cls + '">' + r + '</span>';
+                html += '</div>';
+            });
+            el.innerHTML = html;
+        }
+
+        function evalReplayGame(gameId) {
+            evalIsReplaying = true;
+            socket.emit('request_replay_eval_game', { game_id: gameId });
+            document.getElementById('eval-btn-live').style.display = '';
+        }
+
+        function evalGoLive() {
+            evalIsReplaying = false;
+            evalReplayGameData = null;
+            document.getElementById('eval-btn-live').style.display = 'none';
+            socket.emit('request_eval_live_state');
+        }
+
+        // Init eval board on page load
         $(document).ready(function() {
             initBoard();
+            evalInitBoard();
         });
     </script>
 </body>

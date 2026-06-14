@@ -278,7 +278,54 @@ def play_one_game(mcts_engine: MCTS,
         else:
             # Board is not in game-over state; force draw with proper termination
             outcome = 0.0
-            termination = "max_length" if move_count >= max_game_length else "unknown"
+            if move_count >= max_game_length:
+                termination = "max_length"
+            else:
+                termination = "unknown"
+                # --- DIAGNOSTIC LOGGING ---
+                with open("unknown_termination_log.txt", "a") as f:
+                    f.write("=" * 60 + "\n")
+                    f.write(f"UNKNOWN TERMINATION at move_count={move_count}\n")
+                    f.write(f"FEN: {board.fen()}\n")
+                    f.write(f"board.is_game_over(): {board.is_game_over()}\n")
+                    f.write(f"Legal moves count: {len(list(board.legal_moves))}\n")
+                    f.write(f"Legal moves: {[m.uci() for m in board.legal_moves]}\n")
+    
+                    # Re-run MCTS one more time on this exact position so we
+                    # can inspect what happened (note: this may give slightly
+                    # different results due to randomness, but the position
+                    # and root.children should reveal the structural issue).
+                    root = mcts_engine.get_root(board)
+                    visit_policy, best_move, stats = mcts_engine.search(root)
+    
+                    f.write(f"root.children count: {len(root.children)}\n")
+                    f.write(f"root.children keys: {sorted(root.children.keys())}\n")
+                    total_visits = sum(c.N for c in root.children.values())
+                    f.write(f"total visits across children: {total_visits}\n")
+    
+                    for idx, child in root.children.items():
+                        f.write(
+                            f"  child idx={idx}, N={child.N}, P={child.P:.4f}, "
+                            f"Q={child.Q:.4f}, move={child.move}, "
+                            f"move_in_legal={child.move in board.legal_moves}\n"
+                        )
+    
+                    f.write(f"search() returned best_move: {best_move}\n")
+    
+                    best_idx = int(np.argmax(visit_policy)) if visit_policy.sum() > 0 else None
+                    f.write(f"argmax(visit_policy): {best_idx}\n")
+                    if best_idx is not None:
+                        f.write(f"best_idx in root.children: {best_idx in root.children}\n")
+                        from encoding import policy_index_to_move
+                        decoded = policy_index_to_move(best_idx, board)
+                        f.write(f"policy_index_to_move(best_idx, board): {decoded}\n")
+    
+                    f.write(f"select_move_with_temperature was called with selected_move=None\n")
+                    f.write(f"visit_policy.sum(): {visit_policy.sum()}\n")
+                    f.write(f"visit_policy.max(): {visit_policy.max()}\n")
+                    f.write("=" * 60 + "\n\n")
+                # --- END DIAGNOSTIC LOGGING ---
+
     
     # Assign values to all positions from each player's perspective
     game_data = []
@@ -322,6 +369,8 @@ def self_play_game(network: AlphaZeroNet, config, on_move=None) -> Tuple[List[Tu
         c_puct=config.mcts.c_puct,
         dirichlet_alpha=config.mcts.dirichlet_alpha,
         dirichlet_epsilon=config.mcts.dirichlet_epsilon,
+        batch_size=getattr(config.mcts, 'batch_size', 1),
+        c_virtual_loss=getattr(config.mcts, 'c_virtual_loss', 0.5),
     )
     
     return play_one_game(

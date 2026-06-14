@@ -294,6 +294,7 @@ def policy_index_to_move(index: int, board: chess.Board) -> chess.Move:
         # Adjust direction based on color
         if board.turn == chess.BLACK:
             dr = -dr
+            dc = -dc
         
         to_rank = from_rank + dr
         to_file = from_file + dc
@@ -344,6 +345,29 @@ def get_legal_move_mask(board: chess.Board) -> np.ndarray:
             mask[idx] = 1.0
         except ValueError:
             # Move encoding failed — shouldn't happen for legal moves
+            continue
+    return mask
+
+
+def get_legal_move_mask_from_moves(legal_moves: list, board: chess.Board) -> np.ndarray:
+    """Get a (4672,) binary mask from a precomputed list of legal moves.
+    
+    This avoids a second iteration over board.legal_moves when the caller
+    has already generated the legal moves list.
+    
+    Args:
+        legal_moves: List of chess.Move objects (already computed)
+        board: Board state (needed for move_to_policy_index context)
+    
+    Returns:
+        mask: (4672,) binary mask
+    """
+    mask = np.zeros(NUM_ACTIONS, dtype=np.float32)
+    for move in legal_moves:
+        try:
+            idx = move_to_policy_index(move, board)
+            mask[idx] = 1.0
+        except ValueError:
             continue
     return mask
 

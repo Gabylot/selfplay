@@ -66,14 +66,15 @@ def run_training(config, gui_enabled: bool = False):
     stats = StatsLogger(str(stats_db_path))
     print(f"[INFO] Stats database: {stats_db_path}")
     
-    # Setup live game state
+    # Setup live game states (one for self-play, one for evaluation)
     live_game = LiveGameState(max_history=20)
+    eval_live_game = LiveGameState(max_history=50)
     
     # Setup replay buffer
     buffer = ReplayBuffer(max_size=config.buffer.max_size)
     
-    # Setup evaluator
-    evaluator = Evaluator(config, stats)
+    # Setup evaluator (with eval live game for GUI viewing)
+    evaluator = Evaluator(config, stats, live_game=eval_live_game)
     
     # Create optimizer (ensure numeric types from YAML)
     optimizer = create_optimizer(
@@ -86,6 +87,7 @@ def run_training(config, gui_enabled: bool = False):
     # Global counters
     step = 0
     game_id = 0
+    eval_game_counter = 0  # Counter for eval games (separate from self-play)
     best_network = create_model_from_config(config)  # Copy for gating reference
     best_network.load_state_dict(network.state_dict())
     best_network.to(device)
@@ -100,7 +102,11 @@ def run_training(config, gui_enabled: bool = False):
     gui_thread = None
     if gui_enabled:
         from gui.app import start_gui_server
-        gui_thread = threading.Thread(target=start_gui_server, args=(stats, config, live_game), daemon=True)
+        gui_thread = threading.Thread(
+            target=start_gui_server, 
+            args=(stats, config, live_game, eval_live_game), 
+            daemon=True
+        )
         gui_thread.start()
         print(f"[INFO] GUI server started at http://{config.gui.host}:{config.gui.port}")
     
@@ -111,7 +117,14 @@ def run_training(config, gui_enabled: bool = False):
         ckpt = load_checkpoint(str(latest_ckpt), network, optimizer)
         step = ckpt.get('step', 0)
         game_id = ckpt.get('game_id', 0)
+        eval_game_counter = ckpt.get('eval_game_counter', 0)
+        # Restore evaluator Elo state
+        if 'best_elo' in ckpt:
+            evaluator.best_elo = ckpt['best_elo']
+        if 'ref_elo' in ckpt:
+            evaluator.ref_elo = ckpt['ref_elo']
         print(f"[INFO] Resumed from step {step}, game {game_id}")
+        print(f"[INFO] Restored Elo: best={evaluator.best_elo:.0f}, ref={evaluator.ref_elo:.0f}")
     
     print(f"\n{'='*60}")
     print(f"  AlphaZero Training Started")
@@ -227,11 +240,17 @@ def run_training(config, gui_enabled: bool = False):
         
         # --- Checkpoint ---
         if step % config.training.checkpoint_interval == 0:
+            ckpt_extra = {
+                'game_id': game_id,
+                'eval_game_counter': eval_game_counter,
+                'best_elo': evaluator.best_elo,
+                'ref_elo': evaluator.ref_elo,
+            }
             ckpt_path = checkpoints_dir / f"step_{step}.pt"
             save_checkpoint(network, optimizer, str(ckpt_path), step, 
-                          extra={'game_id': game_id})
+                          extra=ckpt_extra)
             save_checkpoint(network, optimizer, str(checkpoints_dir / "latest.pt"), step,
-                          extra={'game_id': game_id})
+                          extra=ckpt_extra)
             print(f"  Checkpoint saved: {ckpt_path}")
         
         # --- Evaluation phase (monitoring — does NOT gate self-play) ---
@@ -239,16 +258,21 @@ def run_training(config, gui_enabled: bool = False):
             print(f"[Step {step}] Running evaluation (monitoring)...")
             
             # Gating match (monitoring only)
+            # Per-game start/finish is handled inside the match functions
             gating_result = evaluator.run_gating_match(
-                network, best_network, step, verbose=True
+                network, best_network, step, verbose=True,
+                game_counter=eval_game_counter
             )
+            eval_game_counter += config.evaluation.gate_games
             
             if gating_result['promoted']:
                 best_network.load_state_dict(network.state_dict())
                 print(f"  [GATE] Network promoted! New Elo: {evaluator.best_elo:.0f}")
             
             # Reference match vs alpha-beta
-            ref_result = evaluator.run_reference_match(network, step, verbose=True)
+            ref_result = evaluator.run_reference_match(network, step, verbose=True,
+                                                        game_counter=eval_game_counter)
+            eval_game_counter += config.evaluation.ref_opponent_games
             print(f"  vs Alpha-Beta: {ref_result['win_rate']:.2%} win rate")
         
         # Summary
@@ -259,7 +283,12 @@ def run_training(config, gui_enabled: bool = False):
     
     # Save final checkpoint
     save_checkpoint(network, optimizer, str(checkpoints_dir / "latest.pt"), step,
-                    extra={'game_id': game_id})
+                    extra={
+                        'game_id': game_id,
+                        'eval_game_counter': eval_game_counter,
+                        'best_elo': evaluator.best_elo,
+                        'ref_elo': evaluator.ref_elo,
+                    })
     
     stats.close()
     print("[INFO] Training loop finished.")

@@ -30,10 +30,12 @@ def load_config(path: Optional[str] = None) -> dict:
             "value_fc_size": 256,
         },
         "mcts": {
-            "num_simulations": 200,
-            "c_puct": 1.5,
+            "num_simulations": 400,
+            "c_puct": 3.0,
             "dirichlet_alpha": 0.3,
-            "dirichlet_epsilon": 0.25,
+            "dirichlet_epsilon": 0.4,
+            "batch_size": 8,
+            "c_virtual_loss": 0.5,
         },
         "selfplay": {
             "network_source": "latest",

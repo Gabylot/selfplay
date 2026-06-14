@@ -41,8 +41,16 @@ class LiveGameState:
         # Completed games history (for replay)
         self._game_history: deque = deque(maxlen=max_history)
     
-    def start_game(self, game_id: int, step: int):
-        """Called when a new self-play game begins."""
+    def start_game(self, game_id: int, step: int, game_type: str = "selfplay",
+                   match_info: str = None):
+        """Called when a new game begins.
+        
+        Args:
+            game_id: Unique game identifier
+            step: Current training step
+            game_type: "selfplay", "gating", or "reference"
+            match_info: Optional description like "Gating 3/20"
+        """
         with self._lock:
             # Save previous game if one was in progress
             if self._status == "playing" and self._moves:
@@ -58,6 +66,8 @@ class LiveGameState:
             self._result = None
             self._termination = None
             self._move_number = 0
+            self._game_type = game_type
+            self._match_info = match_info
         
         self._emit_update()
     
@@ -109,6 +119,8 @@ class LiveGameState:
             'result': self._result,
             'termination': self._termination,
             'num_moves': len(self._moves),
+            'game_type': getattr(self, '_game_type', 'selfplay'),
+            'match_info': getattr(self, '_match_info', None),
         }
         self._game_history.appendleft(game)
     
@@ -128,6 +140,8 @@ class LiveGameState:
                 'move_number': self._move_number,
                 'current_fen': self._fens[-1] if self._fens else self._start_fen,
                 'last_move': self._moves[-1] if self._moves else None,
+                'game_type': getattr(self, '_game_type', 'selfplay'),
+                'match_info': getattr(self, '_match_info', None),
             }
     
     def get_game_history(self) -> list:
