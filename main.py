@@ -194,7 +194,8 @@ def run_training(config, gui_enabled=False, num_workers=None):
                            result=game_info['result'], result_str=game_info['result_str'],
                            length=game_info['length'], termination=game_info['termination'],
                            avg_mcts_depth=game_info['avg_mcts_depth'],
-                           num_positions=game_info['num_positions'])
+                           num_positions=game_info['num_positions'],
+                           material_diff=game_info.get('material_diff', 0))
             stats.log_mcts_stats(game_id=game_id, step=step,
                                  avg_tree_depth=game_info['avg_mcts_depth'],
                                  avg_sims_per_move=config.mcts.num_simulations)

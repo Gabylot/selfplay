@@ -51,6 +51,7 @@ class StatsLogger:
                 termination TEXT NOT NULL,
                 avg_mcts_depth REAL,
                 num_positions INTEGER,
+                material_diff INTEGER,
                 timestamp REAL NOT NULL
             );
             
@@ -141,14 +142,14 @@ class StatsLogger:
     
     def log_game(self, game_id: int, step: int, result: float, result_str: str,
                  length: int, termination: str, avg_mcts_depth: float = 0,
-                 num_positions: int = 0):
+                 num_positions: int = 0, material_diff: int = 0):
         """Log a completed self-play game."""
         self.conn.execute(
             "INSERT INTO game_log (game_id, step, result, result_str, length, termination, "
-            "avg_mcts_depth, num_positions, timestamp) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "avg_mcts_depth, num_positions, material_diff, timestamp) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (game_id, step, result, result_str, length, termination, avg_mcts_depth,
-             num_positions, time.time())
+             num_positions, material_diff, time.time())
         )
         self.conn.commit()
     
@@ -243,7 +244,8 @@ class StatsLogger:
     
     def get_game_outcomes(self, last_n: int = None) -> List[Dict]:
         """Get game outcomes over time."""
-        query = "SELECT game_id, step, result, length, termination, avg_mcts_depth, timestamp FROM game_log"
+        query = ("SELECT game_id, step, result, length, termination, avg_mcts_depth, "
+                 "material_diff, timestamp FROM game_log")
         if last_n:
             query += f" ORDER BY id DESC LIMIT {last_n}"
             rows = self.conn.execute(query).fetchall()
@@ -251,7 +253,8 @@ class StatsLogger:
         else:
             rows = self.conn.execute(query + " ORDER BY id ASC").fetchall()
         return [{'game_id': r[0], 'step': r[1], 'result': r[2], 'length': r[3],
-                 'termination': r[4], 'avg_mcts_depth': r[5], 'timestamp': r[6]} for r in rows]
+                 'termination': r[4], 'avg_mcts_depth': r[5],
+                 'material_diff': r[6], 'timestamp': r[7]} for r in rows]
     
     def get_elo_history(self) -> List[Dict]:
         """Get Elo rating history."""

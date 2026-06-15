@@ -122,6 +122,18 @@ def adjudicate_by_material(board, piece_values, graded=False, scaling=9.0):
     return 0.0
 
 
+def material_point_difference(board, piece_values):
+    """Return raw material point difference (white - black) at current position."""
+    w=b=0
+    for sq in chess.SQUARES:
+        p=board.piece_at(sq)
+        if p is None: continue
+        v=piece_values.get(p.symbol().upper(),0)
+        if p.color==chess.WHITE: w+=v
+        else: b+=v
+    return w-b
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Core game loop
 # ─────────────────────────────────────────────────────────────────────────────
@@ -135,9 +147,12 @@ def play_one_game(mcts_engine, max_game_length=150, adjudicate_material=True,
 
     board=chess.Board(); game_states=[]; mcts_stats_list=[]
     move_count=0; termination="unknown"; outcome=0.0
+    root=None  # Tree recycling: carry the subtree across moves
 
     while not board.is_game_over() and move_count<max_game_length:
-        root=mcts_engine.get_root(board)
+        # Reuse the recycled subtree, or create a fresh root
+        if root is None:
+            root=mcts_engine.get_root(board)
         visit_policy,best_move,stats=mcts_engine.search(root)
         move_candidates=mcts_engine.get_root_child_stats(root)
 
@@ -157,6 +172,11 @@ def play_one_game(mcts_engine, max_game_length=150, adjudicate_material=True,
         mcts_move_data={'selected_move':selected_move.uci(),'candidates':move_candidates}
         board.push(selected_move); move_count+=1
         if on_move: on_move(board.fen(),selected_move.uci(),move_count,mcts_move_data)
+
+        # Promote the selected child to root for the next move
+        root=mcts_engine.recycle_tree(root, selected_move)
+
+    material_diff=material_point_difference(board,piece_values)
 
     if board.is_game_over():
         r=board.result()
@@ -185,12 +205,21 @@ def play_one_game(mcts_engine, max_game_length=150, adjudicate_material=True,
             with open("unknown_termination_log.txt","a") as f:
                 f.write(f"UNKNOWN at move {move_count}: {board.fen()}\n")
 
+    # result_str: chess-standard string for display
+    if board.is_game_over():
+        result_str=board.result()
+    elif outcome>0:  result_str="1-0"
+    elif outcome<0:  result_str="0-1"
+    else:            result_str="1/2-1/2"
+
     game_data=[(s,p,outcome*pl) for s,p,pl in game_states]
     avg_depth=(np.mean([s.get('avg_depth',0) for s in mcts_stats_list]) if mcts_stats_list else 0)
     return game_data,{
-        'result':outcome,'result_str':board.result() if board.is_game_over() else '*',
+        'result':outcome,
+        'result_str':result_str,
         'length':move_count,'termination':termination,
         'avg_mcts_depth':float(avg_depth),'num_positions':len(game_data),
+        'material_diff':material_diff,
     }
 
 
@@ -327,16 +356,33 @@ def _worker_process(worker_id, task_queue, result_queue, config_dict, shutdown_e
                 load(net_b, task['weights_b'])
                 ea=mcts(net_a,False); eb=mcts(net_b,False)
                 board=chess.Board(); mc=0
+                root_a=None; root_b=None  # Tree recycling per engine
                 while not board.is_game_over() and mc<config.selfplay.max_game_length:
                     is_a=(board.turn==chess.WHITE)==a_is_white
                     e=ea if is_a else eb
-                    r=e.get_root(board); e.search(r)
+                    # Reuse recycled subtree, or create fresh root
+                    if is_a:
+                        if root_a is None:
+                            root_a=e.get_root(board)
+                        r=root_a
+                    else:
+                        if root_b is None:
+                            root_b=e.get_root(board)
+                        r=root_b
+                    e.search(r)
                     _,mv=e.select_move_with_temperature(r,0.1)
                     if mv is None: break
                     ms={'selected_move':mv.uci(),
                         'candidates':[{'move':c['move'],'N':c['N'],'W':c['W'],'Q':c['Q'],'P':c['P']}
                                       for c in e.get_root_child_stats(r)[:8]]}
                     board.push(mv); mc+=1; on_ev_live(board.fen(),mv.uci(),mc,ms)
+                    # Recycle tree for the engine that just moved
+                    if is_a:
+                        root_a=e.recycle_tree(r, mv)
+                        root_b=None  # Opponent's tree is invalidated by the move
+                    else:
+                        root_b=e.recycle_tree(r, mv)
+                        root_a=None
                 game_result=board.result() if board.is_game_over() else '*'
 
             else:  # reference
@@ -344,20 +390,26 @@ def _worker_process(worker_id, task_queue, result_queue, config_dict, shutdown_e
                 from evaluation import alpha_beta_best_move
                 ea=mcts(net_a,False)
                 board=chess.Board(); mc=0
+                root_net=None  # Tree recycling for the network engine
                 while not board.is_game_over() and mc<config.selfplay.max_game_length:
                     net_turn=(board.turn==chess.WHITE)==a_is_white
                     if net_turn:
-                        r=ea.get_root(board); ea.search(r)
+                        if root_net is None:
+                            root_net=ea.get_root(board)
+                        r=root_net
+                        ea.search(r)
                         _,mv=ea.select_move_with_temperature(r,0.1)
                         if mv is None: break
                         ms={'selected_move':mv.uci(),
                             'candidates':[{'move':c['move'],'N':c['N'],'W':c['W'],'Q':c['Q'],'P':c['P']}
                                           for c in ea.get_root_child_stats(r)[:8]]}
                         board.push(mv); mc+=1; on_ev_live(board.fen(),mv.uci(),mc,ms)
+                        root_net=ea.recycle_tree(r, mv)
                     else:
                         mv=alpha_beta_best_move(board,config.alpha_beta.depth)
                         if mv is None: break
                         board.push(mv); mc+=1; on_ev_live(board.fen(),mv.uci(),mc,None)
+                        root_net=None  # Opponent move invalidates the network's tree
                 game_result=board.result() if board.is_game_over() else '*'
 
             result_queue.put({

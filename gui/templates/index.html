@@ -222,8 +222,8 @@ table.dt tr:hover td{background:#0f172a}
   <tbody id="ptbl"><tr><td colspan="6" style="text-align:center;color:#1f2937">No data</td></tr></tbody></table>
 </div>
 <div class="card"><h2>Recent Game Outcomes</h2>
-  <table class="dt"><thead><tr><th>Game</th><th>Result</th><th>Length</th><th>Termination</th><th>Step</th><th>Depth</th></tr></thead>
-  <tbody id="gtbl"><tr><td colspan="6" style="text-align:center;color:#1f2937">No games</td></tr></tbody></table>
+  <table class="dt"><thead><tr><th>Game</th><th>Result</th><th>Length</th><th>Termination</th><th>Step</th><th>Depth</th><th>Material</th></tr></thead>
+  <tbody id="gtbl"><tr><td colspan="7" style="text-align:center;color:#1f2937">No games</td></tr></tbody></table>
 </div>
 </div><!-- /wrap -->
 
@@ -605,10 +605,11 @@ async function pollAll(){
   else pt.innerHTML=[...promo].reverse().slice(0,20).map(d=>`<tr><td>${d.step}</td><td style="color:${d.promoted?'#22c55e':'#ef4444'}">${d.promoted?'YES':'NO'}</td><td>${(d.win_rate*100).toFixed(1)}%</td><td>${d.wins}W/${d.losses}L/${d.draws}D</td><td>${d.old_elo?Math.round(d.old_elo):'—'}</td><td>${d.new_elo?Math.round(d.new_elo):'—'}</td></tr>`).join('');
   // Games table
   const gt=document.getElementById('gtbl');
-  if(!games||!games.length){gt.innerHTML='<tr><td colspan="6" style="text-align:center;color:#1f2937">No games</td></tr>';}
+  if(!games||!games.length){gt.innerHTML='<tr><td colspan="7" style="text-align:center;color:#1f2937">No games</td></tr>';}
   else gt.innerHTML=[...games].reverse().slice(0,30).map(d=>{
-    const r=d.result===1?'1-0':d.result===-1?'0-1':'½-½',c=d.result===1?'#3b82f6':d.result===-1?'#ef4444':'#475569';
-    return`<tr><td>${d.game_id}</td><td style="color:${c};font-weight:700">${r}</td><td>${d.length}</td><td>${d.termination}</td><td>${d.step}</td><td>${d.avg_mcts_depth?d.avg_mcts_depth.toFixed(1):'—'}</td></tr>`;
+    const r=d.result>0?'1-0':d.result<0?'0-1':'½-½',c=d.result>0?'#3b82f6':d.result<0?'#ef4444':'#475569';
+    const md=d.material_diff, mds=md!=null?(md>0?'+':'')+md:'—';
+    return`<tr><td>${d.game_id}</td><td style="color:${c};font-weight:700">${r}</td><td>${d.length}</td><td>${d.termination}</td><td>${d.step}</td><td>${d.avg_mcts_depth?d.avg_mcts_depth.toFixed(1):'—'}</td><td>${mds}</td></tr>`;
   }).join('');
   // Also poll tile states
   socket.emit('request_worker_states');

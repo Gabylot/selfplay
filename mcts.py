@@ -23,7 +23,8 @@ class MCTSNode:
     """A node in the MCTS tree."""
     
     __slots__ = ['board', 'parent', 'move', 'children', 'N', 'W', 'Q', 'P',
-                 'is_expanded', 'legal_moves_cached', 'visit_count', 'virtual_loss']
+                 'P_orig', 'is_expanded', 'legal_moves_cached', 'visit_count',
+                 'virtual_loss']
     
     def __init__(self, board: chess.Board, parent: Optional['MCTSNode'] = None,
                  move: Optional[chess.Move] = None, prior: float = 0.0):
@@ -35,6 +36,7 @@ class MCTSNode:
         self.W = 0.0        # Total value
         self.Q = 0.0        # Mean value (W / N)
         self.P = prior      # Prior probability from network
+        self.P_orig = prior  # Original prior before Dirichlet noise (for tree recycling)
         self.is_expanded = False
         self.legal_moves_cached: Optional[List[chess.Move]] = None
         self.visit_count = 0  # Duplicate of N, kept for backward compatibility
@@ -78,7 +80,46 @@ class MCTS:
     
     def get_root(self, board: chess.Board) -> MCTSNode:
         """Create a root node for the given board."""
-        return MCTSNode(board.copy(stack=False))
+        return MCTSNode(board.copy(stack=True))
+    
+    def recycle_tree(self, root: MCTSNode, move: chess.Move) -> Optional[MCTSNode]:
+        """Promote the child of `root` that corresponds to `move` to a new root.
+        
+        Instead of discarding the entire search tree after each move, this
+        method promotes the selected child to be the new root, preserving
+        its subtree (expanded children, Q values, visit counts) for the
+        next search.
+        
+        The promoted node's parent pointer is cleared and its own stats
+        (N, W, Q) are reset so that the new root starts with clean PUCT
+        computation while its children retain their accumulated knowledge.
+        
+        Args:
+            root: The current root node (already searched)
+            move: The move that was selected
+        
+        Returns:
+            The promoted child as a new root, or None if the child
+            wasn't found (shouldn't happen in normal flow).
+        """
+        for action_idx, child in root.children.items():
+            if child.move == move:
+                # Detach from parent
+                child.parent = None
+                
+                # Reset root-level stats so PUCT exploration is not
+                # distorted by accumulated visits from the old tree
+                child.N = 0
+                child.W = 0.0
+                child.Q = 0.0
+                child.visit_count = 0
+                
+                # Children keep their Q/N values — they give the next
+                # search a head start on which lines are promising
+                
+                return child
+        
+        return None
     
     def search(self, root: MCTSNode) -> Tuple[np.ndarray, chess.Move, dict]:
         """Run MCTS from root and return visit distribution, best move, and stats.
@@ -351,8 +392,8 @@ class MCTS:
             
             prior = float(legal_policy[action_idx])
             
-            # Use stack=False for cheaper board copy (no move history needed)
-            child_board = node.board.copy(stack=False)
+            # Use stack=True to preserve move history for repetition detection
+            child_board = node.board.copy(stack=True)
             child_board.push(move)
             
             child = MCTSNode(child_board, parent=node, move=move, prior=prior)
@@ -427,7 +468,7 @@ class MCTS:
         
         for i, action_idx in enumerate(node.children):
             child = node.children[action_idx]
-            child.P = (1 - self.dirichlet_epsilon) * child.P + \
+            child.P = (1 - self.dirichlet_epsilon) * child.P_orig + \
                       self.dirichlet_epsilon * noise[i]
     
     def _find_checkmate_child(self, root: MCTSNode) -> Optional[chess.Move]:
