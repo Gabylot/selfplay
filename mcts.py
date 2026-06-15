@@ -430,6 +430,23 @@ class MCTS:
             child.P = (1 - self.dirichlet_epsilon) * child.P + \
                       self.dirichlet_epsilon * noise[i]
     
+    def _find_checkmate_child(self, root: MCTSNode) -> Optional[chess.Move]:
+        """Check if any root child delivers checkmate.
+        
+        A child whose board is in checkmate means the move leading to it
+        wins the game immediately. This should always be played.
+        
+        Args:
+            root: The root node after search
+        
+        Returns:
+            The checkmate move if found, None otherwise.
+        """
+        for child in root.children.values():
+            if child.board.is_checkmate():
+                return child.move
+        return None
+    
     def _get_visit_policy(self, root: MCTSNode) -> Tuple[np.ndarray, chess.Move]:
         """Compute visit count distribution and select move.
         
@@ -446,6 +463,13 @@ class MCTS:
         if not root.children:
             # No children — return empty
             return visit_policy, None
+        
+        # Force checkmate move if MCTS found one
+        checkmate_move = self._find_checkmate_child(root)
+        if checkmate_move is not None:
+            idx = move_to_policy_index(checkmate_move, root.board)
+            visit_policy[idx] = 1.0
+            return visit_policy, checkmate_move
         
         # Fill visit counts
         total_visits = 0
@@ -503,6 +527,13 @@ class MCTS:
         
         if not root.children:
             return visit_policy, None
+        
+        # Force checkmate move if MCTS found one
+        checkmate_move = self._find_checkmate_child(root)
+        if checkmate_move is not None:
+            idx = move_to_policy_index(checkmate_move, root.board)
+            visit_policy[idx] = 1.0
+            return visit_policy, checkmate_move
         
         # Get visit counts
         visit_counts = {}
