@@ -109,6 +109,13 @@ def run_training(config, gui_enabled=False, num_workers=None):
         if 'ref_elo'  in ckpt: evaluator.ref_elo  = ckpt['ref_elo']
         print(f"[INFO] Resumed step={step} game={game_id}")
 
+    # Load replay buffer
+    buffer_path = checkpoints_dir / "replay_buffer.npz"
+    loaded_buffer = ReplayBuffer.load(str(buffer_path), max_size=config.buffer.max_size)
+    if loaded_buffer is not None:
+        buffer = loaded_buffer
+        print(f"[INFO] Loaded replay buffer: {len(buffer)} positions from {buffer.total_games} games")
+
     print(f"\n{'='*60}\n  AlphaZero — step={step} games={game_id} workers={num_workers}\n{'='*60}\n")
 
     psp = ParallelSelfPlay(config, num_workers=num_workers)
@@ -240,7 +247,8 @@ def run_training(config, gui_enabled=False, num_workers=None):
                     save_checkpoint(network, optimizer, str(cp), step, extra=ex)
                     save_checkpoint(network, optimizer,
                                     str(checkpoints_dir/"latest.pt"), step, extra=ex)
-                    print(f"  Checkpoint: {cp}")
+                    buffer.save(str(buffer_path))
+                    print(f"  Checkpoint: {cp}  Buffer: {len(buffer)} positions")
 
                 print(f"  [train] step={step} pol={ld['policy_loss']:.4f} val={ld['value_loss']:.4f}")
 
@@ -421,6 +429,8 @@ def run_training(config, gui_enabled=False, num_workers=None):
               'best_elo':evaluator.best_elo,'ref_elo':evaluator.ref_elo}
         save_checkpoint(network, optimizer,
                         str(checkpoints_dir/"latest.pt"), step, extra=ex)
+        buffer.save(str(buffer_path))
+        print(f"[INFO] Saved replay buffer: {len(buffer)} positions")
         stats.close()
         print("[INFO] Done.")
 

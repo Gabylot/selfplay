@@ -15,6 +15,7 @@ import multiprocessing as mp
 import queue
 import time
 import io
+import os
 
 from encoding import board_to_tensor
 from network import AlphaZeroNet
@@ -58,6 +59,42 @@ class ReplayBuffer:
             else: dr+=1
         s=len(self.buffer)/n
         return {'white_wins':int(ww*s),'black_wins':int(bw*s),'draws':int(dr*s)}
+
+    # ── Serialization ──
+
+    def save(self, path):
+        """Save buffer to a compressed .npz file."""
+        if not self.buffer:
+            return
+        n = len(self.buffer)
+        states   = np.stack([self.buffer[i][0] for i in range(n)])
+        policies = np.stack([self.buffer[i][1] for i in range(n)])
+        values   = np.array([self.buffer[i][2] for i in range(n)], dtype=np.float32)
+        np.savez_compressed(
+            path,
+            states=states, policies=policies, values=values,
+            total_games=self.total_games,
+            total_positions=self.total_positions,
+        )
+
+    @classmethod
+    def load(cls, path, max_size=100000):
+        """Load buffer from a .npz file. Returns a new ReplayBuffer, or None on failure."""
+        try:
+            data = np.load(path, allow_pickle=False)
+            buf = cls(max_size=max_size)
+            states   = data['states']
+            policies = data['policies']
+            values   = data['values']
+            n = len(values)
+            for i in range(n):
+                buf.buffer.append((states[i], policies[i], float(values[i])))
+            buf.total_games      = int(data.get('total_games', n))
+            buf.total_positions  = int(data.get('total_positions', n))
+            return buf
+        except Exception as e:
+            print(f"[WARN] Could not load replay buffer from {path}: {e}")
+            return None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
