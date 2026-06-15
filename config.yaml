@@ -6,7 +6,7 @@ network:
   num_filters: 64
   num_policy_channels: 32
   num_value_channels: 16
-  value_fc_size: 256
+  value_fc_size: 128
 
 # --- MCTS ---
 mcts:
@@ -32,6 +32,8 @@ selfplay:
   temperature_threshold: 30   # Move number to switch from high to low temperature
   temperature_high: 1.0
   temperature_low: 0.1
+  adjudicate_graded: true     # use tanh grading instead of flat ±1
+  adjudicate_scaling: 9.0     # queen = ~0.76, rook = ~0.51, pawn = ~0.11
 
 # --- Replay Buffer ---
 buffer:
@@ -49,7 +51,7 @@ training:
 
 # --- Evaluation ---
 evaluation:
-  eval_interval: 50           # Run eval every N self-play games
+  eval_interval: 200           # Run eval every N self-play games
   gate_games: 20              # Games for network-vs-network gating
   gate_win_threshold: 0.55    # Win rate needed to promote
   ref_opponent_games: 20      # Games vs alpha-beta reference

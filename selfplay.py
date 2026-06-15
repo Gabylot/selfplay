@@ -105,7 +105,7 @@ def get_temperature(move_number, threshold=30, temp_high=1.0, temp_low=0.1):
     return temp_high if move_number < threshold else temp_low
 
 
-def adjudicate_by_material(board, piece_values):
+def adjudicate_by_material(board, piece_values, graded=False, scaling=9.0):
     w=b=0
     for sq in chess.SQUARES:
         p=board.piece_at(sq)
@@ -113,8 +113,12 @@ def adjudicate_by_material(board, piece_values):
         v=piece_values.get(p.symbol().upper(),0)
         if p.color==chess.WHITE: w+=v
         else: b+=v
-    if w>b: return 1.0
-    if b>w: return -1.0
+    diff=w-b
+    if graded:
+        if diff==0: return 0.0
+        return float(np.tanh(diff / scaling))
+    if diff>0: return 1.0
+    if diff<0: return -1.0
     return 0.0
 
 
@@ -124,7 +128,8 @@ def adjudicate_by_material(board, piece_values):
 
 def play_one_game(mcts_engine, max_game_length=150, adjudicate_material=True,
                   piece_values=None, temp_threshold=30, temp_high=1.0, temp_low=0.1,
-                  temperature_override=None, verbose=False, on_move=None):
+                  temperature_override=None, verbose=False, on_move=None,
+                  adjudicate_graded=True, adjudicate_scaling=9.0):
     if piece_values is None:
         piece_values={'P':1,'N':3,'B':3,'R':5,'Q':9}
 
@@ -166,7 +171,7 @@ def play_one_game(mcts_engine, max_game_length=150, adjudicate_material=True,
     elif move_count>=max_game_length:
         termination="max_length"
         if adjudicate_material:
-            outcome=adjudicate_by_material(board,piece_values)
+            outcome=adjudicate_by_material(board,piece_values,graded=adjudicate_graded,scaling=adjudicate_scaling)
             if outcome>0: termination="material_white"
             elif outcome<0: termination="material_black"
     else:
@@ -208,6 +213,8 @@ def self_play_game(network, config, on_move=None):
         temp_high=config.selfplay.temperature_high,
         temp_low=config.selfplay.temperature_low,
         on_move=on_move,
+        adjudicate_graded=getattr(config.selfplay,'adjudicate_graded',True),
+        adjudicate_scaling=getattr(config.selfplay,'adjudicate_scaling',9.0),
     )
 
 
@@ -282,7 +289,9 @@ def _worker_process(worker_id, task_queue, result_queue, config_dict, shutdown_e
                                 config.selfplay.adjudicate_material,piece_values,
                                 config.selfplay.temperature_threshold,
                                 config.selfplay.temperature_high,config.selfplay.temperature_low,
-                                on_move=on_sp)
+                                on_move=on_sp,
+                                adjudicate_graded=getattr(config.selfplay,'adjudicate_graded',True),
+                                adjudicate_scaling=getattr(config.selfplay,'adjudicate_scaling',9.0))
             result_queue.put({
                 'worker_id':worker_id,'type':'live_end',
                 'result':gi['result_str'],'termination':gi['termination'],

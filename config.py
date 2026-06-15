@@ -42,6 +42,8 @@ def load_config(path: Optional[str] = None) -> dict:
             "max_game_length": 150,
             "adjudicate_material": True,
             "piece_values": {"P": 1, "N": 3, "B": 3, "R": 5, "Q": 9},
+            "adjudicate_graded": True,
+            "adjudicate_scaling": 9.0,
             "temperature_threshold": 30,
             "temperature_high": 1.0,
             "temperature_low": 0.1,
