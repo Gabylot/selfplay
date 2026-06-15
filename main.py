@@ -1,22 +1,20 @@
 """Main entry point for the AlphaZero Chess Engine.
 
-Orchestrates self-play, training, evaluation, and optionally the GUI.
+Training loop:
+  1. Push self-play tasks to all workers.
+  2. Collect finished games, add to buffer.
+  3. Every N games: train.
+  4. Every M games: PAUSE self-play, run eval games through the same
+     worker pool, RESUME self-play.
 
 Usage:
-    python main.py train          # Run training loop (self-play + training + eval)
-    python main.py gui            # Launch GUI server (connects to running training)
-    python main.py train --gui    # Run training with GUI
-    python main.py evaluate       # Run evaluation matches only
-    python main.py sanity         # Run sanity check (tiny config, quick test)
+    python main.py train [--gui] [--workers N]
+    python main.py gui
+    python main.py evaluate
+    python main.py sanity
 """
 
-import argparse
-import sys
-import os
-import time
-import threading
-import signal
-import json
+import argparse, sys, os, time, threading, signal, io
 from pathlib import Path
 
 import torch
@@ -25,462 +23,502 @@ import numpy as np
 from config import get_config
 from network import AlphaZeroNet, create_model_from_config, save_checkpoint, load_checkpoint
 from mcts import MCTS
-from selfplay import self_play_game, ReplayBuffer
+from selfplay import self_play_game, ReplayBuffer, ParallelSelfPlay
 from training import train_one_step, create_optimizer
 from evaluation import Evaluator
 from stats import StatsLogger
 from gui.live_game import LiveGameState
 
 
-# Global flag for graceful shutdown
 _shutdown = False
-
-
 def signal_handler(sig, frame):
     global _shutdown
     _shutdown = True
-    print("\n[INFO] Shutdown signal received._finishing current operation...")
+    print("\n[INFO] Shutdown signal received…")
 
 
-def run_training(config, gui_enabled: bool = False):
-    """Main training loop: self-play → training → evaluation → repeat."""
+# ─────────────────────────────────────────────────────────────────────────────
+# Training loop
+# ─────────────────────────────────────────────────────────────────────────────
+
+def run_training(config, gui_enabled=False, num_workers=None):
     global _shutdown
-    
-    # Setup device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"[INFO] Using device: {device}")
-    
-    # Create network
+    print(f"[INFO] Device: {device}")
+
+    if num_workers is None:
+        num_workers = getattr(config.selfplay, 'num_workers', 8)
+    print(f"[INFO] Workers: {num_workers}")
+
     network = create_model_from_config(config)
     network.to(device)
-    print(f"[INFO] Network created: {sum(p.numel() for p in network.parameters())} parameters")
-    
-    # Setup directories
-    output_dir = Path(config.main.output_dir) / config.main.run_name
-    output_dir.mkdir(parents=True, exist_ok=True)
+    print(f"[INFO] Network: {sum(p.numel() for p in network.parameters())} params")
+
+    output_dir      = Path(config.main.output_dir) / config.main.run_name
     checkpoints_dir = output_dir / "checkpoints"
+    output_dir.mkdir(parents=True, exist_ok=True)
     checkpoints_dir.mkdir(exist_ok=True)
-    
-    # Setup stats
+
     stats_db_path = output_dir / config.stats.db_path
     stats = StatsLogger(str(stats_db_path))
-    print(f"[INFO] Stats database: {stats_db_path}")
-    
-    # Setup live game states (one for self-play, one for evaluation)
-    live_game = LiveGameState(max_history=20)
-    eval_live_game = LiveGameState(max_history=50)
-    
-    # Setup replay buffer
-    buffer = ReplayBuffer(max_size=config.buffer.max_size)
-    
-    # Setup evaluator (with eval live game for GUI viewing)
+
+    # One LiveGameState per worker (worker_id set, not eval)
+    worker_live_games = [
+        LiveGameState(max_history=5, worker_id=i, is_eval=False)
+        for i in range(num_workers)
+    ]
+    # Separate eval board
+    eval_live_game = LiveGameState(max_history=50, worker_id=-1, is_eval=True)
+
+    buffer    = ReplayBuffer(max_size=config.buffer.max_size)
     evaluator = Evaluator(config, stats, live_game=eval_live_game)
-    
-    # Create optimizer (ensure numeric types from YAML)
+
     optimizer = create_optimizer(
-        network, 
+        network,
         lr=float(config.training.learning_rate),
         momentum=float(config.training.momentum),
         weight_decay=float(config.training.weight_decay),
     )
-    
-    # Global counters
-    step = 0
-    game_id = 0
-    eval_game_counter = 0  # Counter for eval games (separate from self-play)
-    best_network = create_model_from_config(config)  # Copy for gating reference
+
+    step = game_id = eval_game_counter = 0
+    best_network = create_model_from_config(config)
     best_network.load_state_dict(network.state_dict())
     best_network.to(device)
-    
-    # Log initial config
+
     stats.log_config(step, config.to_dict())
-    
-    # Determine self-play network source
-    use_latest = (config.selfplay.network_source == "latest")
-    
-    # Launch GUI if requested
-    gui_thread = None
+
+    # GUI
     if gui_enabled:
         from gui.app import start_gui_server
-        gui_thread = threading.Thread(
-            target=start_gui_server, 
-            args=(stats, config, live_game, eval_live_game), 
-            daemon=True
-        )
-        gui_thread.start()
-        print(f"[INFO] GUI server started at http://{config.gui.host}:{config.gui.port}")
-    
-    # Load checkpoint if exists
+        threading.Thread(
+            target=start_gui_server,
+            args=(stats, config, worker_live_games, eval_live_game),
+            daemon=True,
+        ).start()
+        print(f"[INFO] GUI → http://{config.gui.host}:{config.gui.port}")
+
+    # Load checkpoint
     latest_ckpt = checkpoints_dir / "latest.pt"
     if latest_ckpt.exists():
-        print(f"[INFO] Loading checkpoint from {latest_ckpt}")
+        print(f"[INFO] Loading checkpoint: {latest_ckpt}")
         ckpt = load_checkpoint(str(latest_ckpt), network, optimizer)
-        step = ckpt.get('step', 0)
-        game_id = ckpt.get('game_id', 0)
-        eval_game_counter = ckpt.get('eval_game_counter', 0)
-        # Restore evaluator Elo state
-        if 'best_elo' in ckpt:
-            evaluator.best_elo = ckpt['best_elo']
-        if 'ref_elo' in ckpt:
-            evaluator.ref_elo = ckpt['ref_elo']
-        print(f"[INFO] Resumed from step {step}, game {game_id}")
-        print(f"[INFO] Restored Elo: best={evaluator.best_elo:.0f}, ref={evaluator.ref_elo:.0f}")
-    
-    print(f"\n{'='*60}")
-    print(f"  AlphaZero Training Started")
-    print(f"  Step: {step}, Games: {game_id}")
-    print(f"  Self-play network: {'latest' if use_latest else 'gated_best'}")
-    print(f"  MCTS simulations: {config.mcts.num_simulations}")
-    print(f"{'='*60}\n")
-    
-    # --- Main training loop ---
-    while not _shutdown:
-        # --- Self-Play Phase ---
-        print(f"[Step {step}] Playing self-play games...")
-        
-        # Determine which network to use for self-play
-        if use_latest:
-            current_net = network
-        else:
-            current_net = best_network
-        
-        num_selfplay_games = config.training.training_steps_per_iteration
-        
-        for _ in range(num_selfplay_games):
-            if _shutdown:
-                break
-            
-            # Notify live game viewer that a new game is starting
-            live_game.start_game(game_id + 1, step)
-            
-            # Create on_move callback for live board updates
-            def _on_move(fen, uci, move_num, mcts_stats=None, _gid=game_id+1, _step=step):
-                live_game.update(fen, uci, move_num, mcts_stats=mcts_stats)
-            
-            game_data, game_info = self_play_game(current_net, config, on_move=_on_move)
-            buffer.add_game(game_data)
-            
-            game_id += 1
-            
-            # Notify live game viewer that the game is over
-            result_str = game_info['result_str']
-            live_game.game_over(result_str, game_info['termination'])
-            
-            # Log game to stats
-            stats.log_game(
-                game_id=game_id, step=step,
-                result=game_info['result'],
-                result_str=game_info['result_str'],
-                length=game_info['length'],
-                termination=game_info['termination'],
-                avg_mcts_depth=game_info['avg_mcts_depth'],
-                num_positions=game_info['num_positions'],
-            )
-            
-            # Log MCTS stats
-            stats.log_mcts_stats(
-                game_id=game_id, step=step,
-                avg_tree_depth=game_info['avg_mcts_depth'],
-                avg_sims_per_move=config.mcts.num_simulations,
-            )
-            
-            print(f"  Game {game_id}: {game_info['termination']} | "
-                  f"Result: {game_info['result_str']} | "
-                  f"Length: {game_info['length']} | "
-                  f"Buffer: {len(buffer)} positions")
-        
-        if _shutdown:
-            break
-        
-        # --- Training Phase ---
-        print(f"[Step {step}] Training network...")
-        
-        for _ in range(config.training.training_steps_per_iteration):
-            if _shutdown:
-                break
-            
-            loss_dict = train_one_step(
-                network, optimizer, buffer, int(config.training.batch_size), device
-            )
-            step += 1
-            
-            # Log losses (separate policy/value)
-            stats.log_training_step(
-                step=step,
-                policy_loss=loss_dict['policy_loss'],
-                value_loss=loss_dict['value_loss'],
-                total_loss=loss_dict['total_loss'],
-                learning_rate=config.training.learning_rate,
-            )
-            
-            print(f"  Training step {step}: "
-                  f"policy={loss_dict['policy_loss']:.4f} "
-                  f"value={loss_dict['value_loss']:.4f} "
-                  f"total={loss_dict['total_loss']:.4f}")
-        
-        # --- Buffer stats ---
-        outcome_dist = buffer.get_outcome_distribution()
-        stats.log_buffer_stats(
-            step=step, buffer_size=len(buffer),
-            white_wins=outcome_dist['white_wins'],
-            black_wins=outcome_dist['black_wins'],
-            draws=outcome_dist['draws'],
-        )
-        
-        # --- Network confidence stats ---
-        # Sample a few positions to measure confidence
-        if len(buffer) > 0:
-            sample_size = min(50, len(buffer))
-            indices = np.random.choice(len(buffer), size=sample_size, replace=False)
-            states = np.array([buffer.buffer[i][0] for i in indices])
-            policies, values = network.predict_batch(states)
-            avg_max_policy = float(np.mean(np.max(policies, axis=1)))
-            avg_abs_value = float(np.mean(np.abs(values)))
-            stats.log_network_stats(step, avg_max_policy, avg_abs_value)
-        
-        # --- Checkpoint ---
-        if step % config.training.checkpoint_interval == 0:
-            ckpt_extra = {
-                'game_id': game_id,
-                'eval_game_counter': eval_game_counter,
-                'best_elo': evaluator.best_elo,
-                'ref_elo': evaluator.ref_elo,
-            }
-            ckpt_path = checkpoints_dir / f"step_{step}.pt"
-            save_checkpoint(network, optimizer, str(ckpt_path), step, 
-                          extra=ckpt_extra)
-            save_checkpoint(network, optimizer, str(checkpoints_dir / "latest.pt"), step,
-                          extra=ckpt_extra)
-            print(f"  Checkpoint saved: {ckpt_path}")
-        
-        # --- Evaluation phase (monitoring — does NOT gate self-play) ---
-        if game_id % config.evaluation.eval_interval == 0:
-            print(f"[Step {step}] Running evaluation (monitoring)...")
-            
-            # Gating match (monitoring only)
-            # Per-game start/finish is handled inside the match functions
-            gating_result = evaluator.run_gating_match(
-                network, best_network, step, verbose=True,
-                game_counter=eval_game_counter
-            )
-            eval_game_counter += config.evaluation.gate_games
-            
-            if gating_result['promoted']:
-                best_network.load_state_dict(network.state_dict())
-                print(f"  [GATE] Network promoted! New Elo: {evaluator.best_elo:.0f}")
-            
-            # Reference match vs alpha-beta
-            ref_result = evaluator.run_reference_match(network, step, verbose=True,
-                                                        game_counter=eval_game_counter)
-            eval_game_counter += config.evaluation.ref_opponent_games
-            print(f"  vs Alpha-Beta: {ref_result['win_rate']:.2%} win rate")
-        
-        # Summary
-        print(f"\n{'='*40}")
-        print(f"  Summary: step={step}, games={game_id}, buffer={len(buffer)}")
-        print(f"  Stats DB: {stats_db_path}")
-        print(f"{'='*40}\n")
-    
-    # Save final checkpoint
-    save_checkpoint(network, optimizer, str(checkpoints_dir / "latest.pt"), step,
-                    extra={
-                        'game_id': game_id,
-                        'eval_game_counter': eval_game_counter,
-                        'best_elo': evaluator.best_elo,
-                        'ref_elo': evaluator.ref_elo,
-                    })
-    
-    stats.close()
-    print("[INFO] Training loop finished.")
+        step             = ckpt.get('step', 0)
+        game_id          = ckpt.get('game_id', 0)
+        eval_game_counter= ckpt.get('eval_game_counter', 0)
+        if 'best_elo' in ckpt: evaluator.best_elo = ckpt['best_elo']
+        if 'ref_elo'  in ckpt: evaluator.ref_elo  = ckpt['ref_elo']
+        print(f"[INFO] Resumed step={step} game={game_id}")
 
+    print(f"\n{'='*60}\n  AlphaZero — step={step} games={game_id} workers={num_workers}\n{'='*60}\n")
+
+    psp = ParallelSelfPlay(config, num_workers=num_workers)
+    psp.start()
+    psp.push_selfplay(network)   # kick off first round
+
+    games_since_train = 0
+    games_since_eval  = 0
+    train_interval    = config.training.training_steps_per_iteration
+    eval_interval     = config.evaluation.eval_interval
+
+    # Per-worker live game tracking for real-time updates
+    worker_live_game_ids = [0] * num_workers
+
+    try:
+        while not _shutdown:
+            result = psp.collect_one(timeout=300.0)
+            if result is None:
+                print("[WARN] No result in 5 min — workers may be stuck")
+                continue
+            if result.get('done'):
+                continue
+
+            rtype = result.get('type')
+
+            # ── Live incremental messages (real-time GUI updates) ──
+            if rtype == 'live_start':
+                wid = result['worker_id']
+                wlg = worker_live_games[wid]
+                worker_live_game_ids[wid] += 1
+                wlg.start_game(worker_live_game_ids[wid], step,
+                               game_type=result.get('game_type', 'selfplay'),
+                               match_info=result.get('match_info'))
+                continue
+
+            if rtype == 'live_move':
+                wid = result['worker_id']
+                wlg = worker_live_games[wid]
+                wlg.update(result['fen'], result['move'], result['move_number'],
+                           mcts_stats=result.get('mcts_stats'))
+                continue
+
+            if rtype == 'live_end':
+                wid = result['worker_id']
+                wlg = worker_live_games[wid]
+                wlg.game_over(result['result'], result.get('termination', ''))
+                continue
+
+            # Only process self-play results in the main loop
+            if rtype != 'selfplay':
+                continue
+
+            wid = result['worker_id']
+
+            # Deserialise
+            raw       = result['game_data']
+            game_data = [(np.array(s,dtype=np.float32),
+                          np.array(p,dtype=np.float32),
+                          float(v)) for s,p,v in raw]
+            game_info = result['game_info']
+            fens      = result.get('fens', [])
+            moves     = result.get('moves', [])
+            mcts_s    = result.get('mcts_stats', [])
+
+            buffer.add_game(game_data)
+            game_id          += 1
+            games_since_train += 1
+            games_since_eval  += 1
+
+            # GUI tile already updated via live_start/live_move/live_end messages.
+            # No need to update LiveGameState again here since the live messages
+            # already did the incremental updates.
+
+            # Stats
+            stats.log_game(game_id=game_id, step=step,
+                           result=game_info['result'], result_str=game_info['result_str'],
+                           length=game_info['length'], termination=game_info['termination'],
+                           avg_mcts_depth=game_info['avg_mcts_depth'],
+                           num_positions=game_info['num_positions'])
+            stats.log_mcts_stats(game_id=game_id, step=step,
+                                 avg_tree_depth=game_info['avg_mcts_depth'],
+                                 avg_sims_per_move=config.mcts.num_simulations)
+
+            print(f"  [W{wid}] Game {game_id}: {game_info['termination']:18s} | "
+                  f"{game_info['result_str']} | {game_info['length']} moves | buf={len(buffer)}")
+
+            # ── Push next self-play task to this worker immediately ──
+            import torch as _torch, io as _io
+            buf2 = _io.BytesIO()
+            _torch.save(network.state_dict(), buf2)
+            wb = buf2.getvalue()
+            try: psp._task_qs[wid].put_nowait({'type':'selfplay','weights':wb})
+            except: pass
+
+            # ── Training ──
+            if (games_since_train >= train_interval
+                    and len(buffer) >= int(config.training.batch_size)):
+                games_since_train = 0
+                for _ in range(config.training.num_batches_per_step):
+                    if _shutdown: break
+                    ld = train_one_step(network, optimizer, buffer,
+                                        int(config.training.batch_size), device)
+                    step += 1
+                    stats.log_training_step(step=step,
+                                            policy_loss=ld['policy_loss'],
+                                            value_loss=ld['value_loss'],
+                                            total_loss=ld['total_loss'],
+                                            learning_rate=config.training.learning_rate)
+
+                # Buffer / confidence stats
+                od = buffer.get_outcome_distribution()
+                stats.log_buffer_stats(step=step, buffer_size=len(buffer),
+                                       white_wins=od['white_wins'],
+                                       black_wins=od['black_wins'], draws=od['draws'])
+                if len(buffer) > 0:
+                    n   = min(50, len(buffer))
+                    ix  = np.random.choice(len(buffer), size=n, replace=False)
+                    sts = np.array([buffer.buffer[i][0] for i in ix])
+                    ps, vs = network.predict_batch(sts)
+                    stats.log_network_stats(step,
+                                            float(np.mean(np.max(ps,axis=1))),
+                                            float(np.mean(np.abs(vs))))
+
+                # Checkpoint
+                if step % config.training.checkpoint_interval == 0:
+                    ex = {'game_id':game_id,'eval_game_counter':eval_game_counter,
+                          'best_elo':evaluator.best_elo,'ref_elo':evaluator.ref_elo}
+                    cp = checkpoints_dir / f"step_{step}.pt"
+                    save_checkpoint(network, optimizer, str(cp), step, extra=ex)
+                    save_checkpoint(network, optimizer,
+                                    str(checkpoints_dir/"latest.pt"), step, extra=ex)
+                    print(f"  Checkpoint: {cp}")
+
+                print(f"  [train] step={step} pol={ld['policy_loss']:.4f} val={ld['value_loss']:.4f}")
+
+            # ── Eval ──────────────────────────────────────────────────────
+            if games_since_eval >= eval_interval and not _shutdown:
+                games_since_eval = 0
+                print(f"\n[Step {step}] === EVAL (self-play paused) ===")
+
+                # Drain any in-flight self-play results so we don't mix them
+                # with eval results in the collector loop below.
+                time.sleep(0.5)          # let in-flight results land
+                psp.drain()              # discard them
+
+                # Serialise both networks once
+                import torch as _t, io as _i
+                def _wb(net):
+                    b=_i.BytesIO(); _t.save(net.state_dict(),b); return b.getvalue()
+                wb_latest = _wb(network)
+                wb_best   = _wb(best_network)
+
+                n_gate = config.evaluation.gate_games
+                n_ref  = config.evaluation.ref_opponent_games
+                total_eval = n_gate + n_ref
+
+                # Build task list: half-and-half colors
+                eval_tasks = []
+                for gi in range(n_gate):
+                    eval_tasks.append({
+                        'type':'eval', 'eval_type':'gating',
+                        'weights_a': wb_latest, 'weights_b': wb_best,
+                        'a_is_white': (gi % 2 == 0),
+                        'game_label': f"Gate {gi+1}/{n_gate}",
+                    })
+                for gi in range(n_ref):
+                    eval_tasks.append({
+                        'type':'eval', 'eval_type':'reference',
+                        'weights_a': wb_latest, 'weights_b': None,
+                        'a_is_white': (gi % 2 == 0),
+                        'game_label': f"Ref {gi+1}/{n_ref}",
+                    })
+
+                dispatched = psp.dispatch_eval_games(eval_tasks)
+                print(f"  Dispatched {dispatched} eval games to {num_workers} workers")
+
+                # Collect eval results
+                gate_wins=gate_losses=gate_draws=0
+                ref_wins=ref_losses=ref_draws=0
+                collected = 0
+                eval_game_id_start = eval_game_counter
+                eval_live_start_ids = [0] * num_workers  # per-worker eval game counter
+
+                while collected < dispatched and not _shutdown:
+                    r = psp.collect_one(timeout=300.0)
+                    if r is None:
+                        print("[WARN] Eval result timeout"); break
+                    if r.get('done'): continue
+
+                    rt = r.get('type')
+
+                    # ── Live incremental messages for eval games ──
+                    # Only update worker tiles in real-time (the single eval board
+                    # is updated from complete results to avoid interleaving moves
+                    # from parallel eval games).
+                    if rt == 'live_start':
+                        wid = r['worker_id']
+                        eval_live_start_ids[wid] += 1
+                        gid_el = eval_game_counter + eval_live_start_ids[wid]
+                        gt = r.get('game_type', 'reference')
+                        label = r.get('match_info', '')
+                        wlg = worker_live_games[wid]
+                        wlg.start_game(gid_el, step, game_type=gt, match_info=label)
+                        continue
+
+                    if rt == 'live_move':
+                        wid = r['worker_id']
+                        wlg = worker_live_games[wid]
+                        wlg.update(r['fen'], r['move'], r['move_number'],
+                                   mcts_stats=r.get('mcts_stats'))
+                        continue
+
+                    if rt == 'live_end':
+                        wid = r['worker_id']
+                        wlg = worker_live_games[wid]
+                        wlg.game_over(r['result'], r.get('termination', ''))
+                        continue
+
+                    if rt != 'eval':
+                        continue   # stray self-play result — discard
+
+                    wid       = r['worker_id']
+                    res       = r['result']
+                    etype     = r['eval_type']
+                    a_white   = r['a_is_white']
+                    label     = r['game_label']
+                    fens_e    = r.get('fens',[])
+                    moves_e   = r.get('moves',[])
+                    mcts_e    = r.get('mcts_stats',[])
+                    collected += 1
+
+                    # Worker tiles already updated via live_start/live_move/live_end.
+                    # Update the dedicated eval board from complete results (batched)
+                    # to avoid interleaving moves from parallel eval games.
+                    wlg = worker_live_games[wid]
+                    gt  = 'gating' if etype=='gating' else 'reference'
+                    gid_e = eval_game_counter + collected
+                    # Replay the full game on the eval board
+                    eval_live_game.start_game(gid_e, step, game_type=gt, match_info=label)
+                    for i,(fen,uci) in enumerate(zip(fens_e, moves_e)):
+                        ms = mcts_e[i] if i < len(mcts_e) else None
+                        eval_live_game.update(fen, uci, i+1, mcts_stats=ms)
+                    eval_live_game.game_over(res, gt)
+
+                    # Tally
+                    if etype == 'gating':
+                        if res=='1-0':
+                            if a_white: gate_wins+=1
+                            else:       gate_losses+=1
+                        elif res=='0-1':
+                            if a_white: gate_losses+=1
+                            else:       gate_wins+=1
+                        else: gate_draws+=1
+                    else:
+                        if res=='1-0':
+                            if a_white: ref_wins+=1
+                            else:       ref_losses+=1
+                        elif res=='0-1':
+                            if a_white: ref_losses+=1
+                            else:       ref_wins+=1
+                        else: ref_draws+=1
+
+                    print(f"  [{etype[:4].upper()} W{wid}] {label}: {res}")
+
+                eval_game_counter += collected
+
+                # Gating decision
+                total_g = gate_wins+gate_losses+gate_draws
+                if total_g > 0:
+                    wr = (gate_wins + 0.5*gate_draws) / total_g
+                    promoted = wr > config.evaluation.gate_win_threshold
+                    if promoted:
+                        best_network.load_state_dict(network.state_dict())
+                        print(f"  [GATE] PROMOTED  win_rate={wr:.1%}")
+                    else:
+                        print(f"  [GATE] not promoted  win_rate={wr:.1%}")
+                    k = config.evaluation.elo_k_factor
+                    old_elo = evaluator.best_elo
+                    evaluator.best_elo = old_elo + k*(wr - 0.5)
+                    stats.log_promotion_attempt(step=step, promoted=promoted,
+                                                win_rate=wr, games_played=total_g,
+                                                wins=gate_wins, losses=gate_losses,
+                                                draws=gate_draws,
+                                                old_elo=old_elo, new_elo=evaluator.best_elo)
+                    stats.log_elo(evaluator.best_elo,"gating",step,
+                                  total_g,gate_wins,gate_losses,gate_draws)
+
+                # Reference stats
+                total_r = ref_wins+ref_losses+ref_draws
+                if total_r > 0:
+                    rwr = (ref_wins + 0.5*ref_draws) / total_r
+                    print(f"  [REF] win_rate={rwr:.1%}  {ref_wins}W/{ref_losses}L/{ref_draws}D")
+                    stats.log_evaluation(step=step, opponent="alpha_beta_ref",
+                                         games_played=total_r,
+                                         wins=ref_wins, losses=ref_losses,
+                                         draws=ref_draws, win_rate=rwr)
+                    net_elo = evaluator.ref_elo + 200
+                    new_ne  = net_elo + k*(rwr - 0.5)
+                    stats.log_elo(new_ne,"alpha_beta_ref",step,
+                                  total_r,ref_wins,ref_losses,ref_draws)
+
+                print(f"  === EVAL DONE — resuming self-play ===\n")
+                # Resume self-play: push tasks to all workers
+                psp.push_selfplay(network)
+
+    finally:
+        print("[INFO] Stopping workers…")
+        psp.stop()
+        ex = {'game_id':game_id,'eval_game_counter':eval_game_counter,
+              'best_elo':evaluator.best_elo,'ref_elo':evaluator.ref_elo}
+        save_checkpoint(network, optimizer,
+                        str(checkpoints_dir/"latest.pt"), step, extra=ex)
+        stats.close()
+        print("[INFO] Done.")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Sanity check
+# ─────────────────────────────────────────────────────────────────────────────
 
 def run_sanity_check(config):
-    """Run a quick sanity check with tiny config."""
-    print("\n" + "="*60)
-    print("  SANITY CHECK: Tiny Config Pipeline Test")
-    print("="*60 + "\n")
-    
-    # Override config for tiny test
-    overrides = {
-        'network': {
-            'num_residual_blocks': 2,
-            'num_filters': 16,
-            'num_policy_channels': 8,
-            'num_value_channels': 8,
-            'value_fc_size': 32,
-        },
-        'mcts': {'num_simulations': 10},
-        'selfplay': {
-            'max_game_length': 50,
-            'temperature_threshold': 15,
-        },
-        'training': {
-            'batch_size': 8,
-            'training_steps_per_iteration': 2,
-            'checkpoint_interval': 5,
-        },
-        'evaluation': {
-            'eval_interval': 2,
-            'gate_games': 4,
-            'ref_opponent_games': 4,
-        },
-        'buffer': {'max_size': 1000},
-    }
-    
-    local_config = get_config(config_path=None, overrides=overrides)
-    
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Device: {device}")
-    
-    # Create network
-    network = create_model_from_config(local_config)
-    network.to(device)
-    param_count = sum(p.numel() for p in network.parameters())
-    print(f"Network: {param_count} parameters")
-    
-    # Test encoding (quick sanity)
-    import chess
-    from encoding import board_to_tensor, get_legal_move_mask, move_to_policy_index, policy_index_to_move
-    board = chess.Board()
-    tensor = board_to_tensor(board)
-    print(f"Board tensor shape: {tensor.shape} (expected: 18, 8, 8)")
-    mask = get_legal_move_mask(board)
-    print(f"Legal move mask sum: {mask.sum():.0f} (expected: 20 for starting position)")
-    
-    # Test MCTS
-    print("\n--- Testing MCTS ---")
-    mcts = MCTS(network, num_simulations=10, c_puct=1.5)
-    root = mcts.get_root(board)
-    visit_policy, best_move, stats = mcts.search(root)
-    print(f"Best move: {best_move}")
-    print(f"Visit policy sum: {visit_policy.sum():.4f}")
-    print(f"Avg depth: {stats['avg_depth']:.2f}")
-    
-    # Test self-play game
-    print("\n--- Testing Self-Play Game ---")
-    game_data, game_info = self_play_game(network, local_config)
-    print(f"Game result: {game_info['result_str']}")
-    print(f"Game length: {game_info['length']} moves")
-    print(f"Termination: {game_info['termination']}")
-    print(f"Positions generated: {game_info['num_positions']}")
-    
-    # Test replay buffer
-    print("\n--- Testing Replay Buffer ---")
-    buffer = ReplayBuffer(max_size=1000)
-    buffer.add_game(game_data)
-    print(f"Buffer size: {len(buffer)}")
-    states, policies, values = buffer.sample_batch(8)
-    print(f"Sampled batch: states={states.shape}, policies={policies.shape}, values={values.shape}")
-    
-    # Test training step
-    print("\n--- Testing Training Step ---")
-    optimizer = create_optimizer(network)
-    losses = train_one_step(network, optimizer, buffer, batch_size=8, device=device)
-    print(f"Policy loss: {losses['policy_loss']:.4f}")
-    print(f"Value loss: {losses['value_loss']:.4f}")
-    print(f"Total loss: {losses['total_loss']:.4f}")
-    
-    # Test stats logging
-    print("\n--- Testing Stats Logging ---")
-    stats_db = StatsLogger(str(output_dir / "sanity_stats.db"))
-    stats_db.log_training_step(1, losses['policy_loss'], losses['value_loss'], losses['total_loss'])
-    stats_db.log_game(game_id=1, step=1, result=game_info['result'], 
-                      result_str=game_info['result_str'],
-                      length=game_info['length'], termination=game_info['termination'])
-    
-    summary = stats_db.get_summary()
-    print(f"Stats summary: total_games={summary['total_games']}, current_step={summary['current_step']}")
-    stats_db.close()
-    
-    # Test alpha-beta
-    print("\n--- Testing Alpha-Beta ---")
+    print("\n" + "="*60 + "\n  SANITY CHECK\n" + "="*60)
+    from encoding import board_to_tensor, get_legal_move_mask
+    from training import train_one_step, create_optimizer
     from evaluation import alpha_beta_best_move
-    move = alpha_beta_best_move(board, depth=2)
-    print(f"Alpha-beta best move: {move}")
-    
-    print("\n" + "="*60)
-    print("  SANITY CHECK PASSED - All components working!")
-    print("="*60 + "\n")
+    import chess
+
+    ov = {'network':{'num_residual_blocks':2,'num_filters':16,
+                     'num_policy_channels':8,'num_value_channels':8,'value_fc_size':32},
+          'mcts':{'num_simulations':10},
+          'selfplay':{'max_game_length':50,'temperature_threshold':15},
+          'training':{'batch_size':8,'training_steps_per_iteration':2,
+                      'checkpoint_interval':5,'num_batches_per_step':2},
+          'evaluation':{'eval_interval':2,'gate_games':4,'ref_opponent_games':4},
+          'buffer':{'max_size':1000}}
+    lc = get_config(config_path=None, overrides=ov)
+    dev = torch.device("cpu")
+    net = create_model_from_config(lc)
+    board = chess.Board()
+    t = board_to_tensor(board)
+    print(f"Tensor: {t.shape}")
+    m = get_legal_move_mask(board); print(f"Mask sum: {m.sum():.0f}")
+    me = MCTS(net, num_simulations=10, c_puct=1.5)
+    root = me.get_root(board)
+    vp,bm,st = me.search(root)
+    print(f"MCTS best: {bm}  depth: {st['avg_depth']:.2f}")
+    gd,gi = self_play_game(net, lc)
+    print(f"Game: {gi['termination']} | {gi['result_str']} | {gi['length']} moves")
+    buf = ReplayBuffer(1000); buf.add_game(gd)
+    opt = create_optimizer(net)
+    ld  = train_one_step(net, opt, buf, 8, dev)
+    print(f"Loss: pol={ld['policy_loss']:.4f} val={ld['value_loss']:.4f}")
+    mv = alpha_beta_best_move(board, 2)
+    print(f"Alpha-beta: {mv}")
+    print("="*60 + "\n  SANITY CHECK PASSED\n" + "="*60)
 
 
-def run_gui_only(config):
-    """Launch GUI server only (connects to running training DB)."""
-    from gui.app import start_gui_server
-    print(f"[INFO] Starting GUI server at http://{config.gui.host}:{config.gui.port}")
-    start_gui_server(stats=None, config=config)
-    # If stats is None, GUI reads from existing DB file
-
+# ─────────────────────────────────────────────────────────────────────────────
+# Entry point
+# ─────────────────────────────────────────────────────────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser(description="AlphaZero Chess Engine")
-    parser.add_argument("mode", choices=["train", "gui", "evaluate", "sanity"],
-                       help="Run mode: train, gui, evaluate, sanity")
-    parser.add_argument("--gui", action="store_true",
-                       help="Enable GUI alongside training")
-    parser.add_argument("--config", type=str, default=None,
-                       help="Path to YAML config file")
-    parser.add_argument("--sims", type=int, default=None,
-                       help="Override MCTS simulation count")
-    parser.add_argument("--blocks", type=int, default=None,
-                       help="Override number of residual blocks")
-    parser.add_argument("--filters", type=int, default=None,
-                       help="Override number of filters")
-    parser.add_argument("--run-name", type=str, default=None,
-                       help="Override run name")
-    
+    parser = argparse.ArgumentParser()
+    parser.add_argument("mode", choices=["train","gui","evaluate","sanity"])
+    parser.add_argument("--gui",      action="store_true")
+    parser.add_argument("--config",   type=str, default=None)
+    parser.add_argument("--sims",     type=int, default=None)
+    parser.add_argument("--blocks",   type=int, default=None)
+    parser.add_argument("--filters",  type=int, default=None)
+    parser.add_argument("--run-name", type=str, default=None)
+    parser.add_argument("--workers",  type=int, default=None)
     args = parser.parse_args()
-    
-    # Build overrides from CLI
-    overrides = {}
-    if args.sims is not None:
-        overrides.setdefault('mcts', {})['num_simulations'] = args.sims
-    if args.blocks is not None:
-        overrides.setdefault('network', {})['num_residual_blocks'] = args.blocks
-    if args.filters is not None:
-        overrides.setdefault('network', {})['num_filters'] = args.filters
-    if args.run_name is not None:
-        overrides.setdefault('main', {})['run_name'] = args.run_name
-    
-    config = get_config(path=args.config, overrides=overrides if overrides else None)
-    
-    # Setup signal handler
-    signal.signal(signal.SIGINT, signal_handler)
+
+    ov = {}
+    if args.sims:     ov.setdefault('mcts',{})['num_simulations']=args.sims
+    if args.blocks:   ov.setdefault('network',{})['num_residual_blocks']=args.blocks
+    if args.filters:  ov.setdefault('network',{})['num_filters']=args.filters
+    if args.run_name: ov.setdefault('main',{})['run_name']=args.run_name
+    config = get_config(path=args.config, overrides=ov if ov else None)
+
+    signal.signal(signal.SIGINT,  signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
-    
-    # Global output dir for sanity check
+
     global output_dir
-    output_dir = Path(config.main.output_dir) / config.main.run_name
+    output_dir = Path(config.main.output_dir)/config.main.run_name
     output_dir.mkdir(parents=True, exist_ok=True)
-    
+
     if args.mode == "train":
-        run_training(config, gui_enabled=args.gui)
-    
+        import multiprocessing as _mp
+        if _mp.get_start_method(allow_none=True) is None:
+            try: _mp.set_start_method('spawn')
+            except RuntimeError: pass
+        run_training(config, gui_enabled=args.gui, num_workers=args.workers)
+
     elif args.mode == "gui":
-        run_gui_only(config)
-    
+        from gui.app import start_gui_server
+        start_gui_server(stats=None, config=config, worker_live_games=[], eval_live_game=None)
+
     elif args.mode == "evaluate":
-        # Run evaluation only
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        network = create_model_from_config(config)
-        network.to(device)
-        
-        # Load checkpoint
-        ckpt_path = Path(config.main.output_dir) / config.main.run_name / "checkpoints" / "latest.pt"
-        if ckpt_path.exists():
-            print(f"[INFO] Loading checkpoint from {ckpt_path}")
-            load_checkpoint(str(ckpt_path), network)
-        else:
-            print("[WARN] No checkpoint found. Using random network — results will be meaningless.")
-        
-        stats = StatsLogger(str(Path(config.main.output_dir) / config.main.run_name / config.stats.db_path))
-        evaluator = Evaluator(config, stats)
-        
-        print("\n--- Running Reference Evaluation ---")
-        ref_result = evaluator.run_reference_match(network, step=0, verbose=True)
-        print(f"vs Alpha-Beta: {ref_result['win_rate']:.2%} win rate")
-        
-        stats.close()
-    
+        dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        net = create_model_from_config(config); net.to(dev)
+        cp  = Path(config.main.output_dir)/config.main.run_name/"checkpoints"/"latest.pt"
+        if cp.exists(): load_checkpoint(str(cp), net)
+        else: print("[WARN] No checkpoint")
+        s   = StatsLogger(str(Path(config.main.output_dir)/config.main.run_name/config.stats.db_path))
+        ev  = Evaluator(config, s)
+        r   = ev.run_reference_match(net, step=0, verbose=True)
+        print(f"vs Alpha-Beta: {r['win_rate']:.1%}")
+        s.close()
+
     elif args.mode == "sanity":
         run_sanity_check(config)
 

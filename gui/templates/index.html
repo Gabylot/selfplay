@@ -1,1043 +1,629 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>AlphaZero Chess Engine — Dashboard</title>
-    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/chess.js/0.10.3/chess.min.js"></script>
-    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@chrisoakman/chessboardjs@1.0.0/dist/chessboard-1.0.0.min.css" />
-    <script src="https://code.jquery.com/jquery-3.7.1.min.js"></script>
-    <script src="https://cdn.jsdelivr.net/npm/@chrisoakman/chessboardjs@1.0.0/dist/chessboard-1.0.0.min.js"></script>
-    <style>
-        * { box-sizing: border-box; margin: 0; padding: 0; }
-        body { font-family: 'Segoe UI', Arial, sans-serif; background: #1a1a2e; color: #e0e0e0; }
-        .header { background: #16213e; padding: 16px 24px; border-bottom: 2px solid #0f3460; }
-        .header h1 { font-size: 22px; color: #e94560; }
-        .header .sub { font-size: 13px; color: #888; margin-top: 4px; }
-        .container { max-width: 1400px; margin: 0 auto; padding: 16px; }
-        .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-bottom: 16px; }
-        .card { background: #16213e; border-radius: 8px; padding: 16px; border: 1px solid #0f3460; }
-        .card h2 { font-size: 15px; color: #e94560; margin-bottom: 12px; text-transform: uppercase; letter-spacing: 1px; }
-        .stats-row { display: flex; gap: 16px; flex-wrap: wrap; margin-bottom: 16px; }
-        .stat-box { background: #0f3460; border-radius: 6px; padding: 12px 16px; flex: 1; min-width: 120px; text-align: center; }
-        .stat-box .label { font-size: 11px; color: #888; text-transform: uppercase; letter-spacing: 1px; }
-        .stat-box .value { font-size: 24px; font-weight: bold; color: #e94560; margin-top: 4px; }
-        .stat-box .value.blue { color: #53a0ff; }
-        .stat-box .value.green { color: #47d147; }
-        .stat-box .value.orange { color: #ff9500; }
-        .stat-box .value.purple { color: #b57bff; }
-        .chart-container { position: relative; height: 300px; }
-        .status-bar { background: #0f3460; padding: 8px 16px; border-radius: 6px; margin-bottom: 16px; display: flex; justify-content: space-between; align-items: center; font-size: 12px; }
-        .status-bar .dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; margin-right: 6px; }
-        .status-bar .dot.green { background: #47d147; }
-        .status-bar .dot.red { background: #e94560; }
-        table { width: 100%; border-collapse: collapse; font-size: 12px; }
-        th, td { padding: 6px 10px; text-align: left; border-bottom: 1px solid #0f3460; }
-        th { color: #e94560; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px; font-size: 11px; }
-        tr:hover { background: #0f3460; }
-        .outcome-bar { display: flex; height: 8px; border-radius: 4px; overflow: hidden; margin-top: 4px; }
-        .outcome-bar .white { background: #53a0ff; }
-        .outcome-bar .draw { background: #888; }
-        .outcome-bar .black { background: #e94560; }
-        @media (max-width: 900px) { .grid { grid-template-columns: 1fr; } }
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>AlphaZero — Dashboard</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/chess.js/0.10.3/chess.min.js"></script>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@chrisoakman/chessboardjs@1.0.0/dist/chessboard-1.0.0.min.css"/>
+<script src="https://code.jquery.com/jquery-3.7.1.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@chrisoakman/chessboardjs@1.0.0/dist/chessboard-1.0.0.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.7.4/socket.io.min.js"></script>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:'Segoe UI',Arial,sans-serif;background:#111827;color:#d1d5db}
+.hdr{background:#0f172a;padding:12px 20px;border-bottom:1px solid #1e3a5f;display:flex;align-items:center;gap:12px}
+.hdr h1{font-size:17px;color:#f1f5f9;letter-spacing:.3px}
+.hdr .sub{font-size:11px;color:#475569;margin-left:auto}
+.conn{font-size:11px;background:#0a1020;padding:3px 10px;border-radius:4px}
+.wrap{max-width:1600px;margin:0 auto;padding:14px}
 
-        /* Live Game Board Styles */
-        .live-section { margin-bottom: 16px; }
-        .live-grid { display: grid; grid-template-columns: auto 1fr; gap: 16px; margin-bottom: 16px; }
-        @media (max-width: 900px) { .live-grid { grid-template-columns: 1fr; } }
-        .board-wrapper { background: #0f3460; border-radius: 8px; padding: 12px; }
-        .board-info { display: flex; flex-direction: column; gap: 12px; }
-        .game-controls { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
-        .game-controls button { background: #0f3460; color: #e0e0e0; border: 1px solid #1a3a6e; border-radius: 4px; padding: 6px 14px; cursor: pointer; font-size: 12px; transition: background 0.2s; }
-        .game-controls button:hover { background: #1a4a8e; }
-        .game-controls button.active { background: #e94560; border-color: #e94560; }
-        .speed-control { display: flex; align-items: center; gap: 8px; font-size: 12px; color: #888; }
-        .speed-control input[type=range] { width: 120px; accent-color: #e94560; }
-        .move-list { background: #0a0a1a; border-radius: 6px; padding: 10px; max-height: 340px; overflow-y: auto; font-family: 'Courier New', monospace; font-size: 12px; line-height: 1.6; }
-        .move-list .move-pair { display: flex; gap: 4px; }
-        .move-list .move-num { color: #555; min-width: 30px; text-align: right; margin-right: 4px; }
-        .move-list .move { padding: 1px 4px; border-radius: 3px; cursor: default; }
-        .move-list .move.current { background: #e94560; color: #fff; }
-        .move-list .move.white-move { color: #ccc; }
-        .move-list .move.black-move { color: #53a0ff; }
+/* Stat strip */
+.strip{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:14px}
+.sbox{background:#1e293b;border:1px solid #1e3a5f;border-radius:6px;padding:8px 12px;flex:1;min-width:100px;text-align:center}
+.sbox .l{font-size:9px;color:#475569;text-transform:uppercase;letter-spacing:1px}
+.sbox .v{font-size:20px;font-weight:700;margin-top:2px}
+.red{color:#ef4444}.blue{color:#3b82f6}.green{color:#22c55e}.amber{color:#f59e0b}.purple{color:#a78bfa}.sky{color:#38bdf8}.muted{color:#6b7280}
 
-        /* MCTS Candidates Box */
-        .mcts-candidates { background: #0a0a1a; border-radius: 6px; padding: 10px; max-height: 200px; overflow-y: auto; font-family: 'Courier New', monospace; font-size: 11px; line-height: 1.6; }
-        .mcts-candidates table { width: 100%; font-size: 11px; }
-        .mcts-candidates th { font-size: 10px; color: #e94560; padding: 2px 6px; text-align: right; }
-        .mcts-candidates th:first-child { text-align: left; }
-        .mcts-candidates td { padding: 2px 6px; text-align: right; color: #ccc; }
-        .mcts-candidates td:first-child { text-align: left; color: #e0e0e0; }
-        .mcts-candidates tr.selected { background: #1a4a2e; }
-        .mcts-candidates tr.selected td { color: #47d147; font-weight: bold; }
-        .mcts-candidates .mcts-cand-label { font-size: 10px; color: #555; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 4px; }
+/* Cards */
+.card{background:#1e293b;border:1px solid #1e3a5f;border-radius:8px;padding:14px;margin-bottom:14px}
+.card h2{font-size:11px;color:#64748b;text-transform:uppercase;letter-spacing:1.2px;margin-bottom:10px}
+.g2{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-bottom:14px}
+@media(max-width:860px){.g2{grid-template-columns:1fr}}
 
-        .game-status { font-size: 13px; color: #888; }
-        .game-status .result { font-weight: bold; font-size: 15px; }
-        .game-status .result.white { color: #53a0ff; }
-        .game-status .result.black { color: #e94560; }
-        .game-status .result.draw { color: #888; }
-        .game-history-list { background: #0a0a1a; border-radius: 6px; padding: 10px; max-height: 180px; overflow-y: auto; font-size: 12px; }
-        .game-history-item { padding: 4px 8px; border-radius: 4px; cursor: pointer; display: flex; justify-content: space-between; margin-bottom: 2px; }
-        .game-history-item:hover { background: #0f3460; }
-        .game-history-item .result-tag { font-weight: bold; }
-        .game-history-item .result-tag.white { color: #53a0ff; }
-        .game-history-item .result-tag.black { color: #e94560; }
-        .game-history-item .result-tag.draw { color: #888; }
-        .board-status-badge { display: inline-block; padding: 3px 10px; border-radius: 12px; font-size: 11px; font-weight: bold; text-transform: uppercase; letter-spacing: 1px; }
-        .board-status-badge.playing { background: #47d147; color: #000; }
-        .board-status-badge.finished { background: #e94560; color: #fff; }
-        .board-status-badge.idle { background: #555; color: #ccc; }
-        .mcts-stats-inline { font-size: 10px; color: #666; margin-left: 4px; }
-        .move-list .move.current .mcts-stats-inline { color: #aaa; }
+/* Outcome bar */
+.obar{display:flex;height:5px;border-radius:3px;overflow:hidden;margin-top:4px}
+.obar .w{background:#3b82f6}.obar .d{background:#374151}.obar .b{background:#ef4444}
+.olbls{display:flex;justify-content:space-between;margin-top:3px;font-size:10px;color:#475569}
 
-        /* Eval Board Styles */
-        .eval-section { margin-bottom: 16px; border: 1px solid #e94560; }
-        .eval-section .card h2 { color: #ff9500; }
-        .eval-match-info { font-size: 13px; color: #ff9500; font-weight: bold; }
-        .eval-game-history-item .type-tag { font-size: 10px; padding: 1px 6px; border-radius: 8px; margin-right: 6px; font-weight: bold; }
-        .eval-game-history-item .type-tag.gating { background: #e94560; color: #fff; }
-        .eval-game-history-item .type-tag.reference { background: #53a0ff; color: #fff; }
-    </style>
+/* Game grid */
+.game-grid{display:grid;gap:8px}
+.tile{background:#0f172a;border:1px solid #1e3a5f;border-radius:7px;cursor:pointer;overflow:hidden;transition:border-color .15s,box-shadow .15s}
+.tile:hover{border-color:#3b82f6;box-shadow:0 0 0 1px #3b82f6}
+.tile.active{border-color:#22c55e;box-shadow:0 0 0 2px #22c55e}
+.tile-hdr{padding:5px 8px;display:flex;align-items:center;gap:6px;background:#080e1a;border-bottom:1px solid #1e3a5f;font-size:11px}
+.tile-hdr .wlbl{color:#475569;font-weight:600}
+.tile-hdr .glbl{color:#94a3b8}
+.tbadge{font-size:9px;font-weight:700;padding:1px 5px;border-radius:7px;text-transform:uppercase;margin-left:auto}
+.tbadge.playing{background:#14532d;color:#86efac}
+.tbadge.finished{background:#450a0a;color:#fca5a5}
+.tbadge.idle{background:#1e293b;color:#475569}
+.tile-board{width:100%;aspect-ratio:1;pointer-events:none}
+.tile-foot{padding:3px 8px;font-size:9px;color:#475569;display:flex;justify-content:space-between}
+
+/* Viewer */
+.viewer{display:none}
+.viewer.open{display:block}
+.vinner{display:grid;grid-template-columns:auto 1fr;gap:14px}
+@media(max-width:860px){.vinner{grid-template-columns:1fr}}
+.bwrap{background:#0f172a;border-radius:7px;padding:10px;align-self:start}
+.vside{display:flex;flex-direction:column;gap:8px}
+
+/* Controls */
+.ctrl{display:flex;gap:5px;flex-wrap:wrap;align-items:center}
+.ctrl button{background:#1e3a5f;color:#cbd5e1;border:1px solid #2d4f7c;border-radius:4px;padding:4px 10px;cursor:pointer;font-size:11px;transition:background .15s}
+.ctrl button:hover{background:#2d4f7c}
+.ctrl button.active{background:#ef4444;border-color:#ef4444;color:#fff}
+.spd{display:flex;align-items:center;gap:5px;font-size:10px;color:#475569;margin-left:3px}
+.spd input{width:80px;accent-color:#3b82f6}
+
+/* Move list */
+.mlist{background:#080e1a;border-radius:5px;padding:7px;max-height:260px;overflow-y:auto;font-family:'Courier New',monospace;font-size:11px;line-height:1.7;scrollbar-width:thin;scrollbar-color:#1e3a5f transparent}
+.mpair{display:flex;gap:3px}
+.mnum{color:#1f2937;min-width:26px;text-align:right;margin-right:3px}
+.mv{padding:1px 3px;border-radius:3px;cursor:pointer}
+.mv:hover{background:#1e3a5f}
+.mv.wm{color:#cbd5e1}.mv.bm{color:#60a5fa}.mv.cur{background:#ef4444;color:#fff}
+.minl{font-size:9px;color:#374151;margin-left:2px}
+.mv.cur .minl{color:#fecaca}
+
+/* MCTS box */
+.mbox{background:#080e1a;border-radius:5px;padding:7px;font-size:11px;max-height:220px;overflow-y:auto;scrollbar-width:thin;scrollbar-color:#1e3a5f transparent}
+.mbox table{width:100%;border-collapse:collapse}
+.mbox th{font-size:9px;color:#ef4444;padding:2px 5px;text-align:right;border-bottom:1px solid #1e3a5f}
+.mbox th:first-child{text-align:left}
+.mbox td{padding:2px 5px;text-align:right;color:#64748b}
+.mbox td:first-child{text-align:left;color:#d1d5db}
+.mbox tr.sel td{color:#22c55e;font-weight:700}
+
+/* Badge */
+.badge{display:inline-block;padding:2px 7px;border-radius:9px;font-size:9px;font-weight:700;text-transform:uppercase}
+.badge.playing{background:#14532d;color:#86efac}
+.badge.finished{background:#450a0a;color:#fca5a5}
+.badge.idle{background:#1e293b;color:#475569}
+
+/* Recent list */
+.rlist{background:#080e1a;border-radius:5px;padding:5px;max-height:140px;overflow-y:auto;scrollbar-width:thin;scrollbar-color:#1e3a5f transparent}
+.ritem{padding:3px 7px;border-radius:4px;cursor:pointer;display:flex;justify-content:space-between;align-items:center;font-size:10px;margin-bottom:1px}
+.ritem:hover{background:#1e293b}
+.rtag{font-weight:700}
+.rtag.w{color:#3b82f6}.rtag.b{color:#ef4444}.rtag.d{color:#475569}
+.tpill{font-size:8px;font-weight:700;padding:1px 4px;border-radius:5px;margin-right:3px}
+.tpill.gating{background:#450a0a;color:#fca5a5}
+.tpill.reference{background:#1e3a5f;color:#93c5fd}
+
+/* Charts */
+.chwrap{position:relative;height:240px}
+
+/* Tables */
+table.dt{width:100%;border-collapse:collapse;font-size:11px}
+table.dt th{color:#ef4444;font-size:9px;text-transform:uppercase;letter-spacing:.5px;padding:4px 7px;text-align:left;border-bottom:1px solid #1e3a5f}
+table.dt td{padding:4px 7px;border-bottom:1px solid #0f172a;color:#64748b}
+table.dt tr:hover td{background:#0f172a}
+
+/* Eval border */
+.eval-card{border-color:#450a0a}
+.eval-card h2{color:#f87171}
+
+.seclbl{font-size:9px;color:#374151;text-transform:uppercase;letter-spacing:1px;margin-bottom:3px}
+</style>
 </head>
 <body>
-    <div class="header">
-        <h1>AlphaZero Chess Engine</h1>
-        <div class="sub">Self-play training dashboard &mdash; auto-refreshing every 2s</div>
+<div class="hdr">
+  <h1>AlphaZero Chess Engine</h1>
+  <div class="conn"><span id="cdot" style="color:#ef4444">●</span> <span id="ctxt" style="margin-left:3px">Connecting…</span></div>
+  <div class="sub">step <b id="hstep">0</b> · games <b id="hgames">0</b> · buf <b id="hbuf">0</b></div>
+</div>
+<div class="wrap">
+
+<!-- Stat strip -->
+<div class="strip">
+  <div class="sbox"><div class="l">Games</div><div class="v sky" id="sg">0</div></div>
+  <div class="sbox"><div class="l">White Wins</div><div class="v blue" id="sw">0</div></div>
+  <div class="sbox"><div class="l">Black Wins</div><div class="v red" id="sb">0</div></div>
+  <div class="sbox"><div class="l">Draws</div><div class="v muted" id="sd">0</div></div>
+  <div class="sbox"><div class="l">Elo</div><div class="v green" id="se">1000</div></div>
+  <div class="sbox"><div class="l">Policy Loss</div><div class="v purple" id="sp">—</div></div>
+  <div class="sbox"><div class="l">Value Loss</div><div class="v purple" id="sv">—</div></div>
+  <div class="sbox"><div class="l">Avg Length</div><div class="v amber" id="sl">—</div></div>
+</div>
+
+<!-- Outcome bar -->
+<div class="card" style="padding:10px 14px">
+  <div class="obar" id="obar"><div class="w" style="width:33%"></div><div class="d" style="width:34%"></div><div class="b" style="width:33%"></div></div>
+  <div class="olbls"><span>White <span id="ow">0%</span></span><span>Draw <span id="od">0%</span></span><span>Black <span id="ob">0%</span></span></div>
+</div>
+
+<!-- ═══ GAME GRID ═══ -->
+<div class="card">
+  <h2>Live Self-Play · <span id="wcnt">?</span> Workers</h2>
+  <div id="grid" class="game-grid"></div>
+</div>
+
+<!-- ═══ EXPANDED VIEWER ═══ -->
+<div class="card viewer" id="viewer">
+  <h2>Game Detail — Worker <span id="vwid">?</span>
+    <span class="badge idle" id="vbadge">IDLE</span>
+    <button onclick="closeViewer()" style="float:right;background:#1e3a5f;border:1px solid #2d4f7c;color:#d1d5db;border-radius:4px;padding:2px 9px;cursor:pointer;font-size:11px">✕ Close</button>
+  </h2>
+  <div class="vinner">
+    <div class="bwrap"><div id="mboard" style="width:340px"></div></div>
+    <div class="vside">
+      <div class="ctrl">
+        <button id="vpbtn" class="active" onclick="vPause()">⏸ Pause</button>
+        <button onclick="vBack()">◀ Back</button>
+        <button onclick="vFwd()">▶ Fwd</button>
+        <button onclick="vStart()">⏮ Start</button>
+        <button onclick="vEnd()">⏭ End</button>
+        <button id="vlbtn" onclick="vLive()" style="display:none">🔴 Live</button>
+        <div class="spd">Speed <input type="range" id="vspd" min="100" max="3000" value="500" step="100" oninput="vSpdChange()"> <span id="vspdlbl">500ms</span></div>
+      </div>
+      <div id="vres" style="font-size:12px;color:#475569;display:none"></div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:7px">
+        <div><div class="seclbl">Move List</div><div class="mlist" id="vml"></div></div>
+        <div><div class="seclbl">MCTS Candidates (N W Q P)</div><div class="mbox" id="vmcts"><div style="color:#1f2937;text-align:center;padding:8px">No data</div></div></div>
+      </div>
+      <div><div class="seclbl">Recent Games (this worker)</div><div class="rlist" id="vrec"><div style="color:#374151;padding:4px 7px">No completed games yet</div></div></div>
     </div>
-    <div class="container">
-        <!-- Live Game Board -->
-        <div class="card live-section">
-            <h2>Live Self-Play Board</h2>
-            <div class="live-grid">
-                <div class="board-wrapper">
-                    <div id="chess-board" style="width: 400px"></div>
-                </div>
-                <div class="board-info">
-                    <div style="display:flex;gap:12px;align-items:center;flex-wrap:wrap">
-                        <span class="game-status">Game <strong id="lg-game-id">—</strong> &nbsp;|&nbsp; Move <strong id="lg-move-num">0</strong></span>
-                        <span class="board-status-badge idle" id="lg-status-badge">IDLE</span>
-                    </div>
-                    <div class="game-status" id="lg-turn-info"></div>
-                    <div class="game-controls">
-                        <button id="btn-pause" class="active" onclick="togglePause()">⏸ Pause</button>
-                        <button onclick="stepBack()">◀ Back</button>
-                        <button onclick="stepForward()">▶ Fwd</button>
-                        <button onclick="goToStart()">⏮ Start</button>
-                        <button onclick="goToEnd()">⏭ End</button>
-                        <button id="btn-live" onclick="goLive()" style="display:none">🔴 Live</button>
-                        <div class="speed-control">
-                            <span>Speed:</span>
-                            <input type="range" id="speed-slider" min="100" max="3000" value="500" step="100" oninput="updateSpeed()">
-                            <span id="speed-label">500ms</span>
-                        </div>
-                    </div>
-                    <div class="game-status" id="lg-result" style="display:none"></div>
-                    <!-- Move List and MCTS Candidates side by side -->
-                    <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;">
-                        <div>
-                            <div style="font-size:11px;color:#555;text-transform:uppercase;letter-spacing:1px;margin-bottom:4px;">Move List</div>
-                            <div class="move-list" id="move-list"></div>
-                        </div>
-                        <div>
-                            <div style="font-size:11px;color:#555;text-transform:uppercase;letter-spacing:1px;margin-bottom:4px;">MCTS Candidates (N W Q P)</div>
-                            <div class="mcts-candidates" id="mcts-candidates">
-                                <div style="color:#555;text-align:center;">No MCTS data for this position</div>
-                            </div>
-                        </div>
-                    </div>
-                    <div>
-                        <h2 style="font-size:12px;margin-bottom:6px">Recent Games</h2>
-                        <div class="game-history-list" id="game-history-list">
-                            <div style="color:#555;text-align:center">No completed games yet</div>
-                        </div>
-                    </div>
-                </div>
-            </div>
-        </div>
+  </div>
+</div>
 
-        <!-- Evaluation Live Board -->
-        <div class="card live-section eval-section">
-            <h2>Evaluation Games</h2>
-            <div class="live-grid">
-                <div class="board-wrapper">
-                    <div id="eval-chess-board" style="width: 400px"></div>
-                </div>
-                <div class="board-info">
-                    <div style="display:flex;gap:12px;align-items:center;flex-wrap:wrap">
-                        <span class="game-status">Eval Game <strong id="eval-lg-game-id">—</strong> &nbsp;|&nbsp; Move <strong id="eval-lg-move-num">0</strong></span>
-                        <span class="board-status-badge idle" id="eval-lg-status-badge">IDLE</span>
-                        <span class="eval-match-info" id="eval-match-info"></span>
-                    </div>
-                    <div class="game-status" id="eval-lg-turn-info"></div>
-                    <div class="game-controls">
-                        <button id="eval-btn-pause" class="active" onclick="evalTogglePause()">⏸ Pause</button>
-                        <button onclick="evalStepBack()">◀ Back</button>
-                        <button onclick="evalStepForward()">▶ Fwd</button>
-                        <button onclick="evalGoToStart()">⏮ Start</button>
-                        <button onclick="evalGoToEnd()">⏭ End</button>
-                        <button id="eval-btn-live" onclick="evalGoLive()" style="display:none">🔴 Live</button>
-                        <div class="speed-control">
-                            <span>Speed:</span>
-                            <input type="range" id="eval-speed-slider" min="100" max="3000" value="500" step="100" oninput="evalUpdateSpeed()">
-                            <span id="eval-speed-label">500ms</span>
-                        </div>
-                    </div>
-                    <div class="game-status" id="eval-lg-result" style="display:none"></div>
-                    <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;">
-                        <div>
-                            <div style="font-size:11px;color:#555;text-transform:uppercase;letter-spacing:1px;margin-bottom:4px;">Move List</div>
-                            <div class="move-list" id="eval-move-list"></div>
-                        </div>
-                        <div>
-                            <div style="font-size:11px;color:#555;text-transform:uppercase;letter-spacing:1px;margin-bottom:4px;">MCTS Candidates (N W Q P)</div>
-                            <div class="mcts-candidates" id="eval-mcts-candidates">
-                                <div style="color:#555;text-align:center;">No MCTS data</div>
-                            </div>
-                        </div>
-                    </div>
-                    <div>
-                        <h2 style="font-size:12px;margin-bottom:6px">Recent Eval Games</h2>
-                        <div class="game-history-list" id="eval-game-history-list">
-                            <div style="color:#555;text-align:center">No completed eval games yet</div>
-                        </div>
-                    </div>
-                </div>
-            </div>
-        </div>
-
-        <!-- Stats Section -->
-        <div class="status-bar">
-            <div><span class="dot green" id="status-dot"></span><span id="status-text">Connecting...</span></div>
-            <div>Step: <strong id="stat-step">0</strong> | Games: <strong id="stat-games">0</strong> | Buffer: <strong id="stat-buffer">0</strong></div>
-        </div>
-        <div class="stats-row">
-            <div class="stat-box"><div class="label">Total Games</div><div class="value" id="sum-games">0</div></div>
-            <div class="stat-box"><div class="label">White Wins</div><div class="value blue" id="sum-white">0</div></div>
-            <div class="stat-box"><div class="label">Black Wins</div><div class="value orange" id="sum-black">0</div></div>
-            <div class="stat-box"><div class="label">Draws</div><div class="value" id="sum-draws" style="color:#888">0</div></div>
-            <div class="stat-box"><div class="label">Current Elo</div><div class="value green" id="sum-elo">1000</div></div>
-            <div class="stat-box"><div class="label">Policy Loss</div><div class="value purple" id="sum-pol-loss">-</div></div>
-            <div class="stat-box"><div class="label">Value Loss</div><div class="value purple" id="sum-val-loss">-</div></div>
-            <div class="stat-box"><div class="label">Avg Game Length</div><div class="value" id="sum-avg-len" style="color:#53a0ff">-</div></div>
-        </div>
-        <div class="card" style="margin-bottom:16px">
-            <h2>Game Outcomes</h2>
-            <div class="outcome-bar" id="outcome-bar"><div class="white" style="width:33%"></div><div class="draw" style="width:34%"></div><div class="black" style="width:33%"></div></div>
-            <div style="display:flex;justify-content:space-between;margin-top:4px;font-size:11px;color:#888">
-                <span>White <span id="outcome-white-pct">0%</span></span>
-                <span>Draw <span id="outcome-draw-pct">0%</span></span>
-                <span>Black <span id="outcome-black-pct">0%</span></span>
-            </div>
-        </div>
-        <div class="grid">
-            <div class="card"><h2>Training Losses (Separate)</h2><div class="chart-container"><canvas id="chart-loss"></canvas></div></div>
-            <div class="card"><h2>Elo Rating Over Time</h2><div class="chart-container"><canvas id="chart-elo"></canvas></div></div>
-            <div class="card"><h2>Average Game Length</h2><div class="chart-container"><canvas id="chart-gamelen"></canvas></div></div>
-            <div class="card"><h2>Network Confidence</h2><div class="chart-container"><canvas id="chart-confidence"></canvas></div></div>
-        </div>
-        <div class="grid">
-            <div class="card"><h2>Replay Buffer Composition</h2><div class="chart-container"><canvas id="chart-buffer"></canvas></div></div>
-            <div class="card"><h2>Win/Draw/Loss Rates Over Time</h2><div class="chart-container"><canvas id="chart-rates"></canvas></div></div>
-        </div>
-        <div class="card" style="margin-bottom:16px">
-            <h2>Promotion Attempts (Gate Stagnation Diagnostics)</h2>
-            <table><thead><tr><th>Step</th><th>Promoted</th><th>Win Rate</th><th>W/L/D</th><th>Old Elo</th><th>New Elo</th></tr></thead>
-            <tbody id="promo-table-body"><tr><td colspan="6" style="color:#888;text-align:center">No data yet</td></tr></tbody></table>
-        </div>
-        <div class="card" style="margin-bottom:16px">
-            <h2>Recent Game Outcomes</h2>
-            <table><thead><tr><th>Game</th><th>Result</th><th>Length</th><th>Termination</th><th>Step</th><th>MCTS Depth</th></tr></thead>
-            <tbody id="game-table-body"><tr><td colspan="6" style="color:#888;text-align:center">No games yet</td></tr></tbody></table>
-        </div>
-        <div class="card" style="margin-bottom:16px">
-            <h2>MCTS Statistics</h2>
-            <div class="chart-container"><canvas id="chart-mcts"></canvas></div>
-        </div>
+<!-- ═══ EVAL BOARD ═══ -->
+<div class="card eval-card">
+  <h2>Evaluation Games <span id="eminfo" style="color:#f87171;font-size:10px;font-weight:normal;margin-left:8px"></span></h2>
+  <div class="vinner">
+    <div class="bwrap"><div id="eboard" style="width:280px"></div></div>
+    <div class="vside">
+      <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+        <span style="font-size:11px;color:#475569">Eval Game <b id="egid">—</b> · Move <b id="emov">0</b></span>
+        <span class="badge idle" id="ebadge">IDLE</span>
+      </div>
+      <div class="ctrl">
+        <button id="epbtn" class="active" onclick="ePause()">⏸ Pause</button>
+        <button onclick="eBack()">◀ Back</button>
+        <button onclick="eFwd()">▶ Fwd</button>
+        <button onclick="eStart()">⏮ Start</button>
+        <button onclick="eEnd()">⏭ End</button>
+        <button id="elbtn" onclick="eLive()" style="display:none">🔴 Live</button>
+      </div>
+      <div id="eres" style="font-size:11px;color:#475569;display:none"></div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:7px">
+        <div><div class="seclbl">Move List</div><div class="mlist" id="eml"></div></div>
+        <div><div class="seclbl">MCTS Candidates</div><div class="mbox" id="emcts"><div style="color:#1f2937;text-align:center;padding:8px">No data</div></div></div>
+      </div>
+      <div><div class="seclbl">Recent Eval Games</div><div class="rlist" id="erec"><div style="color:#374151;padding:4px 7px">No eval games yet</div></div></div>
     </div>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.7.4/socket.io.min.js"></script>
-    <script>
-        // ===== Chessboard Setup =====
-        var board = null;
-        var chess = new Chess();
-        var liveState = { moves: [], fens: [], mctsStats: [], status: 'idle', currentViewIndex: -1 };
-        var isPaused = false;
-        var playInterval = null;
-        var playSpeed = 500;
-        var latestGameState = null;
-        var isReplaying = false;
-        var replayGameId = null;
-        var replayGameData = null;  // Full game data for the currently replayed game
+  </div>
+</div>
 
-        function initBoard() {
-            board = Chessboard('chess-board', {
-                position: 'start',
-                showNotation: true,
-                pieceTheme: '/chess_pieces/{piece}.png'
-            });
-            $(window).resize(function() { board.resize(); });
-        }
+<!-- Charts -->
+<div class="g2">
+  <div class="card"><h2>Training Losses</h2><div class="chwrap"><canvas id="closs"></canvas></div></div>
+  <div class="card"><h2>Elo Rating</h2><div class="chwrap"><canvas id="celo"></canvas></div></div>
+  <div class="card"><h2>Avg Game Length</h2><div class="chwrap"><canvas id="clen"></canvas></div></div>
+  <div class="card"><h2>Network Confidence</h2><div class="chwrap"><canvas id="cconf"></canvas></div></div>
+  <div class="card"><h2>Replay Buffer</h2><div class="chwrap"><canvas id="cbuf"></canvas></div></div>
+  <div class="card"><h2>Win/Draw/Loss Rates</h2><div class="chwrap"><canvas id="crates"></canvas></div></div>
+</div>
 
-        function updateBoard() {
-            if (!board) return;
-            // Preserve page scroll position across DOM updates
-            var pageScroll = window.scrollY || window.pageYOffset;
-            if (liveState.currentViewIndex >= 0 && liveState.currentViewIndex < liveState.fens.length) {
-                board.position(liveState.fens[liveState.currentViewIndex], false);
-            } else if (liveState.fens.length === 0) {
-                board.position('start', false);
-            }
-            updateMoveList();
-            updateMctsCandidates();
-            updateTurnInfo();
-            window.scrollTo(0, pageScroll);
-        }
+<div class="card"><h2>Promotion Attempts</h2>
+  <table class="dt"><thead><tr><th>Step</th><th>Promoted</th><th>Win Rate</th><th>W/L/D</th><th>Old Elo</th><th>New Elo</th></tr></thead>
+  <tbody id="ptbl"><tr><td colspan="6" style="text-align:center;color:#1f2937">No data</td></tr></tbody></table>
+</div>
+<div class="card"><h2>Recent Game Outcomes</h2>
+  <table class="dt"><thead><tr><th>Game</th><th>Result</th><th>Length</th><th>Termination</th><th>Step</th><th>Depth</th></tr></thead>
+  <tbody id="gtbl"><tr><td colspan="6" style="text-align:center;color:#1f2937">No games</td></tr></tbody></table>
+</div>
+</div><!-- /wrap -->
 
-        function updateMoveList() {
-            var ml = document.getElementById('move-list');
-            var html = '';
-            for (var i = 0; i < liveState.moves.length; i += 2) {
-                var moveNum = Math.floor(i / 2) + 1;
-                var whiteMove = liveState.moves[i];
-                var blackMove = (i + 1 < liveState.moves.length) ? liveState.moves[i + 1] : null;
-                var wClass = 'move white-move';
-                var bClass = 'move black-move';
-                if (i === liveState.currentViewIndex) wClass += ' current';
-                if (i + 1 === liveState.currentViewIndex) bClass += ' current';
-                
-                // Build inline MCTS stats text
-                var wStats = getMctsInlineStats(i);
-                var bStats = blackMove ? getMctsInlineStats(i + 1) : '';
-                
-                html += '<div class="move-pair"><span class="move-num">' + moveNum + '.</span>';
-                html += '<span class="' + wClass + '" onclick="onMoveClick(' + i + ')">' + whiteMove + '<span class="mcts-stats-inline">' + wStats + '</span></span>';
-                if (blackMove) {
-                    html += '<span class="' + bClass + '" onclick="onMoveClick(' + (i + 1) + ')">' + blackMove + '<span class="mcts-stats-inline">' + bStats + '</span></span>';
-                }
-                html += '</div>';
-            }
-            ml.innerHTML = html;
-            // Scroll within the move-list container only (not the page)
-            var currentEl = ml.querySelector('.move.current');
-            if (currentEl) {
-                var elTop = currentEl.offsetTop;
-                var elHeight = currentEl.offsetHeight;
-                var containerHeight = ml.clientHeight;
-                var newScrollTop = elTop - (containerHeight / 2) + (elHeight / 2);
-                if (newScrollTop < 0) newScrollTop = 0;
-                ml.scrollTop = newScrollTop;
-            }
-        }
+<script>
+// ════════════════════════════════════════════
+// Charts
+// ════════════════════════════════════════════
+const CO={responsive:true,maintainAspectRatio:false,
+  plugins:{legend:{labels:{color:'#64748b',font:{size:10}}}},
+  scales:{x:{ticks:{color:'#374151',font:{size:9}},grid:{color:'#0a1020'}},
+          y:{ticks:{color:'#374151',font:{size:9}},grid:{color:'#0a1020'}}}};
+function mk(id,ds,ex){return new Chart(document.getElementById(id),{type:'line',data:{labels:[],datasets:ds},options:{...CO,...ex}});}
+const CL=mk('closs',[{label:'Policy',data:[],borderColor:'#ef4444',fill:false,pointRadius:0},
+  {label:'Value',data:[],borderColor:'#3b82f6',fill:false,pointRadius:0},
+  {label:'Total',data:[],borderColor:'#a78bfa',fill:false,pointRadius:0,borderDash:[4,2]}]);
+const CE=mk('celo',[{label:'Elo',data:[],borderColor:'#22c55e',backgroundColor:'rgba(34,197,94,.08)',fill:true,pointRadius:0}]);
+const CN=mk('clen',[{label:'Avg Length',data:[],borderColor:'#f59e0b',fill:false,pointRadius:0}]);
+const CC=mk('cconf',[{label:'Max Policy',data:[],borderColor:'#ef4444',fill:false,pointRadius:0},
+  {label:'|Value|',data:[],borderColor:'#3b82f6',fill:false,pointRadius:0}]);
+const CB=mk('cbuf',[{label:'White',data:[],borderColor:'#3b82f6',backgroundColor:'rgba(59,130,246,.08)',fill:true,pointRadius:0},
+  {label:'Draw',data:[],borderColor:'#374151',backgroundColor:'rgba(55,65,81,.08)',fill:true,pointRadius:0},
+  {label:'Black',data:[],borderColor:'#ef4444',backgroundColor:'rgba(239,68,68,.08)',fill:true,pointRadius:0}]);
+const CR=mk('crates',[{label:'White%',data:[],borderColor:'#3b82f6',fill:false,pointRadius:0},
+  {label:'Draw%',data:[],borderColor:'#374151',fill:false,pointRadius:0},
+  {label:'Black%',data:[],borderColor:'#ef4444',fill:false,pointRadius:0}],
+  {scales:{...CO.scales,y:{...CO.scales.y,min:0,max:100}}});
+function fill(c,rows,ks){if(!rows||!rows.length)return;c.data.labels=rows.map(r=>r.step||r.game_id||0);ks.forEach((k,i)=>{c.data.datasets[i].data=rows.map(r=>r[k]);});c.update('none');}
 
-        function getMctsInlineStats(moveIndex) {
-            if (!liveState.mctsStats || moveIndex >= liveState.mctsStats.length) return '';
-            var ms = liveState.mctsStats[moveIndex];
-            if (!ms || !ms.selected_move) return '';
-            // Find the candidate matching the selected move
-            var cands = ms.candidates || [];
-            var selected = null;
-            for (var k = 0; k < cands.length; k++) {
-                if (cands[k].move === ms.selected_move) {
-                    selected = cands[k];
-                    break;
-                }
-            }
-            if (!selected) return '';
-            return ' (N:' + selected.N + ' Q:' + selected.Q.toFixed(2) + ')';
-        }
+// ════════════════════════════════════════════
+// Tile grid
+// ════════════════════════════════════════════
+let numW=0, tileBoards=[], tileStates={};
 
-        function onMoveClick(moveIndex) {
-            liveState.currentViewIndex = moveIndex;
-            updateBoard();
-        }
+function buildGrid(n){
+  numW=n;
+  document.getElementById('wcnt').textContent=n;
+  const g=document.getElementById('grid');
+  g.innerHTML='';
+  const cols=Math.min(n,4);
+  g.style.gridTemplateColumns=`repeat(${cols},1fr)`;
+  tileBoards=[];
+  for(let i=0;i<n;i++){
+    const d=document.createElement('div');
+    d.className='tile'; d.id=`t${i}`;
+    d.innerHTML=`<div class="tile-hdr"><span class="wlbl">W${i}</span><span class="glbl" id="tg${i}">—</span><span class="tbadge idle" id="tb${i}">IDLE</span></div><div id="tb${i}b" class="tile-board"></div><div class="tile-foot"><span id="tm${i}">0 moves</span><span id="tr${i}" style="color:#1f2937">—</span></div>`;
+    d.onclick=()=>openV(i);
+    g.appendChild(d);
+    tileBoards.push(Chessboard(`tb${i}b`,{position:'start',showNotation:false,pieceTheme:'/chess_pieces/{piece}.png'}));
+  }
+}
 
-        function updateMctsCandidates() {
-            var el = document.getElementById('mcts-candidates');
-            var moveIdx = liveState.currentViewIndex;
-            if (moveIdx < 0 || !liveState.mctsStats || moveIdx >= liveState.mctsStats.length) {
-                el.innerHTML = '<div style="color:#555;text-align:center;">No MCTS data for this position</div>';
-                return;
-            }
-            var ms = liveState.mctsStats[moveIdx];
-            if (!ms || !ms.candidates || ms.candidates.length === 0) {
-                el.innerHTML = '<div style="color:#555;text-align:center;">No MCTS data for this position</div>';
-                return;
-            }
-            var cands = ms.candidates;
-            var selectedMove = ms.selected_move;
-            var html = '<table><thead><tr><th>Move</th><th>N</th><th>W</th><th>Q</th><th>P</th></tr></thead><tbody>';
-            for (var i = 0; i < cands.length; i++) {
-                var c = cands[i];
-                var cls = (c.move === selectedMove) ? ' class="selected"' : '';
-                html += '<tr' + cls + '><td>' + c.move + '</td><td>' + c.N + '</td><td>' + c.W.toFixed(2) + '</td><td>' + c.Q.toFixed(2) + '</td><td>' + c.P.toFixed(3) + '</td></tr>';
-            }
-            // If the selected move is not in the candidates list (possible if all visits = 0)
-            var found = cands.some(function(c) { return c.move === selectedMove; });
-            if (!found && selectedMove) {
-                html += '<tr class="selected"><td>' + selectedMove + '</td><td>0</td><td>0.00</td><td>0.00</td><td>0.000</td></tr>';
-            }
-            html += '</tbody></table>';
-            el.innerHTML = html;
-        }
+function applyTile(s){
+  const w=s.worker_id; if(w>=numW)return;
+  tileStates[w]=s;
+  const badge=document.getElementById(`tb${w}`), gid=document.getElementById(`tg${w}`),
+        mv=document.getElementById(`tm${w}`), res=document.getElementById(`tr${w}`);
+  if(badge){badge.className=`tbadge ${s.status||'idle'}`;badge.textContent=(s.status||'idle').toUpperCase();}
+  if(gid)gid.textContent=s.game_id?`#${s.game_id}`:'—';
+  if(mv)mv.textContent=`${s.num_moves||0} moves`;
+  if(res){
+    const gt=s.game_type||'selfplay';
+    const typeColor=gt==='gating'?'#f87171':gt==='reference'?'#60a5fa':'#1f2937';
+    if(s.status==='finished'&&s.result){
+      const c=s.result==='1-0'?'#3b82f6':s.result==='0-1'?'#ef4444':'#475569';
+      res.innerHTML=`<span style="color:${c}">${s.result}</span>`;
+    } else res.innerHTML='—';
+  }
+  const fen=s.latest_fen||'start';
+  try{tileBoards[w]&&tileBoards[w].position(fen,false);}catch(e){}
 
-        function updateTurnInfo() {
-            var el = document.getElementById('lg-turn-info');
-            var badge = document.getElementById('lg-status-badge');
-            var gameEl = document.getElementById('lg-game-id');
-            var moveEl = document.getElementById('lg-move-num');
-            // Use replay data if replaying, otherwise use live state
-            var stateForDisplay = (isReplaying && replayGameData) ? replayGameData : latestGameState;
-            gameEl.textContent = stateForDisplay ? ('#' + stateForDisplay.game_id) : '—';
-            moveEl.textContent = liveState.currentViewIndex + 1;
+  // If this worker is the one currently expanded, keep viewer in sync
+  if(vWorker===w&&!vReplaying) applyDetail(s);
+}
 
-            badge.className = 'board-status-badge ' + liveState.status;
-            badge.textContent = liveState.status.toUpperCase();
+// ════════════════════════════════════════════
+// Viewer
+// ════════════════════════════════════════════
+let mboard=null, vWorker=-1, vReplaying=false, vReplayData=null;
+let vSt={moves:[],fens:[],mcts:[],status:'idle',idx:-1};
+let vPaused=false, vIv=null, vSpd=500, vMovesUpTo=-1;
 
-            if (liveState.status === 'playing') {
-                var turn = (liveState.currentViewIndex + 1) % 2 === 0 ? 'White' : 'Black';
-                if (liveState.currentViewIndex === -1) turn = 'White';
-                el.textContent = turn + ' to move';
-                el.style.color = turn === 'White' ? '#ccc' : '#53a0ff';
-            } else if (liveState.status === 'finished') {
-                el.textContent = 'Game over';
-                el.style.color = '#888';
-            } else {
-                el.textContent = 'Waiting for game...';
-                el.style.color = '#555';
-            }
-        }
+function initMBoard(){
+  mboard=Chessboard('mboard',{position:'start',showNotation:true,pieceTheme:'/chess_pieces/{piece}.png'});
+  $(window).resize(()=>mboard&&mboard.resize());
+}
 
-        function updateResult() {
-            var el = document.getElementById('lg-result');
-            // Use replay data if replaying, otherwise use live state
-            var stateForResult = (isReplaying && replayGameData) ? replayGameData : latestGameState;
-            if (stateForResult && stateForResult.result) {
-                var resultText = stateForResult.result;
-                var termText = stateForResult.termination || '';
-                var cls = 'draw';
-                if (resultText === '1-0') cls = 'white';
-                else if (resultText === '0-1') cls = 'black';
-                el.innerHTML = '<span class="result ' + cls + '">' + resultText + '</span> &mdash; ' + termText;
-                el.style.display = 'block';
-            } else {
-                el.style.display = 'none';
-            }
-        }
+function openV(w){
+  vWorker=w; vReplaying=false; vReplayData=null;
+  document.getElementById('viewer').className='card viewer open';
+  document.getElementById('vwid').textContent=w;
+  document.getElementById('vlbtn').style.display='none';
+  vSt={moves:[],fens:[],mcts:[],status:'idle',idx:-1}; vMovesUpTo=-1;
+  mboard&&mboard.position('start',false);
+  socket.emit('request_worker_detail',{worker_id:w});
+  socket.emit('request_game_history',{worker_id:w});
+  document.querySelectorAll('.tile').forEach(t=>t.classList.remove('active'));
+  document.getElementById(`t${w}`)?.classList.add('active');
+  document.getElementById('viewer').scrollIntoView({behavior:'smooth',block:'start'});
+}
 
-        // ===== Playback Controls =====
-        function togglePause() {
-            isPaused = !isPaused;
-            var btn = document.getElementById('btn-pause');
-            if (isPaused) {
-                btn.textContent = '▶ Play';
-                btn.classList.remove('active');
-                stopAutoPlay();
-            } else {
-                btn.textContent = '⏸ Pause';
-                btn.classList.add('active');
-                startAutoPlay();
-            }
-        }
+function closeViewer(){
+  vWorker=-1; vStop();
+  document.getElementById('viewer').className='card viewer';
+  document.querySelectorAll('.tile').forEach(t=>t.classList.remove('active'));
+}
 
-        function startAutoPlay() {
-            stopAutoPlay();
-            playInterval = setInterval(function() {
-                if (liveState.currentViewIndex < liveState.fens.length - 1) {
-                    liveState.currentViewIndex++;
-                    updateBoard();
-                } else {
-                    stopAutoPlay();
-                }
-            }, playSpeed);
-        }
+function applyDetail(data){
+  if(!data)return;
+  const nm=data.moves||[], nf=data.fens||[], nc=data.mcts_stats_per_move||[];
+  if(!vReplaying){
+    // If new game started, reset
+    if(data.game_id && data.game_id !== (vSt._gid||0)){
+      vSt={moves:[],fens:[],mcts:[],status:data.status||'idle',idx:-1,_gid:data.game_id};
+      vMovesUpTo=-1;
+      mboard&&mboard.position('start',false);
+    }
+    vSt.status=data.status||'idle';
+    while(vMovesUpTo<nm.length-1){
+      vMovesUpTo++;
+      vSt.moves.push(nm[vMovesUpTo]);
+      vSt.fens.push(nf[vMovesUpTo]);
+      if(vMovesUpTo<nc.length)vSt.mcts.push(nc[vMovesUpTo]);
+    }
+    if(!vPaused)vSt.idx=vSt.fens.length-1;
+  }
+  renderV();
+}
 
-        function stopAutoPlay() {
-            if (playInterval) { clearInterval(playInterval); playInterval = null; }
-        }
+function renderV(){
+  const badge=document.getElementById('vbadge');
+  if(badge){badge.className=`badge ${vSt.status}`;badge.textContent=vSt.status.toUpperCase();}
+  if(mboard){
+    if(vSt.idx>=0&&vSt.idx<vSt.fens.length)mboard.position(vSt.fens[vSt.idx],false);
+    else if(!vSt.fens.length)mboard.position('start',false);
+  }
+  renderML(vSt,'vml',i=>{vSt.idx=i;renderV();});
+  renderMCTS(vSt,'vmcts');
+  const rEl=document.getElementById('vres');
+  const src=vReplaying?vReplayData:null;
+  if(rEl&&src&&src.result){
+    const c=src.result==='1-0'?'#3b82f6':src.result==='0-1'?'#ef4444':'#475569';
+    rEl.innerHTML=`<span style="color:${c};font-weight:700">${src.result}</span> — ${src.termination||''}`;
+    rEl.style.display='block';
+  } else if(rEl)rEl.style.display='none';
+}
 
-        function stepBack() {
-            if (liveState.currentViewIndex > 0) {
-                liveState.currentViewIndex--;
-                updateBoard();
-            } else if (liveState.currentViewIndex === 0) {
-                liveState.currentViewIndex = -1;
-                board.position('start', true);
-                updateMoveList();
-                updateMctsCandidates();
-                updateTurnInfo();
-            }
-        }
+function vPause(){vPaused=!vPaused;const b=document.getElementById('vpbtn');if(vPaused){b.textContent='▶ Play';b.classList.remove('active');vStop();}else{b.textContent='⏸ Pause';b.classList.add('active');vPlay();}}
+function vPlay(){vStop();vIv=setInterval(()=>{if(vSt.idx<vSt.fens.length-1){vSt.idx++;renderV();}else vStop();},vSpd);}
+function vStop(){if(vIv){clearInterval(vIv);vIv=null;}}
+function vBack(){if(vSt.idx>0){vSt.idx--;renderV();}}
+function vFwd(){if(vSt.idx<vSt.fens.length-1){vSt.idx++;renderV();}}
+function vStart(){vSt.idx=-1;mboard&&mboard.position('start',true);renderML(vSt,'vml',i=>{vSt.idx=i;renderV();});renderMCTS(vSt,'vmcts');}
+function vEnd(){if(vSt.fens.length){vSt.idx=vSt.fens.length-1;renderV();}}
+function vLive(){vReplaying=false;vReplayData=null;document.getElementById('vlbtn').style.display='none';socket.emit('request_worker_detail',{worker_id:vWorker});}
+function vSpdChange(){vSpd=parseInt(document.getElementById('vspd').value);document.getElementById('vspdlbl').textContent=vSpd+'ms';if(!vPaused)vPlay();}
 
-        function stepForward() {
-            if (liveState.currentViewIndex < liveState.fens.length - 1) {
-                liveState.currentViewIndex++;
-                updateBoard();
-            }
-        }
+function replayGame(w,gid){
+  vReplaying=true;
+  document.getElementById('vlbtn').style.display='';
+  socket.emit('request_replay_game',{worker_id:w,game_id:gid});
+}
 
-        function goToStart() {
-            liveState.currentViewIndex = -1;
-            board.position('start', true);
-            updateMoveList();
-            updateMctsCandidates();
-            updateTurnInfo();
-        }
+// ════════════════════════════════════════════
+// Eval board
+// ════════════════════════════════════════════
+let eboard=null;
+let eSt={moves:[],fens:[],mcts:[],status:'idle',idx:-1};
+let ePaused=false, eIv=null, eReplaying=false, eReplayData=null, eMovesUpTo=-1, eLastGid=0;
 
-        function goToEnd() {
-            if (liveState.fens.length > 0) {
-                liveState.currentViewIndex = liveState.fens.length - 1;
-                updateBoard();
-            }
-        }
+function initEBoard(){eboard=Chessboard('eboard',{position:'start',showNotation:true,pieceTheme:'/chess_pieces/{piece}.png'});}
 
-        function updateSpeed() {
-            playSpeed = parseInt(document.getElementById('speed-slider').value);
-            document.getElementById('speed-label').textContent = playSpeed + 'ms';
-            if (!isPaused) {
-                startAutoPlay();
-            }
-        }
+function applyEval(data){
+  if(!data)return;
+  const nm=data.moves||[],nf=data.fens||[],nc=data.mcts_stats_per_move||[];
+  if(!eReplaying){
+    if(data.game_id&&data.game_id!==eLastGid){
+      eLastGid=data.game_id;
+      eSt={moves:[],fens:[],mcts:[],status:data.status||'idle',idx:-1};
+      eMovesUpTo=-1; eboard&&eboard.position('start',false);
+    }
+    eSt.status=data.status||'idle';
+    while(eMovesUpTo<nm.length-1){eMovesUpTo++;eSt.moves.push(nm[eMovesUpTo]);eSt.fens.push(nf[eMovesUpTo]);if(eMovesUpTo<nc.length)eSt.mcts.push(nc[eMovesUpTo]);}
+    if(!ePaused)eSt.idx=eSt.fens.length-1;
+  }
+  renderE(data);
+}
 
-        // ===== Socket.IO Live Game Updates =====
-        var socket = io();
-        var lastGameId = 0;
-        var movesReplayedUpTo = -1;  // How many moves of the latest game have been replayed
+function renderE(data){
+  const src=eReplaying?eReplayData:data;
+  const badge=document.getElementById('ebadge');
+  if(badge){badge.className=`badge ${eSt.status}`;badge.textContent=eSt.status.toUpperCase();}
+  document.getElementById('emov').textContent=eSt.idx+1;
+  if(src){
+    document.getElementById('egid').textContent=src.game_id?`#${src.game_id}`:'—';
+    document.getElementById('eminfo').textContent=src.match_info||'';
+  }
+  if(eboard){
+    if(eSt.idx>=0&&eSt.idx<eSt.fens.length)eboard.position(eSt.fens[eSt.idx],false);
+    else eboard.position('start',false);
+  }
+  renderML(eSt,'eml',i=>{eSt.idx=i;renderE(null);});
+  renderMCTS(eSt,'emcts');
+  const rEl=document.getElementById('eres');
+  if(rEl&&src&&src.result){
+    const c=src.result==='1-0'?'#3b82f6':src.result==='0-1'?'#ef4444':'#475569';
+    rEl.innerHTML=`<span style="color:${c};font-weight:700">${src.result}</span> — ${src.termination||''}`;
+    rEl.style.display='block';
+  } else if(rEl)rEl.style.display='none';
+}
 
-        socket.on('connect', function() {
-            console.log('Connected to GUI server');
-            socket.emit('request_live_state');
-        });
+function ePause(){ePaused=!ePaused;const b=document.getElementById('epbtn');if(ePaused){b.textContent='▶ Play';b.classList.remove('active');eStop();}else{b.textContent='⏸ Pause';b.classList.add('active');ePlay();}}
+function ePlay(){eStop();eIv=setInterval(()=>{if(eSt.idx<eSt.fens.length-1){eSt.idx++;renderE(null);}else eStop();},500);}
+function eStop(){if(eIv){clearInterval(eIv);eIv=null;}}
+function eBack(){if(eSt.idx>0){eSt.idx--;renderE(null);}}
+function eFwd(){if(eSt.idx<eSt.fens.length-1){eSt.idx++;renderE(null);}}
+function eStart(){eSt.idx=-1;eboard&&eboard.position('start',true);renderML(eSt,'eml',i=>{eSt.idx=i;renderE(null);});renderMCTS(eSt,'emcts');}
+function eEnd(){if(eSt.fens.length){eSt.idx=eSt.fens.length-1;renderE(null);}}
+function eLive(){eReplaying=false;eReplayData=null;document.getElementById('elbtn').style.display='none';socket.emit('request_eval_live_state');}
+function evalReplayGame(gid){eReplaying=true;document.getElementById('elbtn').style.display='';socket.emit('request_replay_eval_game',{game_id:gid});}
 
-        socket.on('live_game_update', function(data) {
-            // Save latest live state, but don't overwrite the replay display
-            if (!isReplaying) {
-                latestGameState = data;
-            }
+// ════════════════════════════════════════════
+// Shared renderers
+// ════════════════════════════════════════════
+function renderML(st,elId,onClick){
+  const el=document.getElementById(elId); if(!el)return;
+  let h='';
+  for(let i=0;i<st.moves.length;i+=2){
+    const mn=Math.floor(i/2)+1, wm=st.moves[i], bm=i+1<st.moves.length?st.moves[i+1]:null;
+    const wc='mv wm'+(i===st.idx?' cur':''), bc='mv bm'+(i+1===st.idx?' cur':'');
+    const ws=inl(st,i), bs=bm?inl(st,i+1):'';
+    h+=`<div class="mpair"><span class="mnum">${mn}.</span><span class="${wc}" onclick="(${onClick.toString()})(${i})">${wm}<span class="minl">${ws}</span></span>`;
+    if(bm)h+=`<span class="${bc}" onclick="(${onClick.toString()})(${i+1})">${bm}<span class="minl">${bs}</span></span>`;
+    h+='</div>';
+  }
+  el.innerHTML=h;
+  const cur=el.querySelector('.mv.cur');
+  if(cur)el.scrollTop=cur.offsetTop-el.clientHeight/2+cur.offsetHeight/2;
+}
 
-            // If user is watching a replay, don't overwrite their view
-            if (isReplaying) {
-                return;
-            }
+function inl(st,i){
+  if(!st.mcts||i>=st.mcts.length)return'';
+  const ms=st.mcts[i]; if(!ms||!ms.selected_move)return'';
+  const c=(ms.candidates||[]).find(x=>x.move===ms.selected_move);
+  if(!c)return''; return` (N:${c.N} Q:${c.Q.toFixed(2)})`;
+}
 
-            if (data.game_id !== lastGameId) {
-                // New game started
-                lastGameId = data.game_id;
-                liveState = { moves: [], fens: [], mctsStats: [], status: data.status, currentViewIndex: -1 };
-                movesReplayedUpTo = -1;
-                document.getElementById('lg-result').style.display = 'none';
-                board.position('start', false);
-            }
+function renderMCTS(st,elId){
+  const el=document.getElementById(elId); if(!el)return;
+  const idx=st.idx;
+  if(idx<0||!st.mcts||idx>=st.mcts.length){el.innerHTML='<div style="color:#1f2937;text-align:center;padding:8px">No data</div>';return;}
+  const ms=st.mcts[idx]; if(!ms||!ms.candidates||!ms.candidates.length){el.innerHTML='<div style="color:#1f2937;text-align:center;padding:8px">No data</div>';return;}
+  let h='<table><thead><tr><th>Move</th><th>N</th><th>W</th><th>Q</th><th>P</th></tr></thead><tbody>';
+  for(const c of ms.candidates){
+    const s=c.move===ms.selected_move?' class="sel"':'';
+    h+=`<tr${s}><td>${c.move}</td><td>${c.N}</td><td>${c.W.toFixed(2)}</td><td>${c.Q.toFixed(2)}</td><td>${c.P.toFixed(3)}</td></tr>`;
+  }
+  el.innerHTML=h+'</tbody></table>';
+}
 
-            liveState.status = data.status;
+function renderRecent(hist,elId,clickFn){
+  const el=document.getElementById(elId); if(!el)return;
+  if(!hist||!hist.length){el.innerHTML='<div style="color:#374151;padding:4px 7px">No completed games yet</div>';return;}
+  let h='';
+  [...hist].forEach(g=>{
+    const r=g.result||'*', cls=r==='1-0'?'w':r==='0-1'?'b':'d';
+    const tp=g.game_type, pill=tp?`<span class="tpill ${tp==='gating'?'gating':'reference'}">${tp.toUpperCase()}</span>`:'';
+    h+=`<div class="ritem" onclick="${clickFn}(${JSON.stringify(g.game_id)})">${pill}#${g.game_id} <span style="color:#374151">(${g.num_moves})</span><span class="rtag ${cls}">${r}</span></div>`;
+  });
+  el.innerHTML=h;
+}
 
-            // Append new moves (incremental update)
-            while (movesReplayedUpTo < data.moves.length - 1) {
-                movesReplayedUpTo++;
-                liveState.moves.push(data.moves[movesReplayedUpTo]);
-                liveState.fens.push(data.fens[movesReplayedUpTo]);
-                // Append MCTS stats if available
-                if (data.mcts_stats_per_move && movesReplayedUpTo < data.mcts_stats_per_move.length) {
-                    liveState.mctsStats.push(data.mcts_stats_per_move[movesReplayedUpTo]);
-                }
-            }
+// ════════════════════════════════════════════
+// Socket.IO
+// ════════════════════════════════════════════
+const socket=io();
 
-            // Only auto-advance if not paused
-            if (!isPaused) {
-                liveState.currentViewIndex = liveState.fens.length - 1;
-                updateBoard();
-            }
-            updateResult();
-            // Throttle game history refresh to avoid unnecessary DOM rebuilds
-            if (!window._gameHistoryPending) {
-                window._gameHistoryPending = true;
-                setTimeout(function() {
-                    window._gameHistoryPending = false;
-                    refreshGameHistory();
-                }, 2000);
-            }
-        });
+socket.on('connect',()=>{
+  document.getElementById('cdot').style.color='#22c55e';
+  document.getElementById('ctxt').textContent='Connected';
+  socket.emit('request_worker_states');
+  socket.emit('request_eval_live_state');
+});
+socket.on('disconnect',()=>{
+  document.getElementById('cdot').style.color='#ef4444';
+  document.getElementById('ctxt').textContent='Disconnected';
+});
 
-        socket.on('game_history', function(history) {
-            var sv = window.scrollY;
-            document.documentElement.style.overflow = 'hidden';
-            window._gameHistoryCache = history;
-            updateGameHistoryList(history);
-            document.documentElement.style.overflow = '';
-            window.scrollTo(0, sv);
-        });
+socket.on('num_workers',d=>{if(d.num_workers>0&&d.num_workers!==numW)buildGrid(d.num_workers);});
 
-        socket.on('replay_game', function(data) {
-            // Replay a completed game on the board
-            replayGameData = data;  // Store for display purposes
-            lastGameId = data.game_id;
-            liveState = { moves: [], fens: [], mctsStats: [], status: 'finished', currentViewIndex: -1 };
-            movesReplayedUpTo = data.moves.length - 1;
-            liveState.moves = data.moves.slice();
-            liveState.fens = data.fens.slice();
-            // Load MCTS stats if available
-            if (data.mcts_stats_per_move) {
-                liveState.mctsStats = data.mcts_stats_per_move.slice();
-            }
-            // Only update latestGameState if not currently replaying anything new arrives here fresh
-            if (!isReplaying) {
-                latestGameState = data;
-            }
-            board.position('start', false);
-            // Start auto-replay from the beginning
-            liveState.currentViewIndex = -1;
-            updateBoard();
-            document.getElementById('lg-result').style.display = 'none';
-            if (isPaused) togglePause();
-        });
+// Bulk state (on connect / poll)
+socket.on('worker_states',states=>{
+  if(states.length&&states.length!==numW)buildGrid(states.length);
+  states.forEach(applyTile);
+});
 
-        function refreshGameHistory() {
-            socket.emit('request_game_history');
-        }
+// ★ Real-time per-move tile update (push from LiveGameState._emit)
+socket.on('worker_tile_update',s=>applyTile(s));
 
-        function updateGameHistoryList(history) {
-            var el = document.getElementById('game-history-list');
-            if (!history || history.length === 0) {
-                el.innerHTML = '<div style="color:#555;text-align:center">No completed games yet</div>';
-                return;
-            }
-            var html = '';
-            history.forEach(function(g) {
-                var r = g.result || '*';
-                var cls = 'draw';
-                if (r === '1-0') cls = 'white';
-                else if (r === '0-1') cls = 'black';
-                html += '<div class="game-history-item" onclick="replayGame(' + g.game_id + ')">';
-                html += '<span>Game #' + g.game_id + ' <span style="color:#555">(' + g.num_moves + ' moves)</span></span>';
-                html += '<span class="result-tag ' + cls + '">' + r + '</span>';
-                html += '</div>';
-            });
-            el.innerHTML = html;
-        }
+// ★ Real-time full detail update (push from LiveGameState._emit)
+socket.on('worker_detail_update',data=>{
+  if(vWorker>=0&&data.worker_id===vWorker&&!vReplaying)applyDetail(data);
+});
 
-        function replayGame(gameId) {
-            isReplaying = true;
-            replayGameId = gameId;
-            socket.emit('request_replay_game', { game_id: gameId });
-            document.getElementById('btn-live').style.display = '';
-        }
+socket.on('game_history',data=>{
+  if(data.worker_id===vWorker)
+    renderRecent(data.history,'vrec',`replayGame.bind(null,${vWorker})`);
+});
 
-        function goLive() {
-            isReplaying = false;
-            replayGameId = null;
-            replayGameData = null;
-            document.getElementById('btn-live').style.display = 'none';
-            socket.emit('request_live_state');
-        }
+socket.on('replay_game',data=>{
+  vReplayData=data;
+  vSt={moves:data.moves.slice(),fens:data.fens.slice(),mcts:(data.mcts_stats_per_move||[]).slice(),status:'finished',idx:-1};
+  vMovesUpTo=data.moves.length-1;
+  mboard&&mboard.position('start',false);
+  vSt.idx=-1; renderV();
+  if(vPaused)vPause();
+});
 
-        // ===== Chart Defaults & Updates =====
-        const chartDefaults = {
-            responsive: true, maintainAspectRatio: false,
-            plugins: { legend: { labels: { color: '#e0e0e0', font: { size: 11 } } } },
-            scales: {
-                x: { ticks: { color: '#888', font: { size: 10 } }, grid: { color: '#1a1a2e' } },
-                y: { ticks: { color: '#888', font: { size: 10 } }, grid: { color: '#1a1a2e' } },
-            },
-        };
-        const lossChart = new Chart(document.getElementById('chart-loss'), {
-            type: 'line',
-            data: { labels: [], datasets: [
-                { label: 'Policy Loss', data: [], borderColor: '#e94560', fill: false, pointRadius: 1 },
-                { label: 'Value Loss', data: [], borderColor: '#53a0ff', fill: false, pointRadius: 1 },
-                { label: 'Total Loss', data: [], borderColor: '#b57bff', fill: false, pointRadius: 1, borderDash: [4,2] },
-            ]}, options: { ...chartDefaults },
-        });
-        const eloChart = new Chart(document.getElementById('chart-elo'), {
-            type: 'line',
-            data: { labels: [], datasets: [{ label: 'Elo', data: [], borderColor: '#47d147', backgroundColor: 'rgba(71,209,71,0.1)', fill: true, pointRadius: 1 }] },
-            options: { ...chartDefaults },
-        });
-        const gamelenChart = new Chart(document.getElementById('chart-gamelen'), {
-            type: 'line',
-            data: { labels: [], datasets: [{ label: 'Avg Length', data: [], borderColor: '#ff9500', fill: false, pointRadius: 1 }] },
-            options: { ...chartDefaults },
-        });
-        const confidenceChart = new Chart(document.getElementById('chart-confidence'), {
-            type: 'line',
-            data: { labels: [], datasets: [
-                { label: 'Avg Max Policy', data: [], borderColor: '#e94560', fill: false, pointRadius: 1 },
-                { label: 'Avg |Value|', data: [], borderColor: '#53a0ff', fill: false, pointRadius: 1 },
-            ]}, options: { ...chartDefaults },
-        });
-        const bufferChart = new Chart(document.getElementById('chart-buffer'), {
-            type: 'line',
-            data: { labels: [], datasets: [
-                { label: 'White Wins', data: [], borderColor: '#53a0ff', backgroundColor: 'rgba(83,160,255,0.15)', fill: true, pointRadius: 0 },
-                { label: 'Draws', data: [], borderColor: '#888', backgroundColor: 'rgba(136,136,136,0.15)', fill: true, pointRadius: 0 },
-                { label: 'Black Wins', data: [], borderColor: '#e94560', backgroundColor: 'rgba(233,69,96,0.15)', fill: true, pointRadius: 0 },
-            ]}, options: { ...chartDefaults },
-        });
-        const ratesChart = new Chart(document.getElementById('chart-rates'), {
-            type: 'line',
-            data: { labels: [], datasets: [
-                { label: 'White Win %', data: [], borderColor: '#53a0ff', fill: false, pointRadius: 1 },
-                { label: 'Draw %', data: [], borderColor: '#888', fill: false, pointRadius: 1 },
-                { label: 'Black Win %', data: [], borderColor: '#e94560', fill: false, pointRadius: 1 },
-            ]}, options: { ...chartDefaults, scales: { ...chartDefaults.scales, y: { ...chartDefaults.scales.y, min: 0, max: 100 } } },
-        });
-        const mctsChart = new Chart(document.getElementById('chart-mcts'), {
-            type: 'line',
-            data: { labels: [], datasets: [{ label: 'Avg MCTS Depth', data: [], borderColor: '#b57bff', fill: false, pointRadius: 1 }] },
-            options: { ...chartDefaults },
-        });
+socket.on('eval_live_game_update',data=>applyEval(data));
+socket.on('replay_eval_game',data=>{
+  eReplayData=data;
+  eSt={moves:data.moves.slice(),fens:data.fens.slice(),mcts:(data.mcts_stats_per_move||[]).slice(),status:'finished',idx:-1};
+  eMovesUpTo=data.moves.length-1;
+  eboard&&eboard.position('start',false);
+  eSt.idx=-1; renderE(data);
+  if(ePaused)ePause();
+});
+socket.on('eval_game_history',hist=>renderRecent(hist,'erec','evalReplayGame'));
 
-        async function fetchJSON(url) { try { const r = await fetch(url); return r.ok ? await r.json() : null; } catch(e) { return null; } }
+// ════════════════════════════════════════════
+// REST polling (charts + tables)
+// ════════════════════════════════════════════
+async function fj(u){try{const r=await fetch(u);return r.ok?await r.json():null;}catch{return null;}}
 
-        function updateSummary(d) {
-            if (!d) return;
-            document.getElementById('sum-games').textContent = d.total_games||0;
-            document.getElementById('sum-white').textContent = d.white_wins||0;
-            document.getElementById('sum-black').textContent = d.black_wins||0;
-            document.getElementById('sum-draws').textContent = d.draws||0;
-            document.getElementById('sum-elo').textContent = Math.round(d.current_elo||1000);
-            document.getElementById('sum-pol-loss').textContent = d.latest_policy_loss ? d.latest_policy_loss.toFixed(4) : '-';
-            document.getElementById('sum-val-loss').textContent = d.latest_value_loss ? d.latest_value_loss.toFixed(4) : '-';
-            document.getElementById('sum-avg-len').textContent = d.avg_game_length ? d.avg_game_length.toFixed(1) : '-';
-            document.getElementById('stat-step').textContent = d.current_step||0;
-            document.getElementById('stat-games').textContent = d.total_games||0;
-            document.getElementById('stat-buffer').textContent = d.buffer_size||0;
-            document.getElementById('status-text').textContent = 'Connected \u2014 '+(d.total_games||0)+' games';
-            document.getElementById('status-dot').className = 'dot green';
-            var t = (d.white_wins||0)+(d.black_wins||0)+(d.draws||0);
-            if (t>0) {
-                var wp=(d.white_wins/t*100).toFixed(1), dp=(d.draws/t*100).toFixed(1), bp=(d.black_wins/t*100).toFixed(1);
-                document.getElementById('outcome-bar').innerHTML = '<div class="white" style="width:'+wp+'%"></div><div class="draw" style="width:'+dp+'%"></div><div class="black" style="width:'+bp+'%"></div>';
-                document.getElementById('outcome-white-pct').textContent=wp+'%';
-                document.getElementById('outcome-draw-pct').textContent=dp+'%';
-                document.getElementById('outcome-black-pct').textContent=bp+'%';
-            }
-        }
-        function updateChart(chart, data, keys, dsKeys) {
-            if (!data||!data.length) return;
-            chart.data.labels = data.map(function(d){return d.step||d.game_id||0;});
-            dsKeys.forEach(function(k,i){chart.data.datasets[i].data=data.map(function(d){return d[k];});});
-            chart.update('none');
-        }
+function updSum(d){
+  if(!d)return;
+  document.getElementById('sg').textContent=d.total_games||0;
+  document.getElementById('sw').textContent=d.white_wins||0;
+  document.getElementById('sb').textContent=d.black_wins||0;
+  document.getElementById('sd').textContent=d.draws||0;
+  document.getElementById('se').textContent=Math.round(d.current_elo||1000);
+  document.getElementById('sp').textContent=d.latest_policy_loss?d.latest_policy_loss.toFixed(4):'—';
+  document.getElementById('sv').textContent=d.latest_value_loss?d.latest_value_loss.toFixed(4):'—';
+  document.getElementById('sl').textContent=d.avg_game_length?d.avg_game_length.toFixed(1):'—';
+  document.getElementById('hstep').textContent=d.current_step||0;
+  document.getElementById('hgames').textContent=d.total_games||0;
+  document.getElementById('hbuf').textContent=d.buffer_size||0;
+  const t=(d.white_wins||0)+(d.black_wins||0)+(d.draws||0);
+  if(t>0){
+    const wp=(d.white_wins/t*100).toFixed(1),dp=(d.draws/t*100).toFixed(1),bp=(d.black_wins/t*100).toFixed(1);
+    document.getElementById('obar').innerHTML=`<div class="w" style="width:${wp}%"></div><div class="d" style="width:${dp}%"></div><div class="b" style="width:${bp}%"></div>`;
+    document.getElementById('ow').textContent=wp+'%';document.getElementById('od').textContent=dp+'%';document.getElementById('ob').textContent=bp+'%';
+  }
+}
 
-        async function refreshAll() {
-            var savedScroll = window.scrollY || window.pageYOffset;
-            // Temporarily prevent page scroll during DOM updates
-            document.documentElement.style.overflow = 'hidden';
-            var s=await Promise.all([
-                fetchJSON('/api/summary'), fetchJSON('/api/training_losses'),
-                fetchJSON('/api/game_outcomes'), fetchJSON('/api/elo_history'),
-                fetchJSON('/api/promotion_history'), fetchJSON('/api/network_stats'),
-                fetchJSON('/api/buffer_stats'), fetchJSON('/api/mcts_stats')
-            ]);
-            var summary=s[0], losses=s[1], games=s[2], elo=s[3], promos=s[4], netStats=s[5], bufStats=s[6], mctsData=s[7];
-            updateSummary(summary);
-            updateChart(lossChart,losses,null,['policy_loss','value_loss','total_loss']);
-            updateChart(gamelenChart,games,null,['length']);
-            updateChart(eloChart,elo,null,['elo']);
-            updateChart(confidenceChart,netStats,null,['avg_max_policy','avg_abs_value']);
-            updateChart(bufferChart,bufStats,null,['white_wins','draws','black_wins']);
-            updateChart(mctsChart,mctsData,null,['avg_depth']);
-            // Promo table
-            var pt=document.getElementById('promo-table-body');
-            if(!promos||!promos.length){pt.innerHTML='<tr><td colspan="6" style="color:#888;text-align:center">No data yet</td></tr>';}
-            else{pt.innerHTML=promos.slice(-20).reverse().map(function(d){
-                return '<tr><td>'+d.step+'</td><td style="color:'+(d.promoted?'#47d147':'#e94560')+'">'+(d.promoted?'YES':'NO')+'</td><td>'+(d.win_rate*100).toFixed(1)+'%</td><td>'+d.wins+'W/'+d.losses+'L/'+d.draws+'D</td><td>'+(d.old_elo?Math.round(d.old_elo):'-')+'</td><td>'+(d.new_elo?Math.round(d.new_elo):'-')+'</td></tr>';
-            }).join('');}
-            // Game table
-            var gt=document.getElementById('game-table-body');
-            if(!games||!games.length){gt.innerHTML='<tr><td colspan="6" style="color:#888;text-align:center">No games yet</td></tr>';}
-            else{gt.innerHTML=games.slice(-25).reverse().map(function(d){
-                var r=d.result===1?'1-0':d.result===-1?'0-1':'1/2-1/2';
-                var c=d.result===1?'#53a0ff':d.result===-1?'#e94560':'#888';
-                return '<tr><td>'+d.game_id+'</td><td style="color:'+c+'">'+r+'</td><td>'+d.length+'</td><td>'+d.termination+'</td><td>'+d.step+'</td><td>'+(d.avg_mcts_depth?d.avg_mcts_depth.toFixed(1):'-')+'</td></tr>';
-            }).join('');}
-            // Rates chart
-            if(games&&games.length){var rc=[];var ws=20;for(var i=0;i<games.length;i+=ws){var w2=games.slice(Math.max(0,i-ws),i+ws);var tot=w2.length||1;var ww=w2.filter(function(g){return g.result>0;}).length;var bw=w2.filter(function(g){return g.result<0;}).length;var dr=w2.filter(function(g){return g.result===0;}).length;rc.push({step:games[i].step,white_win_pct:ww/tot*100,draw_pct:dr/tot*100,black_win_pct:bw/tot*100});}updateChart(ratesChart,rc,null,['white_win_pct','draw_pct','black_win_pct']);}
-            if(bufStats&&bufStats.length){document.getElementById('stat-buffer').textContent=bufStats[bufStats.length-1].buffer_size||0;}
-            // Restore scroll position after all DOM updates
-            document.documentElement.style.overflow = '';
-            window.scrollTo(0, savedScroll);
-        }
-        refreshAll();
-        setInterval(refreshAll, 5000);
+async function pollAll(){
+  const [sum,loss,games,elo,promo,net,buf]=await Promise.all([
+    fj('/api/summary'),fj('/api/training_losses'),fj('/api/game_outcomes'),
+    fj('/api/elo_history'),fj('/api/promotion_history'),fj('/api/network_stats'),fj('/api/buffer_stats')]);
+  updSum(sum);
+  fill(CL,loss,['policy_loss','value_loss','total_loss']);
+  fill(CE,elo,['elo']);
+  fill(CN,games,['length']);
+  fill(CC,net,['avg_max_policy','avg_abs_value']);
+  fill(CB,buf,['white_wins','draws','black_wins']);
+  if(games&&games.length){
+    const ws=20,rc=[];
+    for(let i=0;i<games.length;i+=ws){
+      const sl=games.slice(Math.max(0,i-ws),i+ws),t=sl.length||1;
+      rc.push({step:games[i].step,
+               white_win_pct:sl.filter(g=>g.result>0).length/t*100,
+               draw_pct:sl.filter(g=>g.result===0).length/t*100,
+               black_win_pct:sl.filter(g=>g.result<0).length/t*100});
+    }
+    fill(CR,rc,['white_win_pct','draw_pct','black_win_pct']);
+  }
+  // Promo table
+  const pt=document.getElementById('ptbl');
+  if(!promo||!promo.length){pt.innerHTML='<tr><td colspan="6" style="text-align:center;color:#1f2937">No data</td></tr>';}
+  else pt.innerHTML=[...promo].reverse().slice(0,20).map(d=>`<tr><td>${d.step}</td><td style="color:${d.promoted?'#22c55e':'#ef4444'}">${d.promoted?'YES':'NO'}</td><td>${(d.win_rate*100).toFixed(1)}%</td><td>${d.wins}W/${d.losses}L/${d.draws}D</td><td>${d.old_elo?Math.round(d.old_elo):'—'}</td><td>${d.new_elo?Math.round(d.new_elo):'—'}</td></tr>`).join('');
+  // Games table
+  const gt=document.getElementById('gtbl');
+  if(!games||!games.length){gt.innerHTML='<tr><td colspan="6" style="text-align:center;color:#1f2937">No games</td></tr>';}
+  else gt.innerHTML=[...games].reverse().slice(0,30).map(d=>{
+    const r=d.result===1?'1-0':d.result===-1?'0-1':'½-½',c=d.result===1?'#3b82f6':d.result===-1?'#ef4444':'#475569';
+    return`<tr><td>${d.game_id}</td><td style="color:${c};font-weight:700">${r}</td><td>${d.length}</td><td>${d.termination}</td><td>${d.step}</td><td>${d.avg_mcts_depth?d.avg_mcts_depth.toFixed(1):'—'}</td></tr>`;
+  }).join('');
+  // Also poll tile states
+  socket.emit('request_worker_states');
+}
 
-        // ===== Eval Board =====
-        var evalBoard = null;
-        var evalChess = new Chess();
-        var evalState = { moves: [], fens: [], mctsStats: [], status: 'idle', currentViewIndex: -1 };
-        var evalIsPaused = false;
-        var evalPlayInterval = null;
-        var evalPlaySpeed = 500;
-        var evalLatestState = null;
-        var evalIsReplaying = false;
-        var evalReplayGameData = null;
-        var evalLastGameId = 0;
-        var evalMovesReplayedUpTo = -1;
-
-        function evalInitBoard() {
-            evalBoard = Chessboard('eval-chess-board', {
-                position: 'start',
-                showNotation: true,
-                pieceTheme: '/chess_pieces/{piece}.png'
-            });
-        }
-
-        function evalUpdateBoard() {
-            if (!evalBoard) return;
-            if (evalState.currentViewIndex >= 0 && evalState.currentViewIndex < evalState.fens.length) {
-                evalBoard.position(evalState.fens[evalState.currentViewIndex], false);
-            } else if (evalState.fens.length === 0) {
-                evalBoard.position('start', false);
-            }
-            evalUpdateMoveList();
-            evalUpdateMctsCandidates();
-            evalUpdateTurnInfo();
-        }
-
-        function evalUpdateMoveList() {
-            var ml = document.getElementById('eval-move-list');
-            var html = '';
-            for (var i = 0; i < evalState.moves.length; i += 2) {
-                var moveNum = Math.floor(i / 2) + 1;
-                var whiteMove = evalState.moves[i];
-                var blackMove = (i + 1 < evalState.moves.length) ? evalState.moves[i + 1] : null;
-                var wClass = 'move white-move';
-                var bClass = 'move black-move';
-                if (i === evalState.currentViewIndex) wClass += ' current';
-                if (i + 1 === evalState.currentViewIndex) bClass += ' current';
-                html += '<div class="move-pair"><span class="move-num">' + moveNum + '.</span>';
-                html += '<span class="' + wClass + '" onclick="evalOnMoveClick(' + i + ')">' + whiteMove + '</span>';
-                if (blackMove) {
-                    html += '<span class="' + bClass + '" onclick="evalOnMoveClick(' + (i + 1) + ')">' + blackMove + '</span>';
-                }
-                html += '</div>';
-            }
-            ml.innerHTML = html;
-            var currentEl = ml.querySelector('.move.current');
-            if (currentEl) {
-                var elTop = currentEl.offsetTop;
-                var elHeight = currentEl.offsetHeight;
-                var containerHeight = ml.clientHeight;
-                var newScrollTop = elTop - (containerHeight / 2) + (elHeight / 2);
-                if (newScrollTop < 0) newScrollTop = 0;
-                ml.scrollTop = newScrollTop;
-            }
-        }
-
-        function evalOnMoveClick(moveIndex) {
-            evalState.currentViewIndex = moveIndex;
-            evalUpdateBoard();
-        }
-
-        function evalUpdateMctsCandidates() {
-            var el = document.getElementById('eval-mcts-candidates');
-            var moveIdx = evalState.currentViewIndex;
-            if (moveIdx < 0 || !evalState.mctsStats || moveIdx >= evalState.mctsStats.length) {
-                el.innerHTML = '<div style="color:#555;text-align:center;">No MCTS data</div>';
-                return;
-            }
-            var ms = evalState.mctsStats[moveIdx];
-            if (!ms || !ms.candidates || ms.candidates.length === 0) {
-                el.innerHTML = '<div style="color:#555;text-align:center;">No MCTS data</div>';
-                return;
-            }
-            var cands = ms.candidates;
-            var selectedMove = ms.selected_move;
-            var html = '<table><thead><tr><th>Move</th><th>N</th><th>W</th><th>Q</th><th>P</th></tr></thead><tbody>';
-            for (var i = 0; i < cands.length; i++) {
-                var c = cands[i];
-                var cls = (c.move === selectedMove) ? ' class="selected"' : '';
-                html += '<tr' + cls + '><td>' + c.move + '</td><td>' + c.N + '</td><td>' + c.W.toFixed(2) + '</td><td>' + c.Q.toFixed(2) + '</td><td>' + c.P.toFixed(3) + '</td></tr>';
-            }
-            html += '</tbody></table>';
-            el.innerHTML = html;
-        }
-
-        function evalUpdateTurnInfo() {
-            var el = document.getElementById('eval-lg-turn-info');
-            var badge = document.getElementById('eval-lg-status-badge');
-            var gameEl = document.getElementById('eval-lg-game-id');
-            var moveEl = document.getElementById('eval-lg-move-num');
-            var stateForDisplay = (evalIsReplaying && evalReplayGameData) ? evalReplayGameData : evalLatestState;
-            gameEl.textContent = stateForDisplay ? ('#' + stateForDisplay.game_id) : '\u2014';
-            moveEl.textContent = evalState.currentViewIndex + 1;
-            badge.className = 'board-status-badge ' + evalState.status;
-            badge.textContent = evalState.status.toUpperCase();
-            if (evalState.status === 'playing') {
-                var turn = (evalState.currentViewIndex + 1) % 2 === 0 ? 'White' : 'Black';
-                if (evalState.currentViewIndex === -1) turn = 'White';
-                el.textContent = turn + ' to move';
-                el.style.color = turn === 'White' ? '#ccc' : '#53a0ff';
-            } else if (evalState.status === 'finished') {
-                el.textContent = 'Game over';
-                el.style.color = '#888';
-            } else {
-                el.textContent = 'Waiting for eval game...';
-                el.style.color = '#555';
-            }
-            // Match info
-            var matchInfoEl = document.getElementById('eval-match-info');
-            if (stateForDisplay && stateForDisplay.match_info) {
-                matchInfoEl.textContent = stateForDisplay.match_info;
-            } else {
-                matchInfoEl.textContent = '';
-            }
-        }
-
-        function evalUpdateResult() {
-            var el = document.getElementById('eval-lg-result');
-            var stateForResult = (evalIsReplaying && evalReplayGameData) ? evalReplayGameData : evalLatestState;
-            if (stateForResult && stateForResult.result) {
-                var resultText = stateForResult.result;
-                var termText = stateForResult.termination || '';
-                var cls = 'draw';
-                if (resultText === '1-0') cls = 'white';
-                else if (resultText === '0-1') cls = 'black';
-                el.innerHTML = '<span class="result ' + cls + '">' + resultText + '</span> &mdash; ' + termText;
-                el.style.display = 'block';
-            } else {
-                el.style.display = 'none';
-            }
-        }
-
-        // Eval Playback Controls
-        function evalTogglePause() {
-            evalIsPaused = !evalIsPaused;
-            var btn = document.getElementById('eval-btn-pause');
-            if (evalIsPaused) {
-                btn.textContent = '\u25b6 Play';
-                btn.classList.remove('active');
-                evalStopAutoPlay();
-            } else {
-                btn.textContent = '\u23f8 Pause';
-                btn.classList.add('active');
-                evalStartAutoPlay();
-            }
-        }
-        function evalStartAutoPlay() {
-            evalStopAutoPlay();
-            evalPlayInterval = setInterval(function() {
-                if (evalState.currentViewIndex < evalState.fens.length - 1) {
-                    evalState.currentViewIndex++;
-                    evalUpdateBoard();
-                } else { evalStopAutoPlay(); }
-            }, evalPlaySpeed);
-        }
-        function evalStopAutoPlay() { if (evalPlayInterval) { clearInterval(evalPlayInterval); evalPlayInterval = null; } }
-        function evalStepBack() {
-            if (evalState.currentViewIndex > 0) { evalState.currentViewIndex--; evalUpdateBoard(); }
-            else if (evalState.currentViewIndex === 0) { evalState.currentViewIndex = -1; evalBoard.position('start', true); evalUpdateMoveList(); evalUpdateMctsCandidates(); evalUpdateTurnInfo(); }
-        }
-        function evalStepForward() { if (evalState.currentViewIndex < evalState.fens.length - 1) { evalState.currentViewIndex++; evalUpdateBoard(); } }
-        function evalGoToStart() { evalState.currentViewIndex = -1; evalBoard.position('start', true); evalUpdateMoveList(); evalUpdateMctsCandidates(); evalUpdateTurnInfo(); }
-        function evalGoToEnd() { if (evalState.fens.length > 0) { evalState.currentViewIndex = evalState.fens.length - 1; evalUpdateBoard(); } }
-        function evalUpdateSpeed() {
-            evalPlaySpeed = parseInt(document.getElementById('eval-speed-slider').value);
-            document.getElementById('eval-speed-label').textContent = evalPlaySpeed + 'ms';
-            if (!evalIsPaused) evalStartAutoPlay();
-        }
-
-        // Eval Socket.IO handlers
-        socket.on('connect', function() {
-            socket.emit('request_eval_live_state');
-        });
-
-        socket.on('eval_live_game_update', function(data) {
-            if (!evalIsReplaying) { evalLatestState = data; }
-            if (evalIsReplaying) { return; }
-            if (data.game_id !== evalLastGameId) {
-                evalLastGameId = data.game_id;
-                evalState = { moves: [], fens: [], mctsStats: [], status: data.status, currentViewIndex: -1 };
-                evalMovesReplayedUpTo = -1;
-                document.getElementById('eval-lg-result').style.display = 'none';
-                evalBoard.position('start', false);
-            }
-            evalState.status = data.status;
-            while (evalMovesReplayedUpTo < data.moves.length - 1) {
-                evalMovesReplayedUpTo++;
-                evalState.moves.push(data.moves[evalMovesReplayedUpTo]);
-                evalState.fens.push(data.fens[evalMovesReplayedUpTo]);
-                if (data.mcts_stats_per_move && evalMovesReplayedUpTo < data.mcts_stats_per_move.length) {
-                    evalState.mctsStats.push(data.mcts_stats_per_move[evalMovesReplayedUpTo]);
-                }
-            }
-            if (!evalIsPaused) {
-                evalState.currentViewIndex = evalState.fens.length - 1;
-                evalUpdateBoard();
-            }
-            evalUpdateResult();
-            if (!window._evalGameHistoryPending) {
-                window._evalGameHistoryPending = true;
-                setTimeout(function() {
-                    window._evalGameHistoryPending = false;
-                    evalRefreshGameHistory();
-                }, 2000);
-            }
-        });
-
-        socket.on('eval_game_history', function(history) {
-            evalUpdateGameHistoryList(history);
-        });
-
-        socket.on('replay_eval_game', function(data) {
-            evalReplayGameData = data;
-            evalLastGameId = data.game_id;
-            evalState = { moves: [], fens: [], mctsStats: [], status: 'finished', currentViewIndex: -1 };
-            evalMovesReplayedUpTo = data.moves.length - 1;
-            evalState.moves = data.moves.slice();
-            evalState.fens = data.fens.slice();
-            if (data.mcts_stats_per_move) { evalState.mctsStats = data.mcts_stats_per_move.slice(); }
-            if (!evalIsReplaying) { evalLatestState = data; }
-            evalBoard.position('start', false);
-            evalState.currentViewIndex = -1;
-            evalUpdateBoard();
-            document.getElementById('eval-lg-result').style.display = 'none';
-            if (evalIsPaused) evalTogglePause();
-        });
-
-        function evalRefreshGameHistory() { socket.emit('request_eval_game_history'); }
-
-        function evalUpdateGameHistoryList(history) {
-            var el = document.getElementById('eval-game-history-list');
-            if (!history || history.length === 0) {
-                el.innerHTML = '<div style="color:#555;text-align:center">No completed eval games yet</div>';
-                return;
-            }
-            var html = '';
-            history.forEach(function(g) {
-                var r = g.result || '*';
-                var cls = 'draw';
-                if (r === '1-0') cls = 'white';
-                else if (r === '0-1') cls = 'black';
-                var type = g.game_type || 'eval';
-                var typeCls = (type === 'gating') ? 'gating' : 'reference';
-                var info = g.match_info || type;
-                html += '<div class="game-history-item eval-game-history-item" onclick="evalReplayGame(' + g.game_id + ')">';
-                html += '<span><span class="type-tag ' + typeCls + '">' + type.toUpperCase() + '</span>Game #' + g.game_id + ' <span style="color:#555">(' + g.num_moves + ' moves) ' + info + '</span></span>';
-                html += '<span class="result-tag ' + cls + '">' + r + '</span>';
-                html += '</div>';
-            });
-            el.innerHTML = html;
-        }
-
-        function evalReplayGame(gameId) {
-            evalIsReplaying = true;
-            socket.emit('request_replay_eval_game', { game_id: gameId });
-            document.getElementById('eval-btn-live').style.display = '';
-        }
-
-        function evalGoLive() {
-            evalIsReplaying = false;
-            evalReplayGameData = null;
-            document.getElementById('eval-btn-live').style.display = 'none';
-            socket.emit('request_eval_live_state');
-        }
-
-        // Init eval board on page load
-        $(document).ready(function() {
-            initBoard();
-            evalInitBoard();
-        });
-    </script>
+// ════════════════════════════════════════════
+// Init
+// ════════════════════════════════════════════
+$(document).ready(async()=>{
+  initMBoard(); initEBoard();
+  const wc=await fj('/api/num_workers');
+  if(wc&&wc.num_workers>0)buildGrid(wc.num_workers);
+  pollAll();
+  setInterval(pollAll,5000);
+});
+</script>
 </body>
 </html>
