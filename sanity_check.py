@@ -22,7 +22,7 @@ def main():
     from training import train_one_step, create_optimizer
     from evaluation import alpha_beta_best_move
     from stats import StatsLogger
-    from encoding import board_to_tensor, get_legal_move_mask
+    from encoding import board_to_tensor, get_legal_move_mask, NUM_PLANES
     import torch
     import chess
     import numpy as np
@@ -66,8 +66,8 @@ def main():
     print("\n--- 1. Testing Board Encoding ---")
     board = chess.Board()
     tensor = board_to_tensor(board)
-    assert tensor.shape == (18, 8, 8), f"Wrong shape: {tensor.shape}"
-    print(f"  Board tensor shape: {tensor.shape} (expected: (18, 8, 8)) OK")
+    assert tensor.shape == (NUM_PLANES, 8, 8), f"Wrong shape: {tensor.shape}"
+    print(f"  Board tensor shape: {tensor.shape} (expected: ({NUM_PLANES}, 8, 8)) OK")
 
     mask = get_legal_move_mask(board)
     assert mask.sum() == 20, f"Wrong legal moves: {mask.sum()} (expected 20)"
@@ -118,7 +118,7 @@ def main():
     assert len(buffer) == len(game_data), f"Buffer size mismatch: {len(buffer)} != {len(game_data)}"
     states, policies, values = buffer.sample_batch(8)
     assert states.shape[0] > 0, "Empty batch"
-    assert states.shape[1:] == (18, 8, 8), f"State shape wrong: {states.shape}"
+    assert states.shape[1:] == (NUM_PLANES, 8, 8), f"State shape wrong: {states.shape}"
     assert policies.shape[1] == 4672, f"Policy shape wrong: {policies.shape}"
     print(f"  Buffer size: {len(buffer)}")
     print(f"  Sampled batch: states={states.shape}, policies={policies.shape}, values={values.shape}")

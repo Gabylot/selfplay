@@ -364,7 +364,12 @@ def test_play_one_game_best_move_none():
         
         def select_move_with_temperature(self, root, temperature):
             return np.zeros(NUM_ACTIONS, dtype=np.float32), None
-    
+        
+        def get_root_child_stats(self, root):
+            return []
+        
+        def recycle_tree(self, root, move):
+            return None
     mock_net = MockNetwork()
     game_data, game_info = play_one_game(
         AllNoneMCTS(),

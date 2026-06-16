@@ -38,7 +38,7 @@ class AlphaZeroNet(nn.Module):
     """Dual-head ResNet for chess position evaluation.
     
     Architecture:
-        Input conv (18 -> num_filters)
+        Input conv (20 -> num_filters)
         N residual blocks (num_filters -> num_filters)
         Policy head: Conv 1x1 -> FC -> 4672 logits
         Value head: Conv 1x1 -> FC -> 1 (tanh)
@@ -95,7 +95,7 @@ class AlphaZeroNet(nn.Module):
         """Forward pass.
         
         Args:
-            x: Input tensor of shape (batch, 18, 8, 8)
+            x: Input tensor of shape (batch, 20, 8, 8)
         
         Returns:
             policy_logits: (batch, 4672) raw logits for move probabilities
@@ -125,7 +125,7 @@ class AlphaZeroNet(nn.Module):
         """Predict policy and value for a single board state.
         
         Args:
-            state: (18, 8, 8) numpy array
+            state: (20, 8, 8) numpy array
         
         Returns:
             policy: (4672,) numpy array of probabilities
@@ -145,7 +145,7 @@ class AlphaZeroNet(nn.Module):
         """Predict policy and value for a batch of board states.
         
         Args:
-            states: (batch, 18, 8, 8) numpy array
+            states: (batch, 20, 8, 8) numpy array
         
         Returns:
             policies: (batch, 4672) numpy array of probabilities

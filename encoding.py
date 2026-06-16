@@ -1,11 +1,13 @@
 """Board state and move encoding for the AlphaZero chess engine.
 
-Board Representation (8x8x18):
+Board Representation (8x8x20):
     Planes 0-5:   White P, N, B, R, Q, K
     Planes 6-11:  Black P, N, B, R, Q, K
     Plane 12:     Side to move (1.0 if white)
     Planes 13-16: Castling rights (WK, WQ, BK, BQ)
     Plane 17:     En passant square
+    Plane 18:     Repetition count >= 2 (position seen before)
+    Plane 19:     Repetition count >= 3 (on verge of 3-fold repetition)
 
 Move Encoding (8x8x73 = 4672 action space):
     Planes 0-55:  Queen-like moves (8 directions × 7 distances)
@@ -33,7 +35,7 @@ PIECE_PLANE = {
     (chess.KING, chess.BLACK): 11,
 }
 
-NUM_PLANES = 18
+NUM_PLANES = 20
 NUM_ACTIONS = 8 * 8 * 73  # 4672
 
 # Queen move directions: (dr, dc)
@@ -85,13 +87,15 @@ def _underpromotion_plane(piece_type, dir_idx):
 
 
 def board_to_tensor(board: chess.Board) -> np.ndarray:
-    """Encode a chess.Board as a (18, 8, 8) float32 numpy array.
+    """Encode a chess.Board as a (20, 8, 8) float32 numpy array.
     
     Planes 0-5:   White P, N, B, R, Q, K
     Planes 6-11:  Black P, N, B, R, Q, K
     Plane 12:     Side to move (1.0 if white to move)
     Planes 13-16: Castling rights (WK, WQ, BK, BQ)
     Plane 17:     En passant square
+    Plane 18:     Repetition count >= 2 (position seen before)
+    Plane 19:     Repetition count >= 3 (on verge of 3-fold repetition)
     """
     tensor = np.zeros((NUM_PLANES, 8, 8), dtype=np.float32)
     
@@ -125,11 +129,17 @@ def board_to_tensor(board: chess.Board) -> np.ndarray:
         file = chess.square_file(ep)
         tensor[17, rank, file] = 1.0
     
+    # Repetition count planes
+    if board.is_repetition(2):
+        tensor[18, :, :] = 1.0
+    if board.is_repetition(3):
+        tensor[19, :, :] = 1.0
+    
     return tensor
 
 
 def board_to_tensor_batch(board: chess.Board) -> np.ndarray:
-    """Encode board as batch tensor (1, 18, 8, 8)."""
+    """Encode board as batch tensor (1, 20, 8, 8)."""
     return board_to_tensor(board)[np.newaxis, ...]
 
 

@@ -149,7 +149,7 @@ def play_one_game(mcts_engine, max_game_length=150, adjudicate_material=True,
     move_count=0; termination="unknown"; outcome=0.0
     root=None  # Tree recycling: carry the subtree across moves
 
-    while not board.is_game_over() and move_count<max_game_length:
+    while not board.is_game_over(claim_draw=True) and move_count<max_game_length:
         # Reuse the recycled subtree, or create a fresh root
         if root is None:
             root=mcts_engine.get_root(board)
@@ -178,7 +178,7 @@ def play_one_game(mcts_engine, max_game_length=150, adjudicate_material=True,
 
     material_diff=material_point_difference(board,piece_values)
 
-    if board.is_game_over():
+    if board.is_game_over(claim_draw=True):
         r=board.result()
         if r=="1-0":   outcome,termination=1.0,("checkmate" if board.is_checkmate() else "other")
         elif r=="0-1": outcome,termination=-1.0,("checkmate" if board.is_checkmate() else "other")

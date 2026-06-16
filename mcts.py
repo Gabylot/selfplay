@@ -80,7 +80,7 @@ class MCTS:
     
     def get_root(self, board: chess.Board) -> MCTSNode:
         """Create a root node for the given board."""
-        return MCTSNode(board.copy(stack=True))
+        return MCTSNode(board.copy())
     
     def recycle_tree(self, root: MCTSNode, move: chess.Move) -> Optional[MCTSNode]:
         """Promote the child of `root` that corresponds to `move` to a new root.
@@ -90,9 +90,9 @@ class MCTS:
         its subtree (expanded children, Q values, visit counts) for the
         next search.
         
-        The promoted node's parent pointer is cleared and its own stats
-        (N, W, Q) are reset so that the new root starts with clean PUCT
-        computation while its children retain their accumulated knowledge.
+        The promoted node's parent pointer is cleared. Its N/W/Q stats are
+        kept intact so the next search benefits from the accumulated visit
+        information for correct PUCT exploration scaling.
         
         Args:
             root: The current root node (already searched)
@@ -107,11 +107,9 @@ class MCTS:
                 # Detach from parent
                 child.parent = None
                 
-                # Reset root-level stats so PUCT exploration is not
-                # distorted by accumulated visits from the old tree
-                child.N = 0
-                child.W = 0.0
-                child.Q = 0.0
+                # Clear visit_count (backward-compat duplicate of N).
+                # N/W/Q are intentionally kept so the next search
+                # benefits from accumulated visit information.
                 child.visit_count = 0
                 
                 # Children keep their Q/N values — they give the next
@@ -287,7 +285,7 @@ class MCTS:
         expandable_nodes = []
         
         for i, node in enumerate(leaf_nodes):
-            if node.board.is_game_over():
+            if node.board.is_game_over(claim_draw=True):
                 terminal_values[i] = self._get_terminal_value(node)
             elif not node.is_expanded:
                 expandable_indices.append(i)
@@ -306,7 +304,7 @@ class MCTS:
                 states_list.append(state)
             
             # Stack into batch
-            states_batch = np.stack(states_list, axis=0)  # (batch, 18, 8, 8)
+            states_batch = np.stack(states_list, axis=0)  # (batch, 20, 8, 8)
             
             # Single batched network call
             policies_batch, values_batch = self.network.predict_batch(states_batch)
@@ -333,8 +331,8 @@ class MCTS:
         If the node is a terminal position, returns the game result
         without querying the network.
         """
-        # Check for terminal position
-        if node.board.is_game_over():
+        # Check for terminal position (claim_draw=True detects 3-fold repetition)
+        if node.board.is_game_over(claim_draw=True):
             result = node.board.result()
             if result == "1-0":
                 return 1.0
@@ -392,8 +390,9 @@ class MCTS:
             
             prior = float(legal_policy[action_idx])
             
-            # Use stack=True to preserve move history for repetition detection
-            child_board = node.board.copy(stack=True)
+            # Use stack=True (default) to preserve move history for
+            # threefold repetition detection in child nodes
+            child_board = node.board.copy()
             child_board.push(move)
             
             child = MCTSNode(child_board, parent=node, move=move, prior=prior)
