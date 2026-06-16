@@ -2,20 +2,20 @@
 
 # --- Network Architecture ---
 network:
-  num_residual_blocks: 4
-  num_filters: 64
+  num_residual_blocks: 6
+  num_filters: 128
   num_policy_channels: 32
-  num_value_channels: 16
-  value_fc_size: 128
+  num_value_channels: 32
+  value_fc_size: 256
 
 # --- MCTS ---
 mcts:
-  num_simulations: 400       # Per move (tunable: 50-800)
-  c_puct: 3.0                # PUCT exploration constant
+  num_simulations: 256       # Per move (tunable: 50-800)
+  c_puct: 2.5                # PUCT exploration constant
   dirichlet_alpha: 0.3        # Dirichlet noise alpha
-  dirichlet_epsilon: 0.4     # Weight of noise vs prior
-  batch_size: 8               # Batch size for tree-parallel MCTS (1 = sequential, no virtual loss)
-  c_virtual_loss: 0.5         # Virtual loss penalty for batch MCTS
+  dirichlet_epsilon: 0.35     # Weight of noise vs prior
+  batch_size: 64               # Batch size for tree-parallel MCTS (1 = sequential, no virtual loss)
+  c_virtual_loss: 0.1         # Virtual loss penalty for batch MCTS
 
 # --- Self-Play ---
 selfplay:
@@ -45,9 +45,9 @@ training:
   learning_rate: 0.001
   momentum: 0.9
   weight_decay: 1e-4
-  num_batches_per_step: 10    # Training steps between self-play batches
+  num_batches_per_step: 8    # Training steps between self-play batches
   checkpoint_interval: 50     # Save checkpoint every N training steps
-  training_steps_per_iteration: 5  # Training steps per outer loop iteration
+  training_steps_per_iteration: 3  # Training steps per outer loop iteration
 
 # --- Evaluation ---
 evaluation:
@@ -80,6 +80,13 @@ gui:
   host: "127.0.0.1"
   port: 5000
   refresh_interval: 1.0       # Seconds between live updates
+
+# --- Inference ---
+inference:
+  use_gpu: true              # true = centralized GPU inference server, false = CPU per-worker
+  max_batch: 64               # Max samples per GPU forward pass
+  max_wait_ms: 3.0            # Max ms to wait before firing a partial batch
+  prewarm_batch_sizes: [1, 8, 16, 32, 64]  # Batch sizes to pre-warm
 
 # --- Main ---
 main:

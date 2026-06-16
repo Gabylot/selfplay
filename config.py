@@ -81,6 +81,12 @@ def load_config(path: Optional[str] = None) -> dict:
             "port": 5000,
             "refresh_interval": 1.0,
         },
+        "inference": {
+            "use_gpu": False,
+            "max_batch": 64,
+            "max_wait_ms": 3.0,
+            "prewarm_batch_sizes": [1, 8, 16, 32, 64, 128],
+        },
         "main": {
             "run_name": "default",
             "output_dir": "output",

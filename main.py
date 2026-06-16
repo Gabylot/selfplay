@@ -46,6 +46,10 @@ def run_training(config, gui_enabled=False, num_workers=None):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"[INFO] Device: {device}")
 
+    use_gpu = getattr(config, 'inference', None) and getattr(config.inference, 'use_gpu', False)
+    if use_gpu:
+        print(f"[INFO] Inference: GPU (DirectML centralized server)")
+
     if num_workers is None:
         num_workers = getattr(config.selfplay, 'num_workers', 8)
     print(f"[INFO] Workers: {num_workers}")

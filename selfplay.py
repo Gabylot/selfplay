@@ -20,6 +20,7 @@ import os
 from encoding import board_to_tensor
 from network import AlphaZeroNet
 from mcts import MCTS
+from inference_client import InferenceClient
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -251,7 +252,8 @@ def self_play_game(network, config, on_move=None):
 # Worker process
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _worker_process(worker_id, task_queue, result_queue, config_dict, shutdown_event):
+def _worker_process(worker_id, task_queue, result_queue, config_dict, shutdown_event,
+                    request_queue=None, response_queue=None):
     import torch, sys, os
     from config import Config
     from network import AlphaZeroNet
@@ -260,6 +262,13 @@ def _worker_process(worker_id, task_queue, result_queue, config_dict, shutdown_e
     config=Config(config_dict)
     pv=config.selfplay.piece_values
     piece_values=dict(pv) if hasattr(pv,'items') else pv
+
+    # GPU inference: create InferenceClient as drop-in for the network object
+    use_gpu = (getattr(config, 'inference', None)
+               and getattr(config.inference, 'use_gpu', False))
+    inference_client = None
+    if use_gpu and request_queue is not None and response_queue is not None:
+        inference_client = InferenceClient(worker_id, request_queue, response_queue)
 
     def make_net():
         n=AlphaZeroNet(
@@ -300,8 +309,12 @@ def _worker_process(worker_id, task_queue, result_queue, config_dict, shutdown_e
 
         # ── Self-play ──
         if t=='selfplay':
-            load(net_a, task['weights'])
-            eng=mcts(net_a, noise=True)
+            if inference_client is not None:
+                # GPU inference: use centralized server (weights managed by server)
+                eng=mcts(inference_client, noise=True)
+            else:
+                load(net_a, task['weights'])
+                eng=mcts(net_a, noise=True)
             worker_game_counter += 1
             result_queue.put({
                 'worker_id':worker_id,'type':'live_start',
@@ -436,14 +449,54 @@ class ParallelSelfPlay:
         self._workers=[]; self._task_qs=[]
         self._result_q=mp.Queue(); self._shutdown=mp.Event()
 
+        # GPU inference server infrastructure
+        self._use_gpu = (getattr(config, 'inference', None)
+                         and getattr(config.inference, 'use_gpu', False))
+        self._gpu_server_process = None
+        if self._use_gpu:
+            self._request_q = mp.Queue()
+            self._weight_q = mp.Queue()
+            self._response_qs = {}  # worker_id -> mp.Queue
+            self._gpu_ready = mp.Event()
+            self._gpu_shutdown = mp.Event()
+
     def start(self):
+        if self._use_gpu:
+            # Create response queues for all workers first (server needs them)
+            for i in range(self.num_workers):
+                self._response_qs[i] = mp.Queue(maxsize=256)
+            # Start GPU server and wait for shader pre-warming
+            self._start_gpu_server()
+
         cd=self.config.to_dict()
         for i in range(self.num_workers):
             tq=mp.Queue(maxsize=4)
             self._task_qs.append(tq)
+            kwargs = {}
+            if self._use_gpu:
+                kwargs['request_queue'] = self._request_q
+                kwargs['response_queue'] = self._response_qs[i]
             p=mp.Process(target=_worker_process,
-                         args=(i,tq,self._result_q,cd,self._shutdown),daemon=True)
+                         args=(i,tq,self._result_q,cd,self._shutdown),
+                         kwargs=kwargs, daemon=True)
             p.start(); self._workers.append(p)
+
+    def _start_gpu_server(self):
+        """Start the GPU inference server process and wait for it to be ready."""
+        from gpu_server import GPUInferenceServer
+        server = GPUInferenceServer(
+            config=self.config,
+            request_queue=self._request_q,
+            response_queues=self._response_qs,
+            weight_queue=self._weight_q,
+            ready_event=self._gpu_ready,
+            shutdown_event=self._gpu_shutdown,
+        )
+        self._gpu_server_process = mp.Process(target=server.run, daemon=True)
+        self._gpu_server_process.start()
+        print("[INFO] Waiting for GPU server to warm up shaders...")
+        self._gpu_ready.wait()
+        print("[INFO] GPU server ready")
 
     def _serialize_weights(self, network):
         import torch
@@ -452,11 +505,22 @@ class ParallelSelfPlay:
     def push_selfplay(self, network):
         """Push a self-play task to all workers (replacing any stale task)."""
         wb=self._serialize_weights(network)
+
+        if self._use_gpu:
+            # Send weights to GPU server (drain old ones first)
+            while not self._weight_q.empty():
+                try: self._weight_q.get_nowait()
+                except: pass
+            self._weight_q.put(wb)
+
         for tq in self._task_qs:
             while not tq.empty():
                 try: tq.get_nowait()
                 except: pass
-            try: tq.put_nowait({'type':'selfplay','weights':wb})
+            task = {'type': 'selfplay'}
+            if not self._use_gpu:
+                task['weights'] = wb
+            try: tq.put_nowait(task)
             except queue.Full: pass
 
     # Alias
@@ -496,3 +560,13 @@ class ParallelSelfPlay:
             p.join(timeout=10)
             if p.is_alive(): p.kill()
         self._workers.clear(); self._task_qs.clear()
+
+        # Shut down GPU inference server
+        if self._use_gpu and self._gpu_server_process is not None:
+            self._gpu_shutdown.set()
+            try: self._request_q.put_nowait(None)
+            except: pass
+            self._gpu_server_process.join(timeout=10)
+            if self._gpu_server_process.is_alive():
+                self._gpu_server_process.kill()
+            self._gpu_server_process = None
