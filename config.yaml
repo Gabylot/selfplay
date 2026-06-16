@@ -45,9 +45,9 @@ training:
   learning_rate: 0.001
   momentum: 0.9
   weight_decay: 1e-4
-  num_batches_per_step: 8    # Training steps between self-play batches
+  num_batches_per_step: 10    # Training steps between self-play batches
   checkpoint_interval: 50     # Save checkpoint every N training steps
-  training_steps_per_iteration: 3  # Training steps per outer loop iteration
+  training_steps_per_iteration: 5  # Training steps per outer loop iteration
 
 # --- Evaluation ---
 evaluation:
@@ -85,7 +85,7 @@ gui:
 inference:
   use_gpu: true              # true = centralized GPU inference server, false = CPU per-worker
   max_batch: 64               # Max samples per GPU forward pass
-  max_wait_ms: 3.0            # Max ms to wait before firing a partial batch
+  max_wait_ms: 2.0            # Max ms to wait before firing a partial batch
   prewarm_batch_sizes: [1, 8, 16, 32, 64]  # Batch sizes to pre-warm
 
 # --- Main ---

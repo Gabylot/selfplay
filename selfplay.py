@@ -436,6 +436,21 @@ def _worker_process(worker_id, task_queue, result_queue, config_dict, shutdown_e
                 'fens':fens,'moves':ucis,'mcts_stats':mdata,
             })
 
+        # ── Profile ──
+        elif t=='profile':
+            num_profile_games = task.get('num_games', 3)
+            if inference_client is not None:
+                eng=mcts(inference_client, noise=True)
+            else:
+                load(net_a, task['weights'])
+                eng=mcts(net_a, noise=True)
+            from worker_cpu_profiler import profile_in_worker
+            summary = profile_in_worker(eng, config, piece_values, num_profile_games)
+            result_queue.put({
+                'worker_id':worker_id,'type':'profile_done',
+                'summary':summary,
+            })
+
     result_queue.put({'worker_id':worker_id,'done':True})
 
 
@@ -545,6 +560,26 @@ class ParallelSelfPlay:
             try: out.append(self._result_q.get_nowait())
             except queue.Empty: break
         return out
+
+    def dispatch_profile(self, network, num_games=3, worker_id=None):
+        """Send a profile task to a specific worker (or round-robin to all).
+
+        The worker will run num_games profiled games and print the timing
+        breakdown to its stdout.  Receives a 'profile_done' result when finished.
+        """
+        wb = self._serialize_weights(network)
+        task = {'type': 'profile', 'weights': wb, 'num_games': num_games}
+
+        if worker_id is not None:
+            indices = [worker_id]
+        else:
+            indices = range(self.num_workers)
+
+        for wid in indices:
+            try:
+                self._task_qs[wid].put_nowait(task)
+            except (queue.Full, IndexError):
+                pass
 
     def drain(self):
         while True:
