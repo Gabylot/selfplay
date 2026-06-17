@@ -41,6 +41,38 @@ def signal_handler(sig, frame):
 # Training loop
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _dispatch_live_message(psp, worker_live_games, result):
+    """Handle a single live_start / live_move / live_end result immediately
+    so the GUI stays responsive.  Returns True if a live message was
+    dispatched, False otherwise (e.g. for a full selfplay result)."""
+    if result is None or result.get('done'):
+        return False
+
+    rtype = result.get('type')
+    if rtype == 'live_start':
+        wid = result['worker_id']
+        wlg = worker_live_games[wid]
+        wlg.start_game(0, 0,  # game_id/step set later by caller
+                       game_type=result.get('game_type', 'selfplay'),
+                       match_info=result.get('match_info'))
+        return True
+
+    if rtype == 'live_move':
+        wid = result['worker_id']
+        wlg = worker_live_games[wid]
+        wlg.update(result['fen'], result['move'], result['move_number'],
+                   mcts_stats=result.get('mcts_stats'))
+        return True
+
+    if rtype == 'live_end':
+        wid = result['worker_id']
+        wlg = worker_live_games[wid]
+        wlg.game_over(result['result'], result.get('termination', ''))
+        return True
+
+    return False
+
+
 def run_training(config, gui_enabled=False, num_workers=None):
     global _shutdown
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -143,33 +175,12 @@ def run_training(config, gui_enabled=False, num_workers=None):
             if result.get('done'):
                 continue
 
-            rtype = result.get('type')
-
             # ── Live incremental messages (real-time GUI updates) ──
-            if rtype == 'live_start':
-                wid = result['worker_id']
-                wlg = worker_live_games[wid]
-                worker_live_game_ids[wid] += 1
-                wlg.start_game(worker_live_game_ids[wid], step,
-                               game_type=result.get('game_type', 'selfplay'),
-                               match_info=result.get('match_info'))
-                continue
-
-            if rtype == 'live_move':
-                wid = result['worker_id']
-                wlg = worker_live_games[wid]
-                wlg.update(result['fen'], result['move'], result['move_number'],
-                           mcts_stats=result.get('mcts_stats'))
-                continue
-
-            if rtype == 'live_end':
-                wid = result['worker_id']
-                wlg = worker_live_games[wid]
-                wlg.game_over(result['result'], result.get('termination', ''))
+            if _dispatch_live_message(psp, worker_live_games, result):
                 continue
 
             # Only process self-play results in the main loop
-            if rtype != 'selfplay':
+            if result.get('type') != 'selfplay':
                 continue
 
             wid = result['worker_id']
@@ -219,8 +230,25 @@ def run_training(config, gui_enabled=False, num_workers=None):
             if (games_since_train >= train_interval
                     and len(buffer) >= int(config.training.batch_size)):
                 games_since_train = 0
+
+                # Drain live GUI messages BEFORE and BETWEEN training batches
+                # so the browser stays in sync instead of showing a burst later.
+                _pending_selfplay = []
+                for r in psp.collect_available():
+                    if _dispatch_live_message(psp, worker_live_games, r):
+                        pass
+                    elif r.get('type') == 'selfplay' and not r.get('done'):
+                        _pending_selfplay.append(r)
+
                 for _ in range(config.training.num_batches_per_step):
                     if _shutdown: break
+                    # Drain any new live messages between batches
+                    for r in psp.collect_available():
+                        if _dispatch_live_message(psp, worker_live_games, r):
+                            pass
+                        elif r.get('type') == 'selfplay' and not r.get('done'):
+                            _pending_selfplay.append(r)
+
                     ld = train_one_step(network, optimizer, buffer,
                                         int(config.training.batch_size), device)
                     step += 1
@@ -229,6 +257,37 @@ def run_training(config, gui_enabled=False, num_workers=None):
                                             value_loss=ld['value_loss'],
                                             total_loss=ld['total_loss'],
                                             learning_rate=config.training.learning_rate)
+
+                # ── Handle self-play results that arrived while training ──
+                for pr in _pending_selfplay:
+                    pw   = pr['worker_id']
+                    praw = pr['game_data']
+                    pgi  = pr['game_info']
+                    pgd  = [(np.array(s,dtype=np.float32),
+                              np.array(p,dtype=np.float32),
+                              float(v)) for s,p,v in praw]
+                    buffer.add_game(pgd)
+                    game_id          += 1
+                    games_since_train += 1
+                    games_since_eval  += 1
+
+                    stats.log_game(game_id=game_id, step=step,
+                                   result=pgi['result'], result_str=pgi['result_str'],
+                                   length=pgi['length'], termination=pgi['termination'],
+                                   avg_mcts_depth=pgi['avg_mcts_depth'],
+                                   num_positions=pgi['num_positions'],
+                                   material_diff=pgi.get('material_diff', 0))
+                    stats.log_mcts_stats(game_id=game_id, step=step,
+                                         avg_tree_depth=pgi['avg_mcts_depth'],
+                                         avg_sims_per_move=config.mcts.num_simulations)
+
+                    print(f"  [W{pw}] Game {game_id}: {pgi['termination']:18s} | "
+                          f"{pgi['result_str']} | {pgi['length']} moves | buf={len(buffer)}")
+
+                    import torch as _torch2, io as _io2
+                    _b = _io2.BytesIO(); _torch2.save(network.state_dict(), _b); _wb2 = _b.getvalue()
+                    try: psp._task_qs[pw].put_nowait({'type':'selfplay','weights':_wb2})
+                    except: pass
 
                 # Buffer / confidence stats
                 od = buffer.get_outcome_distribution()

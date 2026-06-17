@@ -7,6 +7,12 @@ Covers:
 - Threefold repetition (with claim_draw=True)
 - Insufficient material
 - Verifies Q values are correct from the side-to-move perspective
+
+Value convention (AlphaZero / training standard):
+  The Q value at a node is the expected game outcome from the perspective of the
+  player who is about to move at that node. A White win ("1-0") is +1.0 when
+  White is to move, and -1.0 when Black is to move. The backpropagation flips
+  sign at each level, so a child's Q has the opposite sign of its parent's.
 """
 
 import sys
@@ -43,14 +49,13 @@ def _run_mcts_and_check_child_q(board, expected_child_move_uci, expected_q,
     """Run MCTS on `board`, find the child for `expected_child_move_uci`,
     and assert its Q value equals `expected_q` (within tolerance).
 
-    The Q value is from the perspective of the player who just moved
-    to reach that child position, which is the OPPOSITE of the root's
-    side to move.
+    The Q value is from the perspective of the player who is about to move
+    at the child node (i.e. the opposite of the root's side to move).
 
     Args:
         board: Position to search from
         expected_child_move_uci: UCI string of the move to check
-        expected_q: Expected Q value of the child (from child's player perspective)
+        expected_q: Expected Q value of the child (from child's perspective)
         description: Human-readable description
         num_sims: Number of MCTS simulations
     """
@@ -84,14 +89,12 @@ def _run_mcts_and_check_child_q(board, expected_child_move_uci, expected_q,
 def test_white_checkmate():
     """Scholar's mate finish: Qh5xf7# (white delivers checkmate).
 
-    Position: 4k2r/pppb1ppp/2n5/4P3/2B2q2/2N2N2/PPPP1PPP/R1BQ1RK1 w kq - 0 1
-    Actually let's use a simpler back-rank mate:
-
     Position: 6k1/5ppp/8/8/8/8/8/R3K3 w Qq - 0 1
-    Ra8# is checkmate.
+    Ra8# is checkmate.  After the move, Black is to move in a lost position,
+    so from Black's perspective the value is -1.0.
     """
     board = chess.Board("6k1/5ppp/8/8/8/8/8/R3K3 w Qq - 0 1")
-    _run_mcts_and_check_child_q(board, "a1a8", 1.0, "White back-rank checkmate")
+    _run_mcts_and_check_child_q(board, "a1a8", -1.0, "White back-rank checkmate")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -103,6 +106,7 @@ def test_black_checkmate():
 
     Position: 4K3/8/4k3/8/8/8/8/r7 b - - 0 1
     Ra8# is checkmate (rook checks along 8th rank, Ke6 covers d7/e7/f7).
+    After the move, White is to move in a lost position → value = -1.0 from White's perspective.
     """
     board = chess.Board("4K3/8/4k3/8/8/8/8/r7 b - - 0 1")
     _run_mcts_and_check_child_q(board, "a1a8", -1.0, "Black checkmate Ra8#")
@@ -115,24 +119,12 @@ def test_black_checkmate():
 def test_stalemate():
     """Stalemate: king has no legal moves and is not in check.
 
-    Position: 4k3/8/8/8/8/8/1q6/K7 w - - 0 1
-    White king on a1, black queen on b2. White to move has no legal moves
-    (Ka2 blocked by queen, Kb1 blocked by queen, Kb2 is capture but... let me verify).
-    Actually Kb1 would be moving into check. Ka2 is not blocked... hmm.
-
-    Let me use a known stalemate:
-    Position: k7/8/1K6/8/8/8/8/8 w - - 0 1
-    Wait, this has Ka8xa7? No, Ka8 has no legal moves (Ka7 blocked by Kb6, Kb7 blocked by Kb6, Kb8 blocked by Kb6... wait Kb8 is empty).
-
-    Let me use the classic: K vs KQ where the losing king is cornered but not in check.
     Position: 8/8/8/8/8/k7/2q5/K7 w - - 0 1
-    White Ka1, Black Ka3 and Qc2. White to move: Ka1 has no legal moves (Ka2 attacked by Qc2, Kb1 attacked by Qc2, Kb2 attacked by Qc2). Stalemate!
+    White Ka1, Black Ka3 and Qc2. White to move has no legal moves.
     """
     board = chess.Board("8/8/8/8/8/k7/2q5/K7 w - - 0 1")
-    # Verify it's actually stalemate
     assert board.is_stalemate(), "Position should be stalemate"
 
-    # MCTS should find value 0.0 for this terminal position
     mcts = MCTS(MockNetwork(), num_simulations=10,
                 dirichlet_alpha=0.0, dirichlet_epsilon=0.0)
     root = mcts.get_root(board)
@@ -223,9 +215,6 @@ def test_threefold_repetition():
 
     MCTS uses is_game_over(claim_draw=True), so 3-fold repetition
     IS treated as terminal with value 0.0 (draw).
-
-    Play moves that return to the starting position 3 times:
-    1. Nf3 Nf6 2. Ng1 Ng8 3. Nf3 Nf6 4. Ng1 Ng8
     """
     board = chess.Board()
     for uci in ["g1f3", "g8f6", "f3g1", "f6g8", "g1f3", "g8f6", "f3g1", "f6g8"]:
@@ -239,7 +228,6 @@ def test_threefold_repetition():
     root = mcts.get_root(board)
     value = mcts._expand_node(root)
     assert abs(value) < 0.01, f"3-fold repetition value should be 0.0, got {value}"
-    # Children should NOT be created (terminal node)
     assert not root.is_expanded or len(root.children) == 0, \
         "Root should not have children (3-fold is terminal)"
     print("  PASS: Threefold repetition detected with Q=0.0 (terminal)")
@@ -250,73 +238,23 @@ def test_threefold_repetition():
 # ─────────────────────────────────────────────────────────────────────────────
 
 def test_checkmate_child_q_value():
-    """After MCTS search, the child leading to checkmate should have Q=+1.0."""
+    """After MCTS search, the child leading to checkmate should have Q = -1.0
+    (from the side to move, which is the opponent of the checkmating side)."""
     board = chess.Board("6k1/5ppp/8/8/8/8/8/R3K3 w Qq - 0 1")
-    _run_mcts_and_check_child_q(board, "a1a8", 1.0,
-                                "Checkmate child has Q=+1.0")
+    _run_mcts_and_check_child_q(board, "a1a8", -1.0,
+                                "Checkmate child has Q=-1.0")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Test 10: Child node gets correct Q for a stalemate move
+# Test 10: Stalemate child Q value – skipped
 # ─────────────────────────────────────────────────────────────────────────────
 
 def test_stalemate_child_q_value():
     """A move leading to stalemate should give Q=0.0 from the mover's perspective.
-
-    Position: 2k5/8/1K6/8/8/8/8/8 b - - 0 1
-    Black king on c8, White king on b6. Black to move.
-    If Black plays Kd7, Ka7, or Kd8, White can force...
-    Actually let me find a position where Black's only move leads to stalemate.
-
-    Position: 8/8/8/8/8/8/K1k5/8 b - - 0 1
-    Black king on c2, White king on a2. Black to move.
-    If Kb1 → White Ka1 is stalemate? No, Kb1 doesn't create stalemate.
-    If Kd1 → White Ka1 is stalemate? No.
-    If Kd2 → White has Ka1, Ka3, Kb1, Kb3. Not stalemate.
-    If Kb1 → White Ka1: White king on a1, Black king on b1. White to move:
-      Ka2 is legal (not attacked). Not stalemate.
-
-    Let me use a known stalemate setup:
-    Position: 2k5/2p5/1KP5/8/8/8/8/8 b - - 0 1
-    Black king c8, black pawn c7, White king b6. Black to move.
-    If c5 → bxc6 e.p.? No, en passant doesn't apply here.
-    If Kd7 → Kb7 threatens c7. Not stalemate.
-    If Kb8 → c7 is still there. Not stalemate.
-    Actually this doesn't easily lead to stalemate.
-
-    Let me use: position where white is about to play a move that causes stalemate.
-    Position: 8/8/8/8/8/8/1q6/K1k5 w - - 0 1
-    White Ka1, Black Kc2 and Qb2. White has no legal moves (Ka2 attacked by Qb2,
-    Kb1 attacked by Qb2). This is already stalemate.
-
-    I need a position where ONE specific move leads to stalemate.
-    Position: 8/8/8/8/8/8/q7/K1k5 w - - 0 1
-    White Ka1, Black Kc2 and Qa2. This is stalemate already (Ka1 has no moves:
-    Ka2 attacked by Qa2, Kb1 attacked by Qa2, Kb2 attacked by Qa2).
-
-    Let me try a different approach. Create a position where it's not yet stalemate,
-    and one move leads to stalemate:
-
-    Position: 8/8/8/8/8/8/8/1k1K4 w - - 0 1
-    White Kd1, Black Kb1. White to move.
-    If Ke1 → Kb2. Not stalemate (Kd2, Kf2 available).
-    If Kc1 → Black Kb1 is in check? No, Kc1 vs Kb1 — kings adjacent, so this is illegal.
-    If Ke2 → Kb2. Not stalemate.
-
-    Hmm, this is hard to set up. Let me use a direct approach:
-    Position where white's ONLY move leads to stalemate.
-
-    Position: 8/8/8/8/8/8/8/K1kR4 w - - 0 1
-    White Ka1, White Rd1, Black Kc1. White to move.
-    Rd1 is attacked by Kc1. If Rd1 moves anywhere, black king might be stalemate.
-    Actually, if Rd8 → Black Kc1: moves available Kc2, Kb1, Kb2. Not stalemate.
-    If Rb1 → Black Kc2, Kb2. Not stalemate.
-
-    Let me just skip the complex stalemate-in-one test and focus on what matters:
-    the terminal value detection is correct. I already tested stalemate detection
-    directly. For child Q values, I'll test checkmate (most important).
+    Because a stalemate position is drawn, so the value is always 0.0.
+    Hard to set up a one-move-to-stalemate position for a child check,
+    but stalemate detection is already verified in test_stalemate().
     """
-    # Skip this test - stalemate detection is already verified in test_stalemate()
     print("  PASS: (skipped — stalemate detection verified in test_stalemate)")
 
 
@@ -357,19 +295,17 @@ def test_nonterminal_uses_network():
 # ─────────────────────────────────────────────────────────────────────────────
 
 def test_checkmate_value_sign():
-    """Verify Q value sign convention: winning position = positive Q
-    from the current player's perspective."""
-    # White to move, can deliver checkmate → Q = +1.0
+    """Verify Q value sign convention: for a White checkmate move,
+    the child node (Black to move) has Q = -1.0."""
     board_w = chess.Board("6k1/5ppp/8/8/8/8/8/R3K3 w Qq - 0 1")
     mcts_w = MCTS(MockNetwork(), num_simulations=50,
                   dirichlet_alpha=0.0, dirichlet_epsilon=0.0)
     root_w = mcts_w.get_root(board_w)
     mcts_w.search(root_w)
 
-    # The checkmate child should have Q = +1.0
     for child in root_w.children.values():
         if child.move and child.move.uci() == "a1a8":
-            assert child.Q > 0.9, f"White checkmate child Q should be > 0.9, got {child.Q}"
+            assert child.Q < -0.9, f"White checkmate child Q should be < -0.9, got {child.Q}"
             print(f"  PASS: White checkmate Q sign correct (Q={child.Q:.4f})")
             return
     assert False, "Checkmate move a1a8 not found in children"
@@ -380,77 +316,21 @@ def test_checkmate_value_sign():
 # ─────────────────────────────────────────────────────────────────────────────
 
 def test_backprop_sign_flip():
-    """After backpropagation, the root's Q should have opposite sign
-    of the child's Q (since they're from different perspectives)."""
+    """After backpropagation, the child Q should be negative (the opponent's loss)
+    and the root should receive a positive increment (White's win)."""
     board = chess.Board("6k1/5ppp/8/8/8/8/8/R3K3 w Qq - 0 1")
     mcts = MCTS(MockNetwork(), num_simulations=50,
                 dirichlet_alpha=0.0, dirichlet_epsilon=0.0)
     root = mcts.get_root(board)
     mcts.search(root)
 
-    # Find the checkmate child
     for child in root.children.values():
         if child.move and child.move.uci() == "a1a8":
-            # Child Q should be +1.0 (checkmate = winning for the mover)
-            assert child.Q > 0.9, f"Child Q should be > 0.9, got {child.Q}"
-            # Root Q should be negative (checkmate means LOSING for root's player)
-            # Wait — root is white, white delivers checkmate, so root's perspective
-            # is WINNING. But backprop flips sign for parent.
-            # Child perspective: it's black's turn, position is checkmate for black,
-            # so value from black's perspective = -1.0
-            # Root perspective: it's white's turn, checkmate is good for white = +1.0
-            # Actually let me think again...
-            #
-            # In _get_terminal_value: result is "1-0" → returns +1.0
-            # This +1.0 is from the perspective of the node's board's side to move.
-            # The child board is after Ra8#, so it's black to move.
-            # result "1-0" means white won. From black's perspective, this is -1.0.
-            # But _get_terminal_value returns +1.0 for "1-0" regardless...
-            #
-            # Wait, let me re-read _get_terminal_value:
-            #   result = node.board.result()
-            #   if result == "1-0": return 1.0
-            # This returns +1.0 for "1-0" from the NODE's perspective.
-            # But the node's board has black to move (after white's checkmate move).
-            # So it's saying "from black's perspective, the result is +1.0" which is wrong.
-            #
-            # Actually, chess results are absolute: "1-0" means white wins.
-            # The node's value should be from the NODE's player's perspective.
-            # If the node is after white's move (black to move), and white won,
-            # then from black's perspective, the value should be -1.0.
-            #
-            # Hmm, but _get_terminal_value returns +1.0 for "1-0" always.
-            # This seems like it could be a bug, or it's intentional and the
-            # convention is that the value is from the SIDE TO MOVE's perspective.
-            #
-            # Actually, looking at AlphaZero convention:
-            # The value at a node is from the perspective of the player at that node.
-            # After white plays Ra8#, the child node has black to move.
-            # The result is "1-0" (white wins). From black's perspective, this is -1.0.
-            # But _get_terminal_value returns +1.0 for "1-0".
-            #
-            # Wait, that CAN'T be right. Let me re-read...
-            #
-            # Oh I see — _get_terminal_value returns the result as-is:
-            # "1-0" → +1.0, "0-1" → -1.0, draw → 0.0
-            # This is from WHITE's perspective always. But MCTS expects values
-            # from the NODE's player's perspective.
-            #
-            # Actually, let me check: does the backpropagation handle this correctly?
-            # In _backpropagate:
-            #   current.W += v
-            #   v = -v  (flip for opponent)
-            # So if the terminal value is +1.0 (white wins), and the terminal node
-            # has black to move, then black gets W += 1.0? That would be wrong.
-            #
-            # Unless... the convention is that the value is always from the root's
-            # perspective (white's perspective if white is to move at root).
-            # In that case, backprop doesn't need to flip at the terminal node.
-            #
-            # I think there might be a sign convention issue here, but it's
-            # pre-existing and not what we're testing. Let me just check that
-            # the child's Q value is non-zero (indicating terminal was detected).
-            assert child.Q != 0.0, f"Checkmate child Q should not be 0.0"
+            assert child.Q < -0.9, f"Child Q should be < -0.9, got {child.Q}"
+            # Root's Q should be positive because White delivered mate.
+            # Actually, after many simulations where only the checkmate line is explored,
+            # root.W / root.N will become positive (White's winning expectation).
+            # We just verify the child's Q is negative as the convention requires.
             print(f"  PASS: Backprop sign handling (root Q={root.Q:.4f}, child Q={child.Q:.4f})")
             return
     assert False, "Checkmate move a1a8 not found"
@@ -465,22 +345,22 @@ def test_get_terminal_value_directly():
     mcts = MCTS(MockNetwork(), num_simulations=10,
                 dirichlet_alpha=0.0, dirichlet_epsilon=0.0)
 
-    # 1-0 (white wins)
+    # 1-0 (white wins), node is after the checkmate move → Black to move → value = -1.0
     board = chess.Board("6k1/5ppp/8/8/8/8/8/R3K3 w Qq - 0 1")
-    board.push(chess.Move.from_uci("a1a8"))  # Checkmate
+    board.push(chess.Move.from_uci("a1a8"))  # Checkmate, Black to move
     node = MCTSNode(board)
     val = mcts._get_terminal_value(node)
-    assert val == 1.0, f"1-0 should return 1.0, got {val}"
-    print("  PASS: _get_terminal_value(1-0) = 1.0")
+    assert val == -1.0, f"1-0 should return -1.0 (Black's perspective), got {val}"
+    print("  PASS: _get_terminal_value(1-0) = -1.0 (Black to move)")
 
-    # 0-1 (black wins)
+    # 0-1 (black wins), node with White to move
     board = chess.Board("r3K3/8/4k3/8/8/8/8/8 w - - 0 1")
     node = MCTSNode(board)
     val = mcts._get_terminal_value(node)
-    assert val == -1.0, f"0-1 should return -1.0, got {val}"
-    print("  PASS: _get_terminal_value(0-1) = -1.0")
+    assert val == -1.0, f"0-1 should return -1.0 (White's perspective), got {val}"
+    print("  PASS: _get_terminal_value(0-1) = -1.0 (White to move)")
 
-    # Draw
+    # Draw (50-move rule)
     board = chess.Board("4k3/8/8/8/8/8/8/4K3 w - - 100 51")
     node = MCTSNode(board)
     val = mcts._get_terminal_value(node)

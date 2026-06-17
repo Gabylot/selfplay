@@ -41,10 +41,8 @@ def warmup_shaders(network, device, batch_sizes=(1, 8, 16, 32, 64, 128)):
     with torch.no_grad():
         for bs in batch_sizes:
             dummy = torch.randn(bs, 20, 8, 8, device=device)
-            # First pass triggers compilation
-            _ = network(dummy)
-            # Second pass confirms cached path
-            _ = network(dummy)
+            for _ in range(5):  # enough to stabilize the shader cache
+                _ = network(dummy)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -111,6 +109,18 @@ class GPUInferenceServer:
         print(f"[GPU-Server] Pre-warming shaders for batch sizes: {self.prewarm_sizes}")
         t0 = time.perf_counter()
         warmup_shaders(net, device, self.prewarm_sizes)
+
+        # Verify the fast path is stable after warming
+        with torch.no_grad():
+            for bs in self.prewarm_sizes:
+                dummy = torch.randn(bs, 20, 8, 8, device=device)
+                times = []
+                for _ in range(5):
+                    t = time.perf_counter()
+                    net(dummy)
+                    times.append((time.perf_counter() - t) * 1000)
+                print(f"[GPU-Server] bs={bs}: min={min(times):.1f}ms max={max(times):.1f}ms")
+
         elapsed = (time.perf_counter() - t0) * 1000
         print(f"[GPU-Server] Shader pre-warming done in {elapsed:.0f} ms")
         self.ready_event.set()

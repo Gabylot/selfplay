@@ -308,67 +308,50 @@ class MCTS:
     def _evaluate_batch(self, leaf_nodes: List[MCTSNode]) -> List[float]:
         """Evaluate a batch of leaf nodes.
 
-        For each leaf:
-        - If terminal, returns game result directly (skip network)
-        - If not expanded yet, queues for network eval
-        - If already expanded (terminal that was previously visited),
-          returns the terminal value (shouldn't happen in normal flow)
+        Terminal nodes are those where the game is over, a threefold repetition
+        has occurred, or the 50‑move rule has been exceeded.  These skip the
+        network and return the game result directly.
 
-        Non-terminal leaves are evaluated together in a single batched
-        network call.
-
-        Args:
-            leaf_nodes: List of leaf nodes to evaluate
-
-        Returns:
-            List of value estimates, one per leaf
+        Non‑terminal, unexpanded leaves are stacked and evaluated in one
+        batched network call.
         """
-        # Separate terminal and expandable leaves
         terminal_values = {}
         expandable_indices = []
         expandable_nodes = []
 
         for i, node in enumerate(leaf_nodes):
-            # Use cached game_over if available, otherwise compute and cache
+            # ---- Terminal check: only ACTUAL game‑ending conditions ----
             if node._game_over_cached is None:
-                node._game_over_cached = node.board.is_game_over(claim_draw=True)
+                node._game_over_cached = (
+                    node.board.is_game_over() or       # mate, stalemate, 75‑move, etc.
+                    node.board.is_repetition(3) or     # 3‑fold repetition already happened
+                    node.board.is_fifty_moves()        # half‑move clock ≥ 100
+                )
+
             if node._game_over_cached:
                 terminal_values[i] = self._get_terminal_value(node)
             elif not node.is_expanded:
                 expandable_indices.append(i)
                 expandable_nodes.append(node)
             else:
-                # Already expanded but no children -- shouldn't happen
-                # in normal flow, but handle gracefully
+                # Node is expanded but terminal (should not happen normally)
                 terminal_values[i] = self._get_terminal_value(node)
 
-        # For expandable leaves, we need network eval
+        # ---- Batched network evaluation for expandable leaves ----
         if expandable_nodes:
-            # Collect states
-            states_list = []
-            for node in expandable_nodes:
-                state = board_to_tensor(node.board)
-                states_list.append(state)
+            states_list = [board_to_tensor(n.board) for n in expandable_nodes]
+            states_batch = np.stack(states_list, axis=0)
 
-            # Stack into batch
-            states_batch = np.stack(states_list, axis=0)  # (batch, 20, 8, 8)
-
-            # Single batched network call
             policies_batch, values_batch = self.network.predict_batch(states_batch)
 
-            # Expand each node with its prediction
             for idx, node in enumerate(expandable_nodes):
                 self._expand_node_with_data(node, policies_batch[idx], values_batch[idx])
                 terminal_values[expandable_indices[idx]] = float(values_batch[idx])
 
-        # Build result list in original order
+        # Reconstruct results in the original leaf order
         results = []
         for i in range(len(leaf_nodes)):
-            if i in terminal_values:
-                results.append(terminal_values[i])
-            else:
-                # Fallback -- should not reach here
-                results.append(0.0)
+            results.append(terminal_values.get(i, 0.0))
 
         return results
 
@@ -381,7 +364,11 @@ class MCTS:
         """
         # Check for terminal position -- cache result on node
         if node._game_over_cached is None:
-            node._game_over_cached = node.board.is_game_over(claim_draw=True)
+            node._game_over_cached = (
+                node.board.is_game_over() or
+                node.board.is_repetition(3) or
+                node.board.is_fifty_moves()
+            )
         if node._game_over_cached:
             return self._get_terminal_value(node)
 
@@ -434,7 +421,12 @@ class MCTS:
         for move in legal_moves:
             try:
                 action_idx = move_to_policy_index(move, node.board)
-            except ValueError:
+            except ValueError as e:
+                # Log the board and the move that failed encoding
+                with open("encoding_failures.log", "a") as f:
+                    f.write(f"FEN: {node.board.fen()}\n"
+                            f"Move: {move.uci()}\n"
+                            f"Error: {e}\n\n")
                 continue
 
             prior = float(legal_policy[action_idx])
@@ -446,22 +438,23 @@ class MCTS:
             child = MCTSNode(parent=node, move=move, prior=prior)
             node.children[action_idx] = child
 
+        if not node.children:
+            print(f"WARNING: No children created for node with {len(legal_moves)} legal moves")
+            # Optional fallback: create children with uniform priors to avoid empty
+            # (but this should not happen in normal operation)
+
         node.is_expanded = True
 
         return float(value)
 
-    def _get_terminal_value(self, node: MCTSNode) -> float:
-        """Get the value of a terminal node from the current player's perspective.
-
-        The value is cached on the node so subsequent calls are free.
-        """
+    def _get_terminal_value(self, node):
         if node._terminal_value_cached is not None:
             return node._terminal_value_cached
         result = node.board.result()
         if result == "1-0":
-            val = 1.0
+            val = 1.0 if node.board.turn == chess.WHITE else -1.0
         elif result == "0-1":
-            val = -1.0
+            val = -1.0 if node.board.turn == chess.WHITE else 1.0
         else:
             val = 0.0
         node._terminal_value_cached = val
@@ -538,7 +531,7 @@ class MCTS:
             The checkmate move if found, None otherwise.
         """
         for child in root.children.values():
-            if child.board.is_checkmate():  # triggers lazy board materialization
+            if child.N > 0 and child.board.is_checkmate():
                 return child.move
         return None
 
