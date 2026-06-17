@@ -6,8 +6,12 @@ to eliminate DirectML's lazy-compilation latency spikes.
 
 Protocol
 --------
-Request  : (worker_id, request_id, state)   state is (20,8,8) float32 ndarray
-Response : (request_id, policy, value)      policy (4672,) ndarray, value float
+Request  : (worker_id, request_id, state)
+           - state ndim == 3 (20,8,8):   single request (timer-aggregated)
+           - state ndim == 4 (N,20,8,8):  batch request (processed immediately)
+Response : (request_id, policy, value)
+           - single response:  policy (4672,) ndarray, value float
+           - batch response:   policy (N,4672) ndarray, values (N,) ndarray
 Weight   : raw bytes (serialized state_dict via torch.save)
 Shutdown : None sentinel in request_queue
 """
@@ -119,31 +123,58 @@ class GPUInferenceServer:
             # Drain weight queue first (non-blocking)
             self._drain_weight_queue(net, device)
 
-            # Collect a batch of requests
-            batch = []
-            deadline = time.monotonic() + self.max_wait_ms / 1000.0
-
-            while len(batch) < self.max_batch:
-                remaining = max(0.0, deadline - time.monotonic())
-                if remaining <= 0 and batch:
-                    break  # timer expired, fire what we have
-                try:
-                    req = self.request_queue.get(timeout=min(remaining, 0.001))
-                    if req is None:
-                        # Shutdown sentinel
-                        self._send_shutdown_to_workers()
-                        return
-                    batch.append(req)
-                except queue.Empty:
-                    if batch:
-                        break  # timer expired
-                    continue
-
-            if not batch:
+            # Get one request (blocking, with timeout to allow weight checks)
+            try:
+                req = self.request_queue.get(timeout=0.5)
+            except queue.Empty:
                 continue
 
-            # Run inference
-            self._process_batch(net, device, batch)
+            if req is None:
+                # Shutdown sentinel
+                self._send_shutdown_to_workers()
+                return
+
+            worker_id, request_id, state = req
+
+            # Differentiate: batch request (ndim == 4) vs single (ndim == 3)
+            if state.ndim == 4:
+                # ── Batch request: process immediately, no timer ──
+                self._process_single_batch(net, device, worker_id, request_id, state)
+            else:
+                # ── Single request: collect more for timer-based batching ──
+                batch = [(worker_id, request_id, state)]
+                deadline = time.monotonic() + self.max_wait_ms / 1000.0
+
+                while len(batch) < self.max_batch:
+                    remaining = max(0.0, deadline - time.monotonic())
+                    if remaining <= 0:
+                        break  # timer expired
+                    try:
+                        req2 = self.request_queue.get(timeout=min(remaining, 0.001))
+                        if req2 is None:
+                            # Shutdown — fire what we have first
+                            break
+                        w2, rid2, st2 = req2
+                        if st2.ndim == 4:
+                            # Another batch request arrived during our window.
+                            # Process the current accumulation first, then handle
+                            # the batch request on the next loop iteration.
+                            # Push it back by prepending (not possible reliably),
+                            # so we just fall through and fire the timer batch,
+                            # then put the batch request back by sending it again.
+                            # Actually simpler: process the timer batch now,
+                            # then handle the batch request immediately.
+                            if batch:
+                                self._process_batch(net, device, batch)
+                            self._process_single_batch(net, device, w2, rid2, st2)
+                            batch = []
+                            break
+                        batch.append((w2, rid2, st2))
+                    except queue.Empty:
+                        break
+
+                if batch:
+                    self._process_batch(net, device, batch)
 
         print("[GPU-Server] Shutting down")
 
@@ -166,9 +197,33 @@ class GPUInferenceServer:
             net.load_state_dict(state_dict)
             net.eval()
 
+    def _process_single_batch(self, net, device, worker_id, request_id, states):
+        """Process a pre-stacked batch request ``(N, 20, 8, 8)`` immediately.
+
+        Sends a single response ``(request_id, policies, values)`` back to
+        the worker, where ``policies.shape == (N, 4672)``.
+        """
+        states_t = torch.from_numpy(states).float().to(device)
+
+        with torch.no_grad():
+            policy_logits, values = net(states_t)
+            policies = F.softmax(policy_logits, dim=1).cpu().numpy()
+            values = values.squeeze(-1).cpu().numpy()
+
+        try:
+            self.response_queues[worker_id].put_nowait(
+                (request_id, policies, values)
+            )
+        except Exception:
+            pass  # queue full or closed — worker likely dead
+
     def _process_batch(self, net, device, batch):
-        """Run a single GPU forward pass and distribute results."""
-        # batch is list of (worker_id, request_id, state)
+        """Run a single GPU forward pass and distribute results.
+
+        ``batch`` is a list of ``(worker_id, request_id, state)`` tuples
+        where each ``state.shape == (20, 8, 8)`` (individual requests
+        aggregated by the timer).
+        """
         states = np.stack([r[2] for r in batch], axis=0)  # (N, 20, 8, 8)
         states_t = torch.from_numpy(states).float().to(device)
 
