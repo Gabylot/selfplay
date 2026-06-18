@@ -8,16 +8,28 @@ Board Representation (8x8x20):
     Plane 17:     En passant square
     Plane 18:     Repetition count >= 2 (position seen before)
     Plane 19:     Repetition count >= 3 (on verge of 3-fold repetition)
+    - Repetition planes can optionally be passed in via `repetition_counts`
+      to avoid expensive board.is_repetition() calls.
 
 Move Encoding (8x8x73 = 4672 action space):
     Planes 0-55:  Queen-like moves (8 directions × 7 distances)
     Planes 56-63: Knight moves (8 offsets)
     Planes 64-72: Underpromotions (3 pieces × 3 horizontal offsets)
     - Queen promotions are encoded as queen-like moves (forward direction)
+    
+Performance optimisations:
+    - MOVE_PLANE_LUT: precomputed 64×64 lookup table mapping (from_sq, to_sq)
+      → queen/knight plane index (0-63), or -1 if not a valid queen/knight delta.
+      This eliminates all direction-search loops, square rank/file calls, and
+      delta arithmetic in the hot path of move_to_policy_index.
+    - board_to_tensor uses piece_map() instead of iterating all 64 squares.
+    - board_to_tensor accepts optional repetition_counts to avoid expensive
+      is_repetition() stack scanning.
 """
 
 import numpy as np
 import chess
+from typing import Optional, Tuple
 
 # Piece type to plane index mapping
 PIECE_PLANE = {
@@ -86,7 +98,43 @@ def _underpromotion_plane(piece_type, dir_idx):
     return 64 + piece_idx * 3 + dir_idx
 
 
-def board_to_tensor(board: chess.Board) -> np.ndarray:
+# ---------------------------------------------------------------------------
+# Precomputed 64×64 lookup table: MOVE_PLANE_LUT[from_sq][to_sq] → plane (0-63)
+# -1 means the delta is not a valid queen or knight move (e.g. same square,
+# non-matching ratio, or distance > 7).
+# ---------------------------------------------------------------------------
+MOVE_PLANE_LUT = np.full((64, 64), -1, dtype=np.int16)
+
+def _build_plane_lut():
+    """Fill MOVE_PLANE_LUT for all valid queen-like and knight moves."""
+    for from_rank in range(8):
+        for from_file in range(8):
+            from_sq = chess.square(from_file, from_rank)
+
+            # Queen-like moves
+            for d_idx, (qdr, qdc) in enumerate(QUEEN_DIRECTIONS):
+                for dist in range(1, 8):
+                    to_rank = from_rank + qdr * dist
+                    to_file = from_file + qdc * dist
+                    if not (0 <= to_rank < 8 and 0 <= to_file < 8):
+                        break
+                    to_sq = chess.square(to_file, to_rank)
+                    plane = d_idx * 7 + (dist - 1)
+                    MOVE_PLANE_LUT[from_sq, to_sq] = plane
+
+            # Knight moves
+            for k_idx, (kdr, kdc) in enumerate(KNIGHT_OFFSETS):
+                to_rank = from_rank + kdr
+                to_file = from_file + kdc
+                if 0 <= to_rank < 8 and 0 <= to_file < 8:
+                    to_sq = chess.square(to_file, to_rank)
+                    MOVE_PLANE_LUT[from_sq, to_sq] = 56 + k_idx
+
+_build_plane_lut()
+
+
+def board_to_tensor(board: chess.Board,
+                     repetition_counts: Optional[Tuple[bool, bool]] = None) -> np.ndarray:
     """Encode a chess.Board as a (20, 8, 8) float32 numpy array.
     
     Planes 0-5:   White P, N, B, R, Q, K
@@ -96,17 +144,23 @@ def board_to_tensor(board: chess.Board) -> np.ndarray:
     Plane 17:     En passant square
     Plane 18:     Repetition count >= 2 (position seen before)
     Plane 19:     Repetition count >= 3 (on verge of 3-fold repetition)
+    
+    Args:
+        board: The chess board to encode.
+        repetition_counts: Optional (rep2, rep3) bools specifying repetition
+            state. If None, board.is_repetition(2) and is_repetition(3) are
+            called (expensive for deep stacks). When called from MCTS with
+            tree-based repetition tracking, pass the precomputed values.
     """
     tensor = np.zeros((NUM_PLANES, 8, 8), dtype=np.float32)
     
-    # Piece positions
-    for sq in chess.SQUARES:
-        piece = board.piece_at(sq)
-        if piece is not None:
-            rank = chess.square_rank(sq)  # 0-7
-            file = chess.square_file(sq)  # 0-7
-            plane = PIECE_PLANE[(piece.piece_type, piece.color)]
-            tensor[plane, rank, file] = 1.0
+    # Piece positions – use piece_map() to iterate only occupied squares
+    # (~32 squares instead of all 64, and avoids repeated board.piece_at())
+    for sq, piece in board.piece_map().items():
+        rank = chess.square_rank(sq)  # 0-7
+        file = chess.square_file(sq)  # 0-7
+        plane = PIECE_PLANE[(piece.piece_type, piece.color)]
+        tensor[plane, rank, file] = 1.0
     
     # Side to move
     if board.turn == chess.WHITE:
@@ -129,10 +183,16 @@ def board_to_tensor(board: chess.Board) -> np.ndarray:
         file = chess.square_file(ep)
         tensor[17, rank, file] = 1.0
     
-    # Repetition count planes
-    if board.is_repetition(2):
+    # Repetition count planes – use precomputed values if provided
+    if repetition_counts is not None:
+        rep2, rep3 = repetition_counts
+    else:
+        rep2 = board.is_repetition(2)
+        rep3 = board.is_repetition(3)
+    
+    if rep2:
         tensor[18, :, :] = 1.0
-    if board.is_repetition(3):
+    if rep3:
         tensor[19, :, :] = 1.0
     
     return tensor
@@ -158,24 +218,22 @@ def move_to_policy_index(move: chess.Move, board: chess.Board) -> int:
     
     The policy space is organized as 8*8*73, where for each source square
     (in rank-file order, rank 0 first), there are 73 possible move planes.
+    
+    Performance: uses a precomputed MOVE_PLANE_LUT to avoid direction-search
+    loops for the hot path (queen/knight moves). Underpromotions still need
+    the piece type and direction, but those are rare (~0.7% of moves).
     """
-    from_rank = chess.square_rank(move.from_square)
-    from_file = chess.square_file(move.from_square)
-    to_rank = chess.square_rank(move.to_square)
-    to_file = chess.square_file(move.to_square)
-    
-    # dr, dc relative to source (in rank-file coordinates)
-    dr = to_rank - from_rank
-    dc = to_file - from_file
-    
-    # Check if this is an underpromotion
-    piece = board.piece_at(move.from_square)
-    is_promotion = move.promotion is not None
-    
-    if is_promotion and move.promotion in (chess.KNIGHT, chess.BISHOP, chess.ROOK):
-        # Underpromotion
-        # Determine direction offset
-        # For white: forward = +1 rank, for black: forward = -1 rank
+    from_sq = move.from_square
+
+    # Handle underpromotions (rare case, handled explicitly)
+    if move.promotion is not None and move.promotion in (chess.KNIGHT, chess.BISHOP, chess.ROOK):
+        from_rank = chess.square_rank(from_sq)
+        from_file = chess.square_file(from_sq)
+        to_sq = move.to_square
+        to_rank = chess.square_rank(to_sq)
+        to_file = chess.square_file(to_sq)
+        dr = to_rank - from_rank
+        dc = to_file - from_file
         if board.turn == chess.WHITE:
             if dr == 1 and dc == 0:
                 dir_idx = 0  # forward
@@ -189,36 +247,32 @@ def move_to_policy_index(move: chess.Move, board: chess.Board) -> int:
             if dr == -1 and dc == 0:
                 dir_idx = 0  # forward
             elif dr == -1 and dc == 1:
-                dir_idx = 1  # forward-left (from black's perspective, going toward rank 1)
+                dir_idx = 1  # forward-left (from black's perspective)
             elif dr == -1 and dc == -1:
                 dir_idx = 2  # forward-right
             else:
                 raise ValueError(f"Invalid underpromotion move: {move}")
-        
         plane = _underpromotion_plane(move.promotion, dir_idx)
     else:
-        # Queen-like or knight move (including queen promotions)
-        # Try to find as queen-like move
-        plane = _find_queen_move_plane(dr, dc)
-        if plane is None:
-            # Try knight move
-            plane = _find_knight_move_plane(dr, dc)
-        if plane is None:
-            raise ValueError(f"Cannot encode move {move} (dr={dr}, dc={dc})")
+        # Fast path: look up in precomputed LUT
+        to_sq = move.to_square
+        plane = MOVE_PLANE_LUT[from_sq, to_sq]
+        if plane == -1:
+            raise ValueError(f"Cannot encode move {move} (no LUT entry for {from_sq}→{to_sq})")
     
     # Flat index: (from_rank * 8 + from_file) * 73 + plane
-    source_idx = from_rank * 8 + from_file
-    return source_idx * 73 + plane
+    # from_sq encodes the same as (rank * 8 + file) on a chess board
+    return from_sq * 73 + plane
 
 
 def _find_queen_move_plane(dr, dc):
-    """Find the plane index for a queen-like move with given delta."""
+    """Find the plane index for a queen-like move with given delta.
+    Kept for backward compatibility; not used in hot path.
+    """
     if dr == 0 and dc == 0:
         return None
     
-    # Find direction
     for d_idx, (qdr, qdc) in enumerate(QUEEN_DIRECTIONS):
-        # Check if (dr, dc) is in this direction
         if qdr == 0:
             if dr != 0:
                 continue
@@ -236,7 +290,6 @@ def _find_queen_move_plane(dr, dc):
                 continue
             dist = abs(dr)
         else:
-            # Diagonal: dr/dc must match the direction ratio
             if qdr * dc != qdc * dr:
                 continue
             if (dr > 0 and qdr < 0) or (dr < 0 and qdr > 0):
@@ -244,7 +297,6 @@ def _find_queen_move_plane(dr, dc):
             if (dc > 0 and qdc < 0) or (dc < 0 and qdc > 0):
                 continue
             dist = abs(dr) if abs(qdr) == 1 else abs(dr)
-            # Verify it's actually on the diagonal with matching magnitude
             if abs(dr) != abs(dc):
                 continue
         
@@ -255,7 +307,9 @@ def _find_queen_move_plane(dr, dc):
 
 
 def _find_knight_move_plane(dr, dc):
-    """Find the plane index for a knight move with given delta."""
+    """Find the plane index for a knight move with given delta.
+    Kept for backward compatibility; not used in hot path.
+    """
     for k_idx, (kdr, kdc) in enumerate(KNIGHT_OFFSETS):
         if dr == kdr and dc == kdc:
             return 56 + k_idx
@@ -266,6 +320,7 @@ def policy_index_to_move(index: int, board: chess.Board) -> chess.Move:
     """Convert a flat policy index (0-4671) to a chess.Move.
     
     Returns None if the move is not valid for the given board state.
+    Uses MOVE_PLANE_LUT to validate the queen/knight delta.
     """
     source_idx = index // 73
     plane = index % 73
@@ -339,7 +394,6 @@ def policy_index_to_move(index: int, board: chess.Board) -> chess.Move:
     # If not legal, try without promotion (for queen-like pawn forward moves)
     if promotion == chess.QUEEN:
         move_no_promo = chess.Move(from_square, to_square, promotion=None)
-        # This shouldn't happen for a pawn reaching the last rank, but just in case
         if move_no_promo in board.legal_moves:
             return move_no_promo
     
@@ -354,7 +408,6 @@ def get_legal_move_mask(board: chess.Board) -> np.ndarray:
             idx = move_to_policy_index(move, board)
             mask[idx] = 1.0
         except ValueError:
-            # Move encoding failed — shouldn't happen for legal moves
             continue
     return mask
 
@@ -394,13 +447,14 @@ def get_all_policy_indices(board: chess.Board) -> dict:
     return result
 
 
-def policy_to_move_dict(board: chess.Board, policy: np.ndarray, top_k: int = 5):
+def policy_to_move_dict(board: chess.Board, policy: np.ndarray, top_k: int = 5, repetition_counts=None):
     """Convert a raw policy vector to the top-k legal moves with probabilities.
     
     Args:
         board: Current board state
         policy: (4672,) raw policy logits or probabilities
         top_k: Number of top moves to return
+        repetition_counts: Optional repetition info to pass to board_to_tensor
     
     Returns:
         List of (move, probability) tuples, sorted by probability descending.

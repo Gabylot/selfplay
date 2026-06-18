@@ -64,7 +64,8 @@ class MCTSNode:
     __slots__ = ['_board', '_board_ready', 'parent', 'move', 'children',
                  'N', 'W', 'Q', 'P', 'P_orig', 'is_expanded',
                  'legal_moves_cached', 'visit_count', 'virtual_loss',
-                 '_game_over_cached', '_terminal_value_cached']
+                 '_game_over_cached', '_terminal_value_cached',
+                 '_position_hash']
 
     def __init__(self, board: Optional[chess.Board] = None,
                  parent: Optional['MCTSNode'] = None,
@@ -87,22 +88,39 @@ class MCTSNode:
         self.virtual_loss = 0  # Virtual loss counter for batched inference
         self._game_over_cached: Optional[bool] = None  # None = not yet checked
         self._terminal_value_cached: Optional[float] = None  # Cached terminal value
+        self._position_hash: Optional[int] = None  # Zobrist hash, cached on first materialisation
 
     @property
     def board(self) -> chess.Board:
         """Lazily materialize the board on first access.
 
-        Walks up via parent, copies with ``stack=True`` to preserve the
-        full game history for threefold-repetition detection, then pushes
-        the move.  The result is cached so subsequent accesses are free.
+        Copies the parent board with ``stack=False`` (does NOT copy the
+        full move history — only the last 8 reversible half-moves), then
+        pushes the move.  The result is cached so subsequent accesses
+        are free.
+
+        Repetition detection is handled separately via a parent-chain
+        Zobrist hash walk (see ``_tree_repetition_check``), so the
+        expensive full-stack copy is not needed.
+
+        If the parent node's board is already materialised (which is
+        always the case during MCTS search because the parent was
+        expanded before its children were created), we use it directly
+        — no recursive walk-up needed.
         """
         if not self._board_ready:
-            # Build from parent once, then cache
+            # The parent was expanded before children were created, so
+            # parent._board_ready is guaranteed to be True during search.
             parent_board = self.parent.board
-            b = parent_board.copy(stack=True)
+            b = parent_board.copy(stack=False)  # lightweight — no full stack copy
             b.push(self.move)
             self._board = b
             self._board_ready = True
+            # Cache Zobrist transposition key for tree-based repetition detection.
+            # _transposition_key() is a lightweight tuple computed from the
+            # board state (pieces, castling, ep, side to move) — it's the same
+            # key used internally by python-chess for Zobrist hashing.
+            self._position_hash = b._transposition_key()
         return self._board
 
     @board.setter
@@ -174,9 +192,49 @@ class MCTS:
         self.adjudicate_graded = adjudicate_graded
         self.adjudicate_scaling = adjudicate_scaling
 
+    @staticmethod
+    def _tree_repetition_check(node: MCTSNode, count: int) -> bool:
+        """Walk the parent chain to detect repetition via Zobrist hashes.
+        
+        Counts how many times ``node._position_hash`` appears in the
+        ancestor chain (including the node itself). Returns True if it
+        appears at least ``count`` times.
+        
+        This replaces expensive board.is_repetition(N) calls that require
+        scanning the entire move stack (which is O(stack_length) with
+        FEN-string comparison).  Hash comparison is O(depth) with a
+        single integer tuple compare per step.
+        
+        **Fallback**: If the node has no parent (i.e. it's the root and
+        the repetition came from the actual game history), falls back to
+        board.is_repetition().
+        """
+        # Ensure hash is available
+        if node._position_hash is None:
+            # Materialise board if needed to get hash
+            _ = node.board  # triggers property which caches _position_hash
+        
+        # Fallback for root nodes: the parent chain is empty, so use the
+        # board's move stack (which correctly stores the game history).
+        if node.parent is None:
+            return node.board.is_repetition(count)
+        
+        target = node._position_hash
+        n = 1  # current node counts as 1
+        current = node.parent
+        while current is not None and n < count:
+            if current._position_hash is not None and current._position_hash == target:
+                n += 1
+                if n >= count:
+                    return True
+            current = current.parent
+        return n >= count
+
     def get_root(self, board: chess.Board) -> MCTSNode:
         """Create a root node for the given board (eagerly stores the board)."""
-        return MCTSNode(board.copy())
+        root_node = MCTSNode(board.copy())
+        root_node._position_hash = board._transposition_key()
+        return root_node
 
     def recycle_tree(self, root: MCTSNode, move: chess.Move) -> Optional[MCTSNode]:
         """Promote the child of `root` that corresponds to `move` to a new root.
@@ -367,19 +425,24 @@ class MCTS:
 
         Non‑terminal, unexpanded leaves are stacked and evaluated in one
         batched network call.
+
+        Uses tree-based Zobrist hash repetition detection (fast integer
+        comparison walking the parent chain) instead of the expensive
+        board.is_repetition() that scans the full move stack.
         """
         terminal_values = {}
         expandable_indices = []
         expandable_nodes = []
+        expandable_reps = []  # (rep2, rep3) for each expandable node
 
         for i, node in enumerate(leaf_nodes):
             # ---- Terminal check: ACTUAL game‑ending + max_length ----
             if node._game_over_cached is None:
                 node._game_over_cached = (
                     node.board.is_game_over() or
-                    node.board.is_repetition(3) or
+                    self._tree_repetition_check(node, 3) or
                     node.board.is_fifty_moves() or
-                    node.board.ply() >= self.max_game_length          # <-- NEW
+                    node.board.ply() >= self.max_game_length
                 )
 
             if node._game_over_cached:
@@ -387,13 +450,20 @@ class MCTS:
             elif not node.is_expanded:
                 expandable_indices.append(i)
                 expandable_nodes.append(node)
+                # Precompute repetition counts for board_to_tensor encoding
+                rep2 = self._tree_repetition_check(node, 2)
+                rep3 = self._tree_repetition_check(node, 3)
+                expandable_reps.append((rep2, rep3))
             else:
                 # Node is expanded but terminal (should not happen normally)
                 terminal_values[i] = self._get_terminal_value(node)
 
         # ---- Batched network evaluation for expandable leaves ----
         if expandable_nodes:
-            states_list = [board_to_tensor(n.board) for n in expandable_nodes]
+            states_list = [
+                board_to_tensor(n.board, repetition_counts=rep)
+                for n, rep in zip(expandable_nodes, expandable_reps)
+            ]
             states_batch = np.stack(states_list, axis=0)
 
             policies_batch, values_batch = self.network.predict_batch(states_batch)
@@ -416,21 +486,26 @@ class MCTS:
         without querying the network.  Terminal state is cached on the
         node to avoid redundant ``is_game_over()`` calls.
 
+        Uses tree-based Zobrist hash repetition detection instead of
+        expensive board.is_repetition() stack scanning.
+
         **NEW** now also checks for `max_game_length`.
         """
         # Check for terminal position -- cache result on node
         if node._game_over_cached is None:
             node._game_over_cached = (
                 node.board.is_game_over() or
-                node.board.is_repetition(3) or
+                self._tree_repetition_check(node, 3) or
                 node.board.is_fifty_moves() or
-                node.board.ply() >= self.max_game_length          # <-- NEW
+                node.board.ply() >= self.max_game_length
             )
         if node._game_over_cached:
             return self._get_terminal_value(node)
 
         # Get network prediction
-        state = board_to_tensor(node.board)
+        rep2 = self._tree_repetition_check(node, 2)
+        rep3 = self._tree_repetition_check(node, 3)
+        state = board_to_tensor(node.board, repetition_counts=(rep2, rep3))
         policy, value = self.network.predict(state)
 
         # Complete expansion using the prediction data
@@ -473,8 +548,11 @@ class MCTS:
             # Uniform over legal moves if network gives zero probability to all
             legal_policy = mask / mask.sum()
 
-        # Create child nodes with lazy board construction
-        # (no board.copy() / push() -- done on first access via the property)
+        # Create child nodes with lazy board construction.
+        # Children store only ``(parent, move)`` and materialise
+        # the board on first access via the MCTSNode.board property.
+        # This avoids expensive board.copy(stack=True) for children
+        # that are never visited during the search.
         for move in legal_moves:
             try:
                 action_idx = move_to_policy_index(move, node.board)
@@ -488,10 +566,10 @@ class MCTS:
 
             prior = float(legal_policy[action_idx])
 
-            # Lazy child: no board copy! The board will be materialized
-            # on first access via the MCTSNode.board property, which walks
-            # up to parent.board (with its full move history for 3-fold
-            # detection), copies with stack=True, and pushes the move.
+            # Lazy child: no board copy! The board will be materialised
+            # on first access via the MCTSNode.board property, which
+            # copies the parent's board (already materialised since
+            # the parent was expanded) with stack=True and pushes.
             child = MCTSNode(parent=node, move=move, prior=prior)
             node.children[action_idx] = child
 
