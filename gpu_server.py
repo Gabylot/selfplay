@@ -40,7 +40,7 @@ def warmup_shaders(network, device, batch_sizes=(1, 8, 16, 32, 64, 128)):
     network.eval()
     with torch.no_grad():
         for bs in batch_sizes:
-            dummy = torch.randn(bs, 20, 8, 8, device=device)
+            dummy = torch.randn(bs, 20, 8, 8, device=device, dtype=torch.float16)
             for _ in range(5):  # enough to stabilize the shader cache
                 _ = network(dummy)
 
@@ -104,6 +104,7 @@ class GPUInferenceServer:
             value_fc_size=self.config.network.value_fc_size,
         ).to(device)
         net.eval()
+        net = net.half()
 
         # Pre-warm shaders
         print(f"[GPU-Server] Pre-warming shaders for batch sizes: {self.prewarm_sizes}")
@@ -113,7 +114,7 @@ class GPUInferenceServer:
         # Verify the fast path is stable after warming
         with torch.no_grad():
             for bs in self.prewarm_sizes:
-                dummy = torch.randn(bs, 20, 8, 8, device=device)
+                dummy = torch.randn(bs, 20, 8, 8, device=device, dtype=torch.float16)
                 times = []
                 for _ in range(5):
                     t = time.perf_counter()
@@ -213,12 +214,12 @@ class GPUInferenceServer:
         Sends a single response ``(request_id, policies, values)`` back to
         the worker, where ``policies.shape == (N, 4672)``.
         """
-        states_t = torch.from_numpy(states).float().to(device)
+        states_t = torch.from_numpy(states).float().to(device).half()
 
         with torch.no_grad():
             policy_logits, values = net(states_t)
-            policies = F.softmax(policy_logits, dim=1).cpu().numpy()
-            values = values.squeeze(-1).cpu().numpy()
+            policies = F.softmax(policy_logits, dim=1).float().cpu().numpy()
+            values = values.float().squeeze(-1).cpu().numpy()
 
         try:
             self.response_queues[worker_id].put_nowait(
@@ -235,12 +236,12 @@ class GPUInferenceServer:
         aggregated by the timer).
         """
         states = np.stack([r[2] for r in batch], axis=0)  # (N, 20, 8, 8)
-        states_t = torch.from_numpy(states).float().to(device)
+        states_t = torch.from_numpy(states).float().to(device).half()
 
         with torch.no_grad():
             policy_logits, values = net(states_t)
-            policies = F.softmax(policy_logits, dim=1).cpu().numpy()
-            values = values.squeeze(-1).cpu().numpy()
+            policies = F.softmax(policy_logits, dim=1).float().cpu().numpy()
+            values = values.float().squeeze(-1).cpu().numpy()
 
         # Distribute results to per-worker response queues
         for i, (worker_id, request_id, _) in enumerate(batch):

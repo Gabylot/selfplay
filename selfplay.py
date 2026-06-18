@@ -323,7 +323,8 @@ def _worker_process(worker_id, task_queue, result_queue, config_dict, shutdown_e
             num_value_channels=config.network.num_value_channels,
             value_fc_size=config.network.value_fc_size,
         )
-        n.eval(); return n
+        n.eval()
+        return n
 
     net_a = make_net(); net_b = make_net()
 

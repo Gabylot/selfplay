@@ -91,34 +91,17 @@ class AlphaZeroNet(nn.Module):
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
     
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Forward pass.
-        
-        Args:
-            x: Input tensor of shape (batch, 20, 8, 8)
-        
-        Returns:
-            policy_logits: (batch, 4672) raw logits for move probabilities
-            value: (batch, 1) scalar in [-1, 1]
-        """
-        # Input convolution
+    def forward(self, x):
         x = F.relu(self.input_bn(self.input_conv(x)))
-        
-        # Residual blocks
         for block in self.res_blocks:
             x = block(x)
-        
-        # Policy head
         policy = F.relu(self.policy_bn(self.policy_conv(x)))
         policy = policy.view(policy.size(0), -1)
         policy_logits = self.policy_fc(policy)
-        
-        # Value head
         value = F.relu(self.value_bn(self.value_conv(x)))
         value = value.view(value.size(0), -1)
         value = F.relu(self.value_fc1(value))
         value = torch.tanh(self.value_fc2(value))
-        
         return policy_logits, value
     
     def predict(self, state: np.ndarray) -> Tuple[np.ndarray, float]:
