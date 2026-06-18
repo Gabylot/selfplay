@@ -369,6 +369,65 @@ def test_get_terminal_value_directly():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Test 15: MCTS naturally prefers the checkmate move (without forced override)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_mcts_prefers_checkmate_move():
+    """MCTS should naturally visit the checkmate move most, even without the forced
+    checkmate override.  This validates that the PUCT sign is correct.
+    """
+    board = chess.Board("6k1/5ppp/8/8/8/8/8/R3K3 w Qq - 0 1")
+
+    mcts = MCTS(MockNetwork(), num_simulations=100,
+                dirichlet_alpha=0.0, dirichlet_epsilon=0.0)
+
+    # ---- Disable the forced-checkmate shortcut ----
+    original_find = mcts._find_checkmate_child
+    mcts._find_checkmate_child = lambda root: None
+
+    try:
+        root = mcts.get_root(board)
+        mcts.search(root)
+
+        # Find the checkmate child
+        mate_child = None
+        for child in root.children.values():
+            if child.move.uci() == "a1a8":
+                mate_child = child
+                break
+
+        assert mate_child is not None, "Checkmate move a1a8 should be a child"
+
+        # Print full child statistics for diagnostics
+        print("\n  Root children (move, visits N, Q, prior P):")
+        children_sorted = sorted(root.children.values(), key=lambda c: c.N, reverse=True)
+        for child in children_sorted:
+            print(f"    {child.move.uci():>5s}  N={child.N:4d}  Q={child.Q:+7.4f}  P={child.P:.4f}")
+
+        # ---- Assertions ----
+        # 1. The checkmate child should have Q = -1.0 (Black to move loses)
+        assert abs(mate_child.Q - (-1.0)) < 0.01, \
+            f"Checkmate child Q should be -1.0, got {mate_child.Q}"
+
+        # 2. It should have the highest visit count (engine prefers it)
+        max_N = max(child.N for child in root.children.values())
+        assert mate_child.N == max_N, \
+            f"Checkmate child should have highest visits ({mate_child.N} vs {max_N})"
+
+        # 3. No other child should come close (optional, just to be safe)
+        other_visits = [c.N for c in root.children.values() if c.move.uci() != "a1a8"]
+        if other_visits:
+            assert mate_child.N > sum(other_visits) * 0.5, \
+                "Checkmate child should dominate visits"
+
+        print(f"  PASS: Checkmate move a1a8 gets {mate_child.N} visits (Q={mate_child.Q})")
+
+    finally:
+        # Restore the original method
+        mcts._find_checkmate_child = original_find
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Main
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -393,6 +452,7 @@ if __name__ == "__main__":
         ("test_checkmate_value_sign", test_checkmate_value_sign),
         ("test_backprop_sign_flip", test_backprop_sign_flip),
         ("test_get_terminal_value_directly", test_get_terminal_value_directly),
+        ("test_mcts_prefers_checkmate_move", test_mcts_prefers_checkmate_move),
     ]
 
     passed = 0

@@ -27,7 +27,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from encoding import (
     move_to_policy_index, policy_index_to_move, board_to_tensor,
     get_legal_move_mask, get_all_policy_indices, NUM_ACTIONS,
-    _find_queen_move_plane, _find_knight_move_plane,
+    MOVE_PLANE_LUT, QUEEN_DIRECTIONS,                          # <-- for LUT validation test
     UNDERPROMOTION_OFFSETS, UNDERPROMOTION_DIRS, UNDERPROMOTION_PIECES,
 )
 from mcts import MCTS, MCTSNode
@@ -201,19 +201,23 @@ def test_endgame_positions():
 
 
 def test_queen_move_plane_all_distances():
-    """Test that _find_queen_move_plane handles all 8 directions × 7 distances."""
-    for d_idx, (qdr, qdc) in enumerate([
-        (-1, 0), (-1, 1), (0, 1), (1, 1), (1, 0), (1, -1), (0, -1), (-1, -1)
-    ]):
-        for dist in range(1, 8):
-            dr = qdr * dist
-            dc = qdc * dist
-            plane = _find_queen_move_plane(dr, dc)
-            expected = d_idx * 7 + (dist - 1)
-            assert plane == expected, (
-                f"Queen move direction {d_idx} ({qdr},{qdc}), "
-                f"dist={dist}: got {plane}, expected {expected}"
-            )
+    """Validate queen‑move LUT entries (replaces old _find_queen_move_plane test)."""
+    for from_rank in range(8):
+        for from_file in range(8):
+            from_sq = chess.square(from_file, from_rank)
+            for d_idx, (qdr, qdc) in enumerate(QUEEN_DIRECTIONS):
+                for dist in range(1, 8):
+                    to_rank = from_rank + qdr * dist
+                    to_file = from_file + qdc * dist
+                    if not (0 <= to_rank < 8 and 0 <= to_file < 8):
+                        break
+                    to_sq = chess.square(to_file, to_rank)
+                    plane = MOVE_PLANE_LUT[from_sq, to_sq]
+                    expected = d_idx * 7 + (dist - 1)
+                    assert plane == expected, (
+                        f"Queen move {from_sq}->{to_sq} (dir {d_idx}, dist {dist}): "
+                        f"LUT has {plane}, expected {expected}"
+                    )
 
 
 # =============================================================
