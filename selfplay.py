@@ -273,6 +273,12 @@ def self_play_game(network, config, on_move=None):
         dirichlet_epsilon=config.mcts.dirichlet_epsilon,
         batch_size=getattr(config.mcts,'batch_size',1),
         c_virtual_loss=getattr(config.mcts,'c_virtual_loss',0.5),
+        # ---- NEW: pass game‑length and adjudication parameters ----
+        max_game_length=config.selfplay.max_game_length,
+        adjudicate_material=config.selfplay.adjudicate_material,
+        piece_values=config.selfplay.piece_values,
+        adjudicate_graded=getattr(config.selfplay, 'adjudicate_graded', True),
+        adjudicate_scaling=getattr(config.selfplay, 'adjudicate_scaling', 9.0),
     )
     return play_one_game(
         mcts_engine=mcts_engine,
@@ -335,6 +341,12 @@ def _worker_process(worker_id, task_queue, result_queue, config_dict, shutdown_e
             dirichlet_epsilon=config.mcts.dirichlet_epsilon if noise else 0.0,
             batch_size=getattr(config.mcts,'batch_size',1),
             c_virtual_loss=getattr(config.mcts,'c_virtual_loss',0.5),
+            # ---- NEW: pass game‑length and adjudication parameters ----
+            max_game_length=config.selfplay.max_game_length,
+            adjudicate_material=config.selfplay.adjudicate_material,
+            piece_values=config.selfplay.piece_values,
+            adjudicate_graded=getattr(config.selfplay, 'adjudicate_graded', True),
+            adjudicate_scaling=getattr(config.selfplay, 'adjudicate_scaling', 9.0),
         )
 
     while not shutdown_event.is_set():

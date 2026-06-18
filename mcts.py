@@ -9,6 +9,7 @@ Implements the AlphaZero PUCT variant with optional batched inference:
   access, saving ~24% CPU by avoiding copies for never-visited children.
 - Cached ``is_game_over`` and terminal value on each node to eliminate
   redundant python-chess calls during repeated leaf evaluations.
+- **NEW**: respects `max_game_length` with configurable adjudication.
 """
 
 import math
@@ -21,6 +22,31 @@ from encoding import (
     move_to_policy_index, policy_index_to_move, NUM_ACTIONS
 )
 from network import AlphaZeroNet
+
+
+# ---- Helper for material adjudication (copied from selfplay.py to avoid circular import) ----
+def adjudicate_by_material(board, piece_values, graded=False, scaling=9.0):
+    """Return +1/-1/0 (or tanh‑scaled) based on material difference."""
+    w = b = 0
+    for sq in chess.SQUARES:
+        p = board.piece_at(sq)
+        if p is None:
+            continue
+        v = piece_values.get(p.symbol().upper(), 0)
+        if p.color == chess.WHITE:
+            w += v
+        else:
+            b += v
+    diff = w - b
+    if graded:
+        if diff == 0:
+            return 0.0
+        return float(np.tanh(diff / scaling))
+    if diff > 0:
+        return 1.0
+    if diff < 0:
+        return -1.0
+    return 0.0
 
 
 class MCTSNode:
@@ -92,6 +118,15 @@ class MCTS:
     Supports both sequential (batch_size=1) and batched (batch_size>1) modes.
     Batched mode uses virtual loss to collect multiple leaf nodes before
     evaluating them together in a single network forward pass.
+
+    **NEW** parameters for respecting self‑play game‑length limit:
+        max_game_length: int – number of half‑moves after which the game is
+                          adjudicated (material or draw).
+        adjudicate_material: bool – if True, use material to decide winner;
+                               if False, treat as draw (0.0).
+        piece_values: dict – mapping from piece symbol to material points.
+        adjudicate_graded: bool – if True, use tanh scaling; else flat ±1.
+        adjudicate_scaling: float – tanh denominator (only if graded).
     """
 
     def __init__(self,
@@ -101,7 +136,13 @@ class MCTS:
                  dirichlet_alpha: float = 0.3,
                  dirichlet_epsilon: float = 0.25,
                  batch_size: int = 1,
-                 c_virtual_loss: float = 0.5):
+                 c_virtual_loss: float = 0.5,
+                 # ---- NEW parameters ----
+                 max_game_length: int = 150,
+                 adjudicate_material: bool = True,
+                 piece_values: Optional[dict] = None,
+                 adjudicate_graded: bool = True,
+                 adjudicate_scaling: float = 9.0):
         """
         Args:
             network: The neural network for position evaluation
@@ -112,6 +153,11 @@ class MCTS:
             batch_size: Number of leaves to collect before network eval.
                        1 = sequential (no virtual loss). >1 = batched inference.
             c_virtual_loss: Virtual loss penalty constant for batched mode.
+            max_game_length: Maximum half‑moves before adjudication.
+            adjudicate_material: Whether to decide winner by material at limit.
+            piece_values: Material values for adjudication.
+            adjudicate_graded: Use tanh grading (True) or ±1 (False).
+            adjudicate_scaling: Scaling for tanh (if graded).
         """
         self.network = network
         self.num_simulations = num_simulations
@@ -120,6 +166,13 @@ class MCTS:
         self.dirichlet_epsilon = dirichlet_epsilon
         self.batch_size = batch_size
         self.c_virtual_loss = c_virtual_loss
+
+        # ---- NEW attributes ----
+        self.max_game_length = max_game_length
+        self.adjudicate_material = adjudicate_material
+        self.piece_values = piece_values or {'P': 1, 'N': 3, 'B': 3, 'R': 5, 'Q': 9}
+        self.adjudicate_graded = adjudicate_graded
+        self.adjudicate_scaling = adjudicate_scaling
 
     def get_root(self, board: chess.Board) -> MCTSNode:
         """Create a root node for the given board (eagerly stores the board)."""
@@ -265,8 +318,8 @@ class MCTS:
             effective_N = child.N + child.virtual_loss
 
             # PUCT formula with virtual loss penalty
-            ucb = child.Q + self.c_puct * child.P * sqrt_parent_n / (1 + effective_N) \
-                  - self.c_virtual_loss * child.virtual_loss
+            ucb = -child.Q + self.c_puct * child.P * sqrt_parent_n / (1 + effective_N) \
+                - self.c_virtual_loss * child.virtual_loss
             if ucb > best_score:
                 best_score = ucb
                 best_child = child
@@ -309,8 +362,8 @@ class MCTS:
         """Evaluate a batch of leaf nodes.
 
         Terminal nodes are those where the game is over, a threefold repetition
-        has occurred, or the 50‑move rule has been exceeded.  These skip the
-        network and return the game result directly.
+        has occurred, the 50‑move rule has been exceeded, **or** the maximum
+        game length has been reached (adjudicated according to config).
 
         Non‑terminal, unexpanded leaves are stacked and evaluated in one
         batched network call.
@@ -320,12 +373,13 @@ class MCTS:
         expandable_nodes = []
 
         for i, node in enumerate(leaf_nodes):
-            # ---- Terminal check: only ACTUAL game‑ending conditions ----
+            # ---- Terminal check: ACTUAL game‑ending + max_length ----
             if node._game_over_cached is None:
                 node._game_over_cached = (
-                    node.board.is_game_over() or       # mate, stalemate, 75‑move, etc.
-                    node.board.is_repetition(3) or     # 3‑fold repetition already happened
-                    node.board.is_fifty_moves()        # half‑move clock ≥ 100
+                    node.board.is_game_over() or
+                    node.board.is_repetition(3) or
+                    node.board.is_fifty_moves() or
+                    node.board.ply() >= self.max_game_length          # <-- NEW
                 )
 
             if node._game_over_cached:
@@ -361,13 +415,16 @@ class MCTS:
         If the node is a terminal position, returns the game result
         without querying the network.  Terminal state is cached on the
         node to avoid redundant ``is_game_over()`` calls.
+
+        **NEW** now also checks for `max_game_length`.
         """
         # Check for terminal position -- cache result on node
         if node._game_over_cached is None:
             node._game_over_cached = (
                 node.board.is_game_over() or
                 node.board.is_repetition(3) or
-                node.board.is_fifty_moves()
+                node.board.is_fifty_moves() or
+                node.board.ply() >= self.max_game_length          # <-- NEW
             )
         if node._game_over_cached:
             return self._get_terminal_value(node)
@@ -448,8 +505,30 @@ class MCTS:
         return float(value)
 
     def _get_terminal_value(self, node):
+        """Return the terminal value of a node.
+
+        **NEW**: if the node is at the maximum game length, adjudicate
+        according to `adjudicate_material` and the associated parameters.
+        Otherwise, use the normal chess result.
+        """
         if node._terminal_value_cached is not None:
             return node._terminal_value_cached
+
+        # ---- NEW: handle max_length termination ----
+        if node.board.ply() >= self.max_game_length:
+            if self.adjudicate_material:
+                val = adjudicate_by_material(
+                    node.board,
+                    self.piece_values,
+                    graded=self.adjudicate_graded,
+                    scaling=self.adjudicate_scaling
+                )
+            else:
+                val = 0.0   # draw
+            node._terminal_value_cached = val
+            return val
+
+        # Otherwise, normal chess outcome
         result = node.board.result()
         if result == "1-0":
             val = 1.0 if node.board.turn == chess.WHITE else -1.0

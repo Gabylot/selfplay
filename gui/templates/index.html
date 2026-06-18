@@ -467,7 +467,7 @@ function inl(st,i){
   if(!st.mcts||i>=st.mcts.length)return'';
   const ms=st.mcts[i]; if(!ms||!ms.selected_move)return'';
   const c=(ms.candidates||[]).find(x=>x.move===ms.selected_move);
-  if(!c)return''; return` (N:${c.N} Q:${c.Q.toFixed(2)})`;
+  if(!c)return''; return` (N:${c.N} Q:${(-c.Q).toFixed(2)})`;
 }
 
 function renderMCTS(st,elId){
@@ -478,7 +478,7 @@ function renderMCTS(st,elId){
   let h='<table><thead><tr><th>Move</th><th>N</th><th>W</th><th>Q</th><th>P</th></tr></thead><tbody>';
   for(const c of ms.candidates){
     const s=c.move===ms.selected_move?' class="sel"':'';
-    h+=`<tr${s}><td>${c.move}</td><td>${c.N}</td><td>${c.W.toFixed(2)}</td><td>${c.Q.toFixed(2)}</td><td>${c.P.toFixed(3)}</td></tr>`;
+    h+=`<tr${s}><td>${c.move}</td><td>${c.N}</td><td>${(-c.W).toFixed(2)}</td><td>${(-c.Q).toFixed(2)}</td><td>${c.P.toFixed(3)}</td></tr>`;
   }
   el.innerHTML=h+'</tbody></table>';
 }
