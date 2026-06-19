@@ -85,12 +85,11 @@ def _underpromotion_plane(piece_type, dir_idx):
 # Precomputed 64x64 lookup table for queen-like + knight moves
 MOVE_PLANE_LUT = np.full((64, 64), -1, dtype=np.int16)
 
-
 def _build_plane_lut():
-    """Fill MOVE_PLANE_LUT for all valid queen-like and knight moves."""
     for from_rank in range(8):
         for from_file in range(8):
             from_sq = chess.square(from_file, from_rank)
+            base_idx = from_sq * 64
             for d_idx, (qdr, qdc) in enumerate(QUEEN_DIRECTIONS):
                 for dist in range(1, 8):
                     to_rank = from_rank + qdr * dist
@@ -99,14 +98,13 @@ def _build_plane_lut():
                         break
                     to_sq = chess.square(to_file, to_rank)
                     plane = d_idx * 7 + (dist - 1)
-                    MOVE_PLANE_LUT[from_sq, to_sq] = plane
+                    MOVE_PLANE_LUT[base_idx + to_sq] = plane
             for k_idx, (kdr, kdc) in enumerate(KNIGHT_OFFSETS):
                 to_rank = from_rank + kdr
                 to_file = from_file + kdc
                 if 0 <= to_rank < 8 and 0 <= to_file < 8:
                     to_sq = chess.square(to_file, to_rank)
-                    MOVE_PLANE_LUT[from_sq, to_sq] = 56 + k_idx
-
+                    MOVE_PLANE_LUT[base_idx + to_sq] = 56 + k_idx
 
 _build_plane_lut()
 
@@ -163,26 +161,23 @@ def board_to_tensor_batch(board: chess.Board) -> np.ndarray:
 
 
 # ---------------------------------------------------------------------------
-#  Move ↔ Policy Index  (no RustBoard, no .uci() parsing)
+#  Move → Policy Index  (optimised)
 # ---------------------------------------------------------------------------
 def move_to_policy_index(move, board: chess.Board) -> int:
-    """
-    Encode a chess.Move into a flat policy index (0..4671).
-    Expects a normal python‑chess Move object.
-    """
     from_sq = move.from_square
     to_sq = move.to_square
-    prom = move.promotion          # None or a chess piece type (int)
+    prom = move.promotion
 
-    # Only underpromotions to knight/bishop/rook need special encoding.
-    # Queen promotions are plain queen‑like moves already in the LUT.
+    # Fast path: non‑underpromotion (incl. queen promos)
     if prom is not None and prom != chess.QUEEN:
-        # --- underpromotion branch (rare) ---
+        # Rare underpromotion branch – still fast but kept separate
         from_rank, from_file = chess.square_rank(from_sq), chess.square_file(from_sq)
         to_rank,   to_file   = chess.square_rank(to_sq),   chess.square_file(to_sq)
         dr, dc = to_rank - from_rank, to_file - from_file
 
-        if board.turn == chess.WHITE:
+        turn = board.turn
+        if turn == chess.WHITE:
+            # white pawn forward: dr == 1
             if dr == 1:
                 if dc == 0:       dir_idx = 0
                 elif dc == -1:    dir_idx = 1
@@ -193,16 +188,20 @@ def move_to_policy_index(move, board: chess.Board) -> int:
         else:  # BLACK
             if dr == -1:
                 if dc == 0:       dir_idx = 0
-                elif dc == 1:     dir_idx = 1    # forward-left for black
-                elif dc == -1:    dir_idx = 2    # forward-right for black
+                elif dc == 1:     dir_idx = 1    # black forward-left
+                elif dc == -1:    dir_idx = 2    # black forward-right
                 else: raise ValueError(f"Invalid underpromotion move: {move}")
             else:
                 raise ValueError(f"Invalid underpromotion move: {move}")
 
-        plane = _underpromotion_plane(prom, dir_idx)
+        # Inline the piece index + dir offset
+        # piece_idx: knight=0, bishop=1, rook=2
+        piece_idx = (prom - chess.KNIGHT)  # if prom is KNIGHT(2), BISHOP(3), ROOK(4)
+        # mapping: 2->0, 3->1, 4->2  => (prom - 2)
+        plane = 64 + piece_idx * 3 + dir_idx
     else:
-        # --- queen‑like, knight, or queen promotion: LUT lookup ---
-        plane = MOVE_PLANE_LUT[from_sq, to_sq]
+        # Queen-like, knight, or queen promotion: flat LUT
+        plane = MOVE_PLANE_LUT[from_sq * 64 + to_sq]
         if plane == -1:
             raise ValueError(f"Cannot encode move {move} (no LUT entry for {from_sq}->{to_sq})")
 
