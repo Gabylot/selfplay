@@ -83,7 +83,7 @@ def _underpromotion_plane(piece_type, dir_idx):
 
 
 # Precomputed 64x64 lookup table for queen-like + knight moves
-MOVE_PLANE_LUT = np.full((64, 64), -1, dtype=np.int16)
+MOVE_PLANE_LUT = np.full(64 * 64, -1, dtype=np.int16)
 
 def _build_plane_lut():
     for from_rank in range(8):
