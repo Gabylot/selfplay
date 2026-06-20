@@ -65,6 +65,7 @@ class MCTSNode:
                  'N', 'W', 'Q', 'P', 'P_orig', 'is_expanded',
                  'legal_moves_cached', 'visit_count', 'virtual_loss',
                  '_game_over_cached', '_terminal_value_cached',
+                 '_checkmate_child_cached', '_checkmate_child_move',
                  '_position_hash']
 
     def __init__(self, board: Optional[chess.Board] = None,
@@ -89,6 +90,8 @@ class MCTSNode:
         self._game_over_cached: Optional[bool] = None  # None = not yet checked
         self._terminal_value_cached: Optional[float] = None  # Cached terminal value
         self._position_hash: Optional[int] = None  # Zobrist hash, cached on first materialisation
+        self._checkmate_child_cached: bool = False  # Whether a checkmate child has been found (cached)
+        self._checkmate_child_move: Optional[chess.Move] = None  # The move that leads to checkmate, if found
 
     @property
     def board(self) -> chess.Board:
@@ -272,6 +275,8 @@ class MCTS:
                 # N/W/Q are intentionally kept so the next search
                 # benefits from accumulated visit information.
                 child.visit_count = 0
+                child._checkmate_child_cached = False
+                child._checkmate_child_move = None
 
                 return child
 
@@ -687,9 +692,16 @@ class MCTS:
         Returns:
             The checkmate move if found, None otherwise.
         """
+        # Return cached result if available (prevets second child scan)
+        if root._checkmate_child_cached:
+            return root._checkmate_child_move
+
         for child in root.children.values():
             if child.N > 0 and child.board.is_checkmate():
                 return child.move
+        # No checkmate found - cache the negative results as well
+        root._checkmate_child_cached = True
+        root._checkmate_child_move = None
         return None
 
     def _get_visit_policy(self, root: MCTSNode) -> Tuple[np.ndarray, chess.Move]:
