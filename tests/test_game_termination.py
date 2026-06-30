@@ -212,7 +212,7 @@ def test_queen_move_plane_all_distances():
                     if not (0 <= to_rank < 8 and 0 <= to_file < 8):
                         break
                     to_sq = chess.square(to_file, to_rank)
-                    plane = MOVE_PLANE_LUT[from_sq * 64 + to_sq]   # ← fix
+                    plane = MOVE_PLANE_LUT[from_sq, to_sq]
                     expected = d_idx * 7 + (dist - 1)
                     assert plane == expected, (
                         f"Queen move {from_sq}->{to_sq} (dir {d_idx}, dist {dist}): "

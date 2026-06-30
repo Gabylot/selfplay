@@ -354,6 +354,9 @@ def run_training(config, gui_enabled=False, num_workers=None):
                         'game_label': f"Ref {gi+1}/{n_ref}",
                     })
 
+                # Push both latest and best weights to GPU server for eval
+                psp.push_eval_weights(network, best_network)
+
                 dispatched = psp.dispatch_eval_games(eval_tasks)
                 print(f"  Dispatched {dispatched} eval games to {num_workers} workers")
 

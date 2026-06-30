@@ -312,8 +312,10 @@ def _worker_process(worker_id, task_queue, result_queue, config_dict, shutdown_e
     use_gpu = (getattr(config, 'inference', None)
                and getattr(config.inference, 'use_gpu', False))
     inference_client = None
+    inference_client_b = None
     if use_gpu and request_queue is not None and response_queue is not None:
-        inference_client = InferenceClient(worker_id, request_queue, response_queue)
+        inference_client = InferenceClient(worker_id, request_queue, response_queue, net_id='a')
+        inference_client_b = InferenceClient(worker_id, request_queue, response_queue, net_id='b')
 
     def make_net():
         n = AlphaZeroNet(
@@ -415,8 +417,13 @@ def _worker_process(worker_id, task_queue, result_queue, config_dict, shutdown_e
                 })
 
             if eval_type == 'gating':
-                load(net_b, task['weights_b'])
-                ea = mcts(net_a, False); eb = mcts(net_b, False)
+                if inference_client is not None:
+                    # GPU mode: use inference clients instead of local nets
+                    ea = mcts(inference_client, False)
+                    eb = mcts(inference_client_b, False)
+                else:
+                    load(net_b, task['weights_b'])
+                    ea = mcts(net_a, False); eb = mcts(net_b, False)
                 board = chess.Board(); mc = 0
                 root_a = None; root_b = None
                 while not board.is_game_over() and mc < config.selfplay.max_game_length:
@@ -449,7 +456,10 @@ def _worker_process(worker_id, task_queue, result_queue, config_dict, shutdown_e
             else:  # reference
                 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
                 from evaluation import alpha_beta_best_move
-                ea = mcts(net_a, False)
+                if inference_client is not None:
+                    ea = mcts(inference_client, False)
+                else:
+                    ea = mcts(net_a, False)
                 board = chess.Board(); mc = 0
                 root_net = None
                 while not board.is_game_over() and mc < config.selfplay.max_game_length:
@@ -523,6 +533,7 @@ class ParallelSelfPlay:
         if self._use_gpu:
             self._request_q = mp.Queue()
             self._weight_q = mp.Queue()
+            self._weight_q_b = mp.Queue()
             self._response_qs = {}
             self._gpu_ready = mp.Event()
             self._gpu_shutdown = mp.Event()
@@ -554,6 +565,7 @@ class ParallelSelfPlay:
             request_queue=self._request_q,
             response_queues=self._response_qs,
             weight_queue=self._weight_q,
+            weight_queue_b=self._weight_q_b,
             ready_event=self._gpu_ready,
             shutdown_event=self._gpu_shutdown,
         )
@@ -587,6 +599,23 @@ class ParallelSelfPlay:
             except queue.Full: pass
 
     def push_weights(self, network): self.push_selfplay(network)
+
+    def push_eval_weights(self, latest_network, best_network):
+        """Push both latest and best weights to the GPU server for eval."""
+        if not self._use_gpu:
+            return
+        wb_latest = self._serialize_weights(latest_network)
+        wb_best = self._serialize_weights(best_network)
+        # Drain and push latest
+        while not self._weight_q.empty():
+            try: self._weight_q.get_nowait()
+            except: pass
+        self._weight_q.put(wb_latest)
+        # Drain and push best
+        while not self._weight_q_b.empty():
+            try: self._weight_q_b.get_nowait()
+            except: pass
+        self._weight_q_b.put(wb_best)
 
     def dispatch_eval_games(self, tasks):
         done = 0
