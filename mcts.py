@@ -9,7 +9,11 @@ Implements the AlphaZero PUCT variant with optional batched inference:
   access, saving ~24% CPU by avoiding copies for never-visited children.
 - Cached ``is_game_over`` and terminal value on each node to eliminate
   redundant python-chess calls during repeated leaf evaluations.
-- **NEW**: respects `max_game_length` with configurable adjudication.
+- Respects `max_game_length` with configurable adjudication.
+- **NEW**: gathers an 8-frame position history (current + 7 prior) for
+  every leaf passed to the network, reconstructed by walking the in-tree
+  parent chain and falling back to the real game history at the tree's
+  root, matching the AlphaZero paper's input representation.
 """
 
 import math
@@ -19,7 +23,8 @@ from typing import Optional, Tuple, List, Dict
 
 from encoding import (
     board_to_tensor, get_legal_move_mask, get_legal_move_mask_from_moves,
-    move_to_policy_index, policy_index_to_move, NUM_ACTIONS
+    move_to_policy_index, policy_index_to_move, NUM_ACTIONS,
+    piece_planes, history_from_board, NUM_HISTORY_FRAMES,
 )
 from network import AlphaZeroNet
 
@@ -65,8 +70,7 @@ class MCTSNode:
                  'N', 'W', 'Q', 'P', 'P_orig', 'is_expanded',
                  'legal_moves_cached', 'visit_count', 'virtual_loss',
                  '_game_over_cached', '_terminal_value_cached',
-                 '_checkmate_child_cached', '_checkmate_child_move',
-                 '_position_hash']
+                 '_position_hash', '_cached_history']
 
     def __init__(self, board: Optional[chess.Board] = None,
                  parent: Optional['MCTSNode'] = None,
@@ -90,8 +94,11 @@ class MCTSNode:
         self._game_over_cached: Optional[bool] = None  # None = not yet checked
         self._terminal_value_cached: Optional[float] = None  # Cached terminal value
         self._position_hash: Optional[int] = None  # Zobrist hash, cached on first materialisation
-        self._checkmate_child_cached: bool = False  # Whether a checkmate child has been found (cached)
-        self._checkmate_child_move: Optional[chess.Move] = None  # The move that leads to checkmate, if found
+        # Cache of reconstructed real-game history piece-planes. Only ever
+        # populated on a tree ROOT node (see MCTS._gather_history), so that
+        # the (potentially expensive) move-stack walk happens once per move
+        # rather than once per leaf expansion under that root.
+        self._cached_history: Optional[List[np.ndarray]] = None
 
     @property
     def board(self) -> chess.Board:
@@ -140,7 +147,7 @@ class MCTS:
     Batched mode uses virtual loss to collect multiple leaf nodes before
     evaluating them together in a single network forward pass.
 
-    **NEW** parameters for respecting self‑play game‑length limit:
+    Parameters for respecting self‑play game‑length limit:
         max_game_length: int – number of half‑moves after which the game is
                           adjudicated (material or draw).
         adjudicate_material: bool – if True, use material to decide winner;
@@ -233,6 +240,55 @@ class MCTS:
             current = current.parent
         return n >= count
 
+    def _gather_history(self, node: MCTSNode,
+                         max_frames: int = NUM_HISTORY_FRAMES - 1) -> List[np.ndarray]:
+        """Collect up to `max_frames` piece-plane arrays preceding `node`,
+        most-recent-first.
+
+        Strategy:
+        1. Walk the in-tree parent chain (these are real positions that
+           occurred along this exact search path, cheap to read since
+           parent boards are already materialised during search).
+        2. If the tree isn't deep enough yet (e.g. near the root), fall
+           back to the actual game history stored on the search tree's
+           root board (which carries the full move stack — see
+           `recycle_tree`, which always rebuilds the promoted root with
+           `stack=True`). This fallback is reconstructed once per move
+           and cached on the root node, not recomputed per leaf.
+
+        Args:
+            node: The node whose preceding history is needed (history is
+                relative to `node`, i.e. does NOT include node's own
+                position).
+            max_frames: How many prior frames to gather (default: enough
+                to fill out the full NUM_HISTORY_FRAMES stack alongside
+                node's own current-position frame).
+
+        Returns:
+            List of (12, 8, 8) float32 arrays, most-recent-first. May be
+            shorter than max_frames if the game itself doesn't have that
+            much history yet (board_to_tensor zero-pads the remainder).
+        """
+        frames: List[np.ndarray] = []
+
+        current = node.parent
+        while current is not None and len(frames) < max_frames:
+            frames.append(piece_planes(current.board))
+            current = current.parent
+
+        if len(frames) < max_frames:
+            # Walk up to the tree root to find the real-game board, then
+            # reconstruct (and cache) its own preceding history.
+            root = node
+            while root.parent is not None:
+                root = root.parent
+            if root._cached_history is None:
+                root._cached_history = history_from_board(root.board, NUM_HISTORY_FRAMES - 1)
+            remaining = max_frames - len(frames)
+            frames.extend(root._cached_history[:remaining])
+
+        return frames
+
     def get_root(self, board: chess.Board) -> MCTSNode:
         """Create a root node for the given board (eagerly stores the board)."""
         root_node = MCTSNode(board.copy())
@@ -248,7 +304,13 @@ class MCTS:
         next search.
 
         The promoted node's parent pointer is cleared and its board is
-        eagerly materialized (since the parent relationship is severed).
+        **always** rebuilt with a full move-stack copy (``stack=True``),
+        even if it was already lazily materialised during search with
+        ``stack=False``. This is required so that the promoted root's
+        board carries the real game history — without it,
+        ``history_from_board()`` (used as the root-level history fallback
+        in ``_gather_history``) would only see the single move just
+        played instead of the actual game so far.
 
         Args:
             root: The current root node (already searched)
@@ -263,20 +325,23 @@ class MCTS:
                 # Detach from parent
                 child.parent = None
 
-                # Eagerly materialize the board since parent relationship is gone
-                if not child._board_ready:
-                    # Use root's board (already materialized) to construct child board
-                    b = root.board.copy(stack=True)
-                    b.push(move)
-                    child._board = b
-                    child._board_ready = True
+                # Always rebuild with a full-stack copy so the promoted
+                # root carries the complete real-game move history
+                # (needed for history_from_board fallback reconstruction).
+                b = root.board.copy(stack=True)
+                b.push(move)
+                child._board = b
+                child._board_ready = True
+                child._position_hash = b._transposition_key()
+
+                # Any cached history on the old (non-root) child is now
+                # stale/irrelevant — clear it so it gets rebuilt lazily.
+                child._cached_history = None
 
                 # Clear visit_count (backward-compat duplicate of N).
                 # N/W/Q are intentionally kept so the next search
                 # benefits from accumulated visit information.
                 child.visit_count = 0
-                child._checkmate_child_cached = False
-                child._checkmate_child_move = None
 
                 return child
 
@@ -439,6 +504,7 @@ class MCTS:
         expandable_indices = []
         expandable_nodes = []
         expandable_reps = []  # (rep2, rep3) for each expandable node
+        expandable_hist = []  # history frames for each expandable node
 
         for i, node in enumerate(leaf_nodes):
             # ---- Terminal check: ACTUAL game‑ending + max_length ----
@@ -459,6 +525,7 @@ class MCTS:
                 rep2 = self._tree_repetition_check(node, 2)
                 rep3 = self._tree_repetition_check(node, 3)
                 expandable_reps.append((rep2, rep3))
+                expandable_hist.append(self._gather_history(node))
             else:
                 # Node is expanded but terminal (should not happen normally)
                 terminal_values[i] = self._get_terminal_value(node)
@@ -466,8 +533,8 @@ class MCTS:
         # ---- Batched network evaluation for expandable leaves ----
         if expandable_nodes:
             states_list = [
-                board_to_tensor(n.board, repetition_counts=rep)
-                for n, rep in zip(expandable_nodes, expandable_reps)
+                board_to_tensor(n.board, history=h, repetition_counts=rep)
+                for n, rep, h in zip(expandable_nodes, expandable_reps, expandable_hist)
             ]
             states_batch = np.stack(states_list, axis=0)
 
@@ -494,7 +561,8 @@ class MCTS:
         Uses tree-based Zobrist hash repetition detection instead of
         expensive board.is_repetition() stack scanning.
 
-        **NEW** now also checks for `max_game_length`.
+        Also checks for `max_game_length`, and gathers the position
+        history (current + up to 7 prior frames) to pass to the network.
         """
         # Check for terminal position -- cache result on node
         if node._game_over_cached is None:
@@ -510,7 +578,8 @@ class MCTS:
         # Get network prediction
         rep2 = self._tree_repetition_check(node, 2)
         rep3 = self._tree_repetition_check(node, 3)
-        state = board_to_tensor(node.board, repetition_counts=(rep2, rep3))
+        hist = self._gather_history(node)
+        state = board_to_tensor(node.board, history=hist, repetition_counts=(rep2, rep3))
         policy, value = self.network.predict(state)
 
         # Complete expansion using the prediction data
@@ -590,14 +659,14 @@ class MCTS:
     def _get_terminal_value(self, node):
         """Return the terminal value of a node.
 
-        **NEW**: if the node is at the maximum game length, adjudicate
+        If the node is at the maximum game length, adjudicate
         according to `adjudicate_material` and the associated parameters.
         Otherwise, use the normal chess result.
         """
         if node._terminal_value_cached is not None:
             return node._terminal_value_cached
 
-        # ---- NEW: handle max_length termination ----
+        # ---- Handle max_length termination ----
         if node.board.ply() >= self.max_game_length:
             if self.adjudicate_material:
                 val = adjudicate_by_material(
@@ -692,16 +761,9 @@ class MCTS:
         Returns:
             The checkmate move if found, None otherwise.
         """
-        # Return cached result if available (prevets second child scan)
-        if root._checkmate_child_cached:
-            return root._checkmate_child_move
-
         for child in root.children.values():
             if child.N > 0 and child.board.is_checkmate():
                 return child.move
-        # No checkmate found - cache the negative results as well
-        root._checkmate_child_cached = True
-        root._checkmate_child_move = None
         return None
 
     def _get_visit_policy(self, root: MCTSNode) -> Tuple[np.ndarray, chess.Move]:

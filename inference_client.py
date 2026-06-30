@@ -6,15 +6,15 @@ result arrives.
 
 Optimization: ``predict_batch()`` sends the **entire batch as a single
 message** ``(worker_id, request_id, batch_states)`` with shape
-``(N, 20, 8, 8)``, eliminating per-sample IPC overhead.  The GPU server
+``(N, NUM_PLANES, 8, 8)``, eliminating per-sample IPC overhead.  The GPU server
 detects the batch (ndim == 4) and processes it immediately without the
 timer-based aggregation window.
 
 Usage::
 
     client = InferenceClient(worker_id=0, request_queue=q, response_queue=rq)
-    policy, value = client.predict(state)            # single (20,8,8)
-    policies, values = client.predict_batch(states)  # batch (N,20,8,8)
+    policy, value = client.predict(state)            # single (NUM_PLANES,8,8)
+    policies, values = client.predict_batch(states)  # batch (N,NUM_PLANES,8,8)
 """
 
 import numpy as np
@@ -51,7 +51,7 @@ class InferenceClient:
         """Predict policy and value for a single board state.
 
         Args:
-            state: (20, 8, 8) numpy array
+            state: (NUM_PLANES, 8, 8) numpy array
 
         Returns:
             policy: (4672,) numpy array of probabilities
@@ -64,13 +64,13 @@ class InferenceClient:
     def predict_batch(self, states: np.ndarray):
         """Predict policy and value for a batch of board states.
 
-        **Optimization**: sends the entire stacked batch ``(N,20,8,8)``
+        **Optimization**: sends the entire stacked batch ``(N,NUM_PLANES,8,8)``
         as a *single* message to the GPU server, eliminating per-sample
         IPC overhead.  The server detects ndim == 4 and processes it
         immediately without the timer-based aggregation window.
 
         Args:
-            states: (batch, 20, 8, 8) numpy array
+            states: (batch, NUM_PLANES, 8, 8) numpy array
 
         Returns:
             policies: (batch, 4672) numpy array of probabilities

@@ -1,7 +1,12 @@
 """Dual-head ResNet for AlphaZero chess.
 
 Small, CPU-friendly network with:
-- Policy head: outputs move probability distribution over 4672 actions
+- Policy head: fully convolutional, outputs an (8, 8, 73) plane stack that
+  is flattened to a 4672-way move distribution. The (rank, file) position
+  of each output corresponds directly to the "pick up a piece here" square,
+  matching encoding.py's `from_sq * 73 + plane` index convention (note the
+  permute before flattening — without it the flatten order would be
+  plane-major instead of square-major and silently desync from encoding.py).
 - Value head: outputs scalar in [-1, 1] for expected outcome from current player's perspective
 - Random weight initialization (no pretraining)
 """
@@ -38,9 +43,9 @@ class AlphaZeroNet(nn.Module):
     """Dual-head ResNet for chess position evaluation.
     
     Architecture:
-        Input conv (20 -> num_filters)
+        Input conv (NUM_PLANES -> num_filters)
         N residual blocks (num_filters -> num_filters)
-        Policy head: Conv 1x1 -> FC -> 4672 logits
+        Policy head: Conv 3x3 -> Conv 1x1 (73 channels) -> permute -> flatten (4672 logits)
         Value head: Conv 1x1 -> FC -> 1 (tanh)
     """
     
@@ -64,10 +69,13 @@ class AlphaZeroNet(nn.Module):
             ResBlock(num_filters) for _ in range(num_residual_blocks)
         ])
         
-        # Policy head
-        self.policy_conv = nn.Conv2d(num_filters, num_policy_channels, kernel_size=1, bias=False)
+        # Policy head — fully convolutional. The final conv outputs 73
+        # channels (one per move-plane type); spatial position (rank, file)
+        # is preserved throughout, so it directly maps to the "from square"
+        # without any dense layer mixing information across squares.
+        self.policy_conv = nn.Conv2d(num_filters, num_policy_channels, kernel_size=3, padding=1, bias=False)
         self.policy_bn = nn.BatchNorm2d(num_policy_channels)
-        self.policy_fc = nn.Linear(num_policy_channels * 8 * 8, NUM_ACTIONS)
+        self.policy_head = nn.Conv2d(num_policy_channels, 73, kernel_size=1)  # raw logits, no BN/activation after
         
         # Value head
         self.value_conv = nn.Conv2d(num_filters, num_value_channels, kernel_size=1, bias=False)
@@ -95,9 +103,18 @@ class AlphaZeroNet(nn.Module):
         x = F.relu(self.input_bn(self.input_conv(x)))
         for block in self.res_blocks:
             x = block(x)
+
+        # ---- Policy head (fully convolutional) ----
         policy = F.relu(self.policy_bn(self.policy_conv(x)))
-        policy = policy.view(policy.size(0), -1)
-        policy_logits = self.policy_fc(policy)
+        policy = self.policy_head(policy)                  # (N, 73, 8, 8) = (N, plane, rank, file)
+        # encoding.py's move_to_policy_index uses from_sq*73 + plane, i.e.
+        # square-major / plane-minor flattening. Permute to (N, rank, file,
+        # plane) before flattening so the resulting 4672-vector lines up
+        # exactly with that convention.
+        policy = policy.permute(0, 2, 3, 1).contiguous()   # (N, 8, 8, 73)
+        policy_logits = policy.view(policy.size(0), -1)    # (N, 4672)
+
+        # ---- Value head ----
         value = F.relu(self.value_bn(self.value_conv(x)))
         value = value.view(value.size(0), -1)
         value = F.relu(self.value_fc1(value))
@@ -108,7 +125,7 @@ class AlphaZeroNet(nn.Module):
         """Predict policy and value for a single board state.
         
         Args:
-            state: (20, 8, 8) numpy array
+            state: (NUM_PLANES, 8, 8) numpy array
         
         Returns:
             policy: (4672,) numpy array of probabilities
@@ -128,7 +145,7 @@ class AlphaZeroNet(nn.Module):
         """Predict policy and value for a batch of board states.
         
         Args:
-            states: (batch, 20, 8, 8) numpy array
+            states: (batch, NUM_PLANES, 8, 8) numpy array
         
         Returns:
             policies: (batch, 4672) numpy array of probabilities

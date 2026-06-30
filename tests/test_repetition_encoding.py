@@ -1,8 +1,8 @@
 """Tests for repetition encoding planes in board_to_tensor.
 
-Verifies that the new planes 18-19 correctly encode repetition history:
-- Plane 18: is_repetition(2) — position has appeared before
-- Plane 19: is_repetition(3) — on the verge of 3-fold repetition
+Verifies that the new planes 103/104 correctly encode repetition history:
+- Plane 103: is_repetition(2) — position has appeared before
+- Plane 104: is_repetition(3) — on the verge of 3-fold repetition
 """
 
 import sys
@@ -16,10 +16,10 @@ from encoding import board_to_tensor, NUM_PLANES
 
 
 def test_tensor_shape():
-    """Verify the tensor has 20 planes, not 18."""
+    """Verify the tensor has the expected NUM_PLANES channels."""
     board = chess.Board()
     tensor = board_to_tensor(board)
-    assert tensor.shape == (20, 8, 8), f"Expected (20, 8, 8), got {tensor.shape}"
+    assert tensor.shape == (NUM_PLANES, 8, 8), f"Expected (NUM_PLANES, 8, 8), got {tensor.shape}"
     print("  PASS: test_tensor_shape")
 
 
@@ -27,12 +27,12 @@ def test_fresh_position_no_repetition():
     """Starting position has no repetition history — both planes should be 0."""
     board = chess.Board()
     tensor = board_to_tensor(board)
-    assert np.all(tensor[18] == 0.0), "Plane 18 should be 0 for fresh position"
-    assert np.all(tensor[19] == 0.0), "Plane 19 should be 0 for fresh position"
+    assert np.all(tensor[103] == 0.0), "Plane 18 should be 0 for fresh position"
+    assert np.all(tensor[104] == 0.0), "Plane 19 should be 0 for fresh position"
     print("  PASS: test_fresh_position_no_repetition")
 
 
-def test_position_seen_twice_plane18():
+def test_position_seen_twice_plane103():
     """After returning to the starting position once, plane 18 should be 1.0."""
     board = chess.Board()
 
@@ -101,12 +101,12 @@ def test_position_seen_twice_plane18():
     # Now we're back to the starting position (second occurrence)
     assert board.is_repetition(2), "Board should detect 2-fold repetition"
     tensor = board_to_tensor(board)
-    assert np.all(tensor[18] == 1.0), "Plane 18 should be 1.0 for seen-once position"
-    assert np.all(tensor[19] == 0.0), "Plane 19 should be 0.0 (not yet 3-fold)"
-    print("  PASS: test_position_seen_twice_plane18")
+    assert np.all(tensor[103] == 1.0), "Plane 18 should be 1.0 for seen-once position"
+    assert np.all(tensor[104] == 0.0), "Plane 19 should be 0.0 (not yet 3-fold)"
+    print("  PASS: test_position_seen_twice_plane103")
 
 
-def test_position_three_times_plane19():
+def test_position_three_times_plane104():
     """After 3 occurrences of the same position, both planes should be 1.0.
 
     Note: In a real game, is_repetition(3) would also mean is_game_over()
@@ -168,9 +168,9 @@ def test_position_three_times_plane19():
         board.push(m)
 
     tensor = board_to_tensor(board)
-    assert np.all(tensor[18] == 1.0), "Plane 18 should be 1.0 (seen before)"
-    assert np.all(tensor[19] == 1.0), "Line 19 should be 1.0 (3-fold repetition imminent)"
-    print("  PASS: test_position_three_times_plane19")
+    assert np.all(tensor[103] == 1.0), "Plane 18 should be 1.0 (seen before)"
+    assert np.all(tensor[104] == 1.0), "Line 19 should be 1.0 (3-fold repetition imminent)"
+    print("  PASS: test_position_three_times_plane104")
 
 
 def test_nonrepeating_position():
@@ -185,8 +185,8 @@ def test_nonrepeating_position():
         board.push(chess.Move.from_uci(uci))
 
     tensor = board_to_tensor(board)
-    assert np.all(tensor[18] == 0.0), "Plane 18 should be 0 for non-repeating position"
-    assert np.all(tensor[19] == 0.0), "Plane 19 should be 0 for non-repeating position"
+    assert np.all(tensor[103] == 0.0), "Plane 18 should be 0 for non-repeating position"
+    assert np.all(tensor[104] == 0.0), "Plane 19 should be 0 for non-repeating position"
     print("  PASS: test_nonrepeating_position")
 
 
@@ -198,15 +198,15 @@ def test_repetition_plane_is_full_plane():
         board.push(chess.Move.from_uci(uci))
 
     tensor = board_to_tensor(board)
-    plane18 = tensor[18]
-    plane19 = tensor[19]
+    plane103 = tensor[103]
+    plane104 = tensor[104]
 
     # Plane 18 should be all 1.0
-    assert plane18.shape == (8, 8)
-    assert np.all(plane18 == 1.0) or not np.any(plane18 == 1.0), \
+    assert plane103.shape == (8, 8)
+    assert np.all(plane103 == 1.0) or not np.any(plane103 == 1.0), \
         "Plane 18 should be uniform (all 0 or all 1)"
     # Plane 19 should be all 0.0 for double repetition (not triple)
-    assert np.all(plane19 == 0.0), "Plane 19 should be 0 for double repetition"
+    assert np.all(plane104 == 0.0), "Plane 19 should be 0 for double repetition"
     print("  PASS: test_repetition_plane_is_full_plane")
 
 
@@ -293,8 +293,8 @@ if __name__ == "__main__":
     tests = [
         ("test_tensor_shape", test_tensor_shape),
         ("test_fresh_position_no_repetition", test_fresh_position_no_repetition),
-        ("test_position_seen_twice_plane18", test_position_seen_twice_plane18),
-        ("test_position_three_times_plane19", test_position_three_times_plane19),
+        ("test_position_seen_twice_plane103", test_position_seen_twice_plane103),
+        ("test_position_three_times_plane104", test_position_three_times_plane104),
         ("test_nonrepeating_position", test_nonrepeating_position),
         ("test_repetition_plane_is_full_plane", test_repetition_plane_is_full_plane),
         ("test_child_board_repetition_detection", test_child_board_repetition_detection),

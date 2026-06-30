@@ -7,8 +7,8 @@ to eliminate DirectML's lazy-compilation latency spikes.
 Protocol
 --------
 Request  : (worker_id, request_id, state)
-           - state ndim == 3 (20,8,8):   single request (timer-aggregated)
-           - state ndim == 4 (N,20,8,8):  batch request (processed immediately)
+           - state ndim == 3 (NUM_PLANES,8,8):   single request (timer-aggregated)
+           - state ndim == 4 (N,NUM_PLANES,8,8):  batch request (processed immediately)
 Response : (request_id, policy, value)
            - single response:  policy (4672,) ndarray, value float
            - batch response:   policy (N,4672) ndarray, values (N,) ndarray
@@ -24,6 +24,7 @@ import torch
 import torch.nn.functional as F
 
 from network import AlphaZeroNet
+from encoding import NUM_PLANES
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -40,7 +41,7 @@ def warmup_shaders(network, device, batch_sizes=(1, 8, 16, 32, 64, 128)):
     network.eval()
     with torch.no_grad():
         for bs in batch_sizes:
-            dummy = torch.randn(bs, 20, 8, 8, device=device, dtype=torch.float16)
+            dummy = torch.randn(bs, NUM_PLANES, 8, 8, device=device, dtype=torch.float16)
             for _ in range(5):  # enough to stabilize the shader cache
                 _ = network(dummy)
 
@@ -114,7 +115,7 @@ class GPUInferenceServer:
         # Verify the fast path is stable after warming
         with torch.no_grad():
             for bs in self.prewarm_sizes:
-                dummy = torch.randn(bs, 20, 8, 8, device=device, dtype=torch.float16)
+                dummy = torch.randn(bs, NUM_PLANES, 8, 8, device=device, dtype=torch.float16)
                 times = []
                 for _ in range(5):
                     t = time.perf_counter()
@@ -209,7 +210,7 @@ class GPUInferenceServer:
             net.eval()
 
     def _process_single_batch(self, net, device, worker_id, request_id, states):
-        """Process a pre-stacked batch request ``(N, 20, 8, 8)`` immediately.
+        """Process a pre-stacked batch request ``(N, NUM_PLANES, 8, 8)`` immediately.
 
         Sends a single response ``(request_id, policies, values)`` back to
         the worker, where ``policies.shape == (N, 4672)``.
@@ -232,10 +233,10 @@ class GPUInferenceServer:
         """Run a single GPU forward pass and distribute results.
 
         ``batch`` is a list of ``(worker_id, request_id, state)`` tuples
-        where each ``state.shape == (20, 8, 8)`` (individual requests
+        where each ``state.shape == (NUM_PLANES, 8, 8)`` (individual requests
         aggregated by the timer).
         """
-        states = np.stack([r[2] for r in batch], axis=0)  # (N, 20, 8, 8)
+        states = np.stack([r[2] for r in batch], axis=0)  # (N, NUM_PLANES, 8, 8)
         states_t = torch.from_numpy(states).float().to(device).half()
 
         with torch.no_grad():
