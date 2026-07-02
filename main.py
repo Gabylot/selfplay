@@ -549,7 +549,7 @@ def run_sanity_check(config):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("mode", choices=["train","gui","evaluate","sanity"])
+    parser.add_argument("mode", choices=["train","gui","evaluate","sanity","match"])
     parser.add_argument("--gui",      action="store_true")
     parser.add_argument("--config",   type=str, default=None)
     parser.add_argument("--sims",     type=int, default=None)
@@ -557,6 +557,12 @@ def main():
     parser.add_argument("--filters",  type=int, default=None)
     parser.add_argument("--run-name", type=str, default=None)
     parser.add_argument("--workers",  type=int, default=None)
+    parser.add_argument("model_a", nargs="?", type=str, default=None,
+                        help="Path to first model checkpoint (for 'match' mode)")
+    parser.add_argument("model_b", nargs="?", type=str, default=None,
+                        help="Path to second model checkpoint (for 'match' mode)")
+    parser.add_argument("--games",   type=int, default=20,
+                        help="Number of games for match (default: 20)")
     args = parser.parse_args()
 
     ov = {}
@@ -598,6 +604,18 @@ def main():
 
     elif args.mode == "sanity":
         run_sanity_check(config)
+
+    elif args.mode == "match":
+        if not args.model_a or not args.model_b:
+            print("[ERROR] Match mode requires two checkpoint paths")
+            print("  python main.py match <model_a.pt> <model_b.pt> [--games N] [--workers N] [--gui]")
+            sys.exit(1)
+        from match import run_match
+        result = run_match(config, args.model_a, args.model_b,
+                           num_games=args.games,
+                           num_workers=args.workers or 4,
+                           gui_enabled=args.gui)
+        print(f"Match result: {result["model_a"]} {result["wins_a"]} - {result["draws"]} - {result["model_b"]} {result["wins_b"]}")
 
 
 if __name__ == "__main__":

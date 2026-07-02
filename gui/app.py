@@ -5,6 +5,7 @@ from flask import Flask, render_template, jsonify, send_from_directory
 from flask_socketio import SocketIO
 from stats import StatsLogger
 from gui.live_game import LiveGameState
+from gui.match_state import MatchState
 
 app = Flask(__name__, template_folder=str(Path(__file__).parent/"templates"))
 app.config['SECRET_KEY'] = 'alphazero-chess'
@@ -14,6 +15,7 @@ _stats = None
 _config = None
 _worker_live_games = []
 _eval_live_game = None
+_match_state = None
 
 
 @app.route('/chess_pieces/<path:fn>')
@@ -72,6 +74,16 @@ def api_mcts_stats():
 def api_num_workers():
     return jsonify({'num_workers': len(_worker_live_games)})
 
+@app.route('/match')
+def match_page():
+    return render_template('match.html')
+
+@app.route('/api/match/state')
+def api_match_state():
+    if _match_state is None:
+        return jsonify({'status': 'idle', 'model_a': '?', 'model_b': '?'})
+    return jsonify(_match_state.get_state())
+
 
 # ── SocketIO ──────────────────────────────────────────────────────────────────
 
@@ -124,18 +136,31 @@ def on_request_replay_eval_game(data):
         game = _eval_live_game.get_game_by_id(data.get('game_id'))
         if game: socketio.emit('replay_eval_game', game)
 
+@socketio.on('request_match_state')
+def on_request_match_state():
+    if _match_state:
+        socketio.emit('match_state', _match_state.get_state())
 
-def start_gui_server(stats=None, config=None, worker_live_games=None, eval_live_game=None):
-    global _stats, _config, _worker_live_games, _eval_live_game
+@socketio.on('request_match_game_history')
+def on_request_match_game_history():
+    if _match_state:
+        socketio.emit('match_game_history', _match_state.get_game_history())
+
+
+def start_gui_server(stats=None, config=None, worker_live_games=None, eval_live_game=None, match_state=None):
+    global _stats, _config, _worker_live_games, _eval_live_game, _match_state
     _stats             = stats
     _config            = config
     _worker_live_games = worker_live_games or []
     _eval_live_game    = eval_live_game
+    _match_state       = match_state
 
     for wlg in _worker_live_games:
         wlg.set_socketio(socketio)
     if _eval_live_game:
         _eval_live_game.set_socketio(socketio)
+    if _match_state:
+        _match_state.set_socketio(socketio)
 
     host = config.gui.host if config else "127.0.0.1"
     port = config.gui.port if config else 5000

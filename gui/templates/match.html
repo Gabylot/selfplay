@@ -1,0 +1,256 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>AlphaZero — Model Match</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/chess.js/0.10.3/chess.min.js"></script>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@chrisoakman/chessboardjs@1.0.0/dist/chessboard-1.0.0.min.css"/>
+<script src="https://code.jquery.com/jquery-3.7.1.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@chrisoakman/chessboardjs@1.0.0/dist/chessboard-1.0.0.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.7.4/socket.io.min.js"></script>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:'Segoe UI',Arial,sans-serif;background:#0f172a;color:#d1d5db}
+.hdr{background:#0f172a;padding:12px 20px;border-bottom:1px solid #1e3a5f;display:flex;align-items:center;gap:12px}
+.hdr h1{font-size:17px;color:#f1f5f9;letter-spacing:.3px}
+.hdr .sub{font-size:11px;color:#475569;margin-left:auto}
+.wrap{max-width:1400px;margin:0 auto;padding:14px}
+
+/* Scoreboard */
+.sboard{background:linear-gradient(135deg,#1e293b,#0f172a);border:1px solid #1e3a5f;border-radius:10px;padding:20px;margin-bottom:16px;display:grid;grid-template-columns:1fr auto 1fr;gap:12px;align-items:center}
+.sboard .side{text-align:center}
+.sboard .side .name{font-size:22px;font-weight:700}
+.sboard .side .score{font-size:48px;font-weight:900;margin:8px 0}
+.sboard .side .label{font-size:11px;color:#475569;text-transform:uppercase;letter-spacing:1px}
+.sboard .side .record{font-size:12px;color:#64748b;margin-top:2px}
+.sboard .vs{font-size:28px;color:#475569;font-weight:700}
+.sboard .progress{grid-column:1/4;text-align:center;margin-top:8px}
+.sboard .pbar{height:4px;background:#1e3a5f;border-radius:2px;overflow:hidden;margin-top:4px}
+.sboard .pbar .fill{height:100%;background:linear-gradient(90deg,#3b82f6,#22c55e);transition:width .3s}
+.blue{color:#3b82f6}.red{color:#ef4444}.green{color:#22c55e}.amber{color:#f59e0b}.muted{color:#6b7280}.white{color:#f1f5f9}
+
+/* Two-column layout */
+.g2{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+@media(max-width:900px){.g2{grid-template-columns:1fr}}
+.card{background:#1e293b;border:1px solid #1e3a5f;border-radius:8px;padding:14px}
+.card h2{font-size:11px;color:#64748b;text-transform:uppercase;letter-spacing:1.2px;margin-bottom:10px}
+.bwrap{background:#0f172a;border-radius:7px;padding:10px;max-width:400px;margin:0 auto}
+.bwrap .board{width:100%;aspect-ratio:1}
+.ginfo{text-align:center;margin-top:8px;font-size:13px;color:#94a3b8}
+.ginfo .status{font-size:14px;font-weight:700;color:#f1f5f9;margin-bottom:4px}
+.ginfo .game-label{color:#64748b;font-size:12px}
+.ginfo .move-list{font-size:11px;color:#475569;margin-top:4px;max-height:60px;overflow:hidden;word-break:break-all}
+.tbl{width:100%;border-collapse:collapse;font-size:12px}
+.tbl th{text-align:left;color:#475569;text-transform:uppercase;letter-spacing:.8px;padding:6px 8px;border-bottom:1px solid #1e3a5f}
+.tbl td{padding:5px 8px;border-bottom:1px solid #1e3a5f;color:#94a3b8}
+.tbl tr:hover td{background:#0f172a}
+.tbl .won{color:#22c55e;font-weight:700}.tbl .lost{color:#ef4444;font-weight:700}.tbl .dr{color:#64748b;font-weight:700}
+.wait{position:fixed;top:0;left:0;width:100%;height:100%;background:#0f172a;display:flex;flex-direction:column;align-items:center;justify-content:center;z-index:100}
+.wait h2{font-size:28px;color:#475569;margin-bottom:8px}
+.wait p{color:#64748b;font-size:14px}
+.wait .spinner{width:40px;height:40px;border:3px solid #1e3a5f;border-top:3px solid #3b82f6;border-radius:50%;animation:spin .8s linear infinite;margin-bottom:16px}
+@keyframes spin{to{transform:rotate(360deg)}}
+</style>
+</head>
+<body>
+<div class="hdr">
+  <h1>&#9812; Model Match</h1>
+  <div class="sub"><a href="/" style="color:#3b82f6;text-decoration:none;font-size:12px">&#8592; Dashboard</a></div>
+</div>
+
+<div class="wrap">
+  <!-- Waiting overlay (hidden once match data arrives) -->
+  <div id="waiting" class="wait">
+    <div class="spinner"></div>
+    <h2>Waiting for match…</h2>
+    <p>Start a match with <code style="background:#1e293b;padding:2px 6px;border-radius:3px">python main.py match ... --gui</code></p>
+  </div>
+
+  <!-- Scoreboard -->
+  <div id="scoreboard" class="sboard" style="display:none">
+    <div class="side">
+      <div class="name blue" id="model-a-name">Model A</div>
+      <div class="score blue" id="model-a-score">0</div>
+      <div class="label">Wins</div>
+      <div class="record" id="model-a-record"></div>
+    </div>
+    <div class="vs">VS</div>
+    <div class="side">
+      <div class="name red" id="model-b-name">Model B</div>
+      <div class="score red" id="model-b-score">0</div>
+      <div class="label">Wins</div>
+      <div class="record" id="model-b-record"></div>
+    </div>
+    <div class="progress">
+      <div id="match-status" style="font-size:13px;color:#94a3b8">Preparing…</div>
+      <div class="pbar"><div id="progress-fill" class="fill" style="width:0%"></div></div>
+      <div id="progress-text" style="font-size:11px;color:#475569;margin-top:2px"></div>
+    </div>
+  </div>
+
+  <div class="g2">
+    <div class="card">
+      <h2>Current Game</h2>
+      <div class="bwrap">
+        <div id="matchBoard" class="board"></div>
+      </div>
+      <div class="ginfo">
+        <div id="game-status" class="status">—</div>
+        <div id="game-label" class="game-label">—</div>
+        <div id="game-moves" class="move-list"></div>
+      </div>
+    </div>
+    <div class="card">
+      <h2>Game Results</h2>
+      <div style="overflow-y:auto;max-height:500px">
+        <table class="tbl">
+          <thead><tr><th>#</th><th>Result</th><th>Moves</th><th>Termination</th><th>Sides</th></tr></thead>
+          <tbody id="results-body">
+            <tr><td colspan="5" style="text-align:center;color:#1f2937">No games yet</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+// Chess board
+var matchBoard = null;
+var currentFen = 'rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1';
+var modelA = 'Model A', modelB = 'Model B';
+
+function initBoard() {
+  var cfg = {
+    position: 'start',
+    draggable: false,
+    showNotation: true,
+    pieceTheme: '../chess_pieces/{piece}.png',
+    boardSize: 400
+  };
+  if (window.innerWidth < 500) cfg.boardSize = Math.min(320, window.innerWidth - 40);
+  matchBoard = Chessboard('matchBoard', cfg);
+  $(window).resize(function() { if (matchBoard) matchBoard.resize(); });
+}
+
+function updateBoard(fen) {
+  if (!matchBoard) return;
+  currentFen = fen;
+  matchBoard.position(fen);
+}
+
+function updateScoreboard(state) {
+  if (!state) return;
+  modelA = state.model_a || modelA;
+  modelB = state.model_b || modelB;
+  document.getElementById('model-a-name').textContent = modelA;
+  document.getElementById('model-b-name').textContent = modelB;
+  document.getElementById('model-a-score').textContent = state.wins_a || 0;
+  document.getElementById('model-b-score').textContent = state.wins_b || 0;
+  var draws = state.draws || 0;
+  var total = state.total_games || 0;
+  var comp = state.completed_games || 0;
+  document.getElementById('model-a-record').textContent =
+    (state.wins_a||0)+'W / '+draws+'D / '+(state.wins_b||0)+'L';
+  document.getElementById('model-b-record').textContent =
+    (state.wins_b||0)+'W / '+draws+'D / '+(state.wins_a||0)+'L';
+  var pct = total > 0 ? (comp / total * 100) : 0;
+  document.getElementById('progress-fill').style.width = pct + '%';
+  document.getElementById('progress-text').textContent = comp+' / '+total+' games';
+  var statusEl = document.getElementById('match-status');
+  if (state.status === 'complete') {
+    statusEl.textContent = 'Match Complete!'; statusEl.style.color = '#22c55e';
+  } else if (state.status === 'running') {
+    statusEl.textContent = 'Playing Game '+(comp+1)+' of '+total+'…';
+    statusEl.style.color = '#f59e0b';
+  } else { statusEl.textContent = 'Preparing…'; statusEl.style.color = '#94a3b8'; }
+  if (state.current_fen) updateBoard(state.current_fen);
+  var gs = document.getElementById('game-status');
+  if (state.status === 'running') {
+    if (state.result) {
+      gs.textContent = state.result+(state.termination?' ('+state.termination+')':'');
+      gs.className = 'status green';
+    } else {
+      gs.textContent = 'Playing — Move '+(state.move_number||0);
+      gs.className = 'status amber';
+    }
+  } else if (state.status === 'complete') {
+    gs.textContent = 'Match Complete'; gs.className = 'status green';
+  } else { gs.textContent = '—'; gs.className = 'status muted'; }
+  var glabel = state.game_label || (state.game_number ? 'Game '+state.game_number : '');
+  document.getElementById('game-label').textContent = glabel;
+  document.getElementById('game-moves').textContent = (state.moves||[]).join(' ');
+}
+
+function updateResultsTable(history) {
+  if (!history || !history.length) {
+    document.getElementById('results-body').innerHTML =
+      '<tr><td colspan="5" style="text-align:center;color:#1f2937">No games yet</td></tr>';
+    return;
+  }
+  var html = '';
+  var games = [...history].slice(0, 50);
+  for (var i = games.length - 1; i >= 0; i--) {
+    var g = games[i];
+    var resDisplay, resClass;
+    if (g.result === '1-0') {
+      var winner = g.a_is_white ? modelA : modelB;
+      resDisplay = '1-0 (' + winner + ')';
+      resClass = 'won';
+    } else if (g.result === '0-1') {
+      var winner2 = g.a_is_white ? modelB : modelA;
+      resDisplay = '0-1 (' + winner2 + ')';
+      resClass = 'lost';
+    } else if (g.result) {
+      resDisplay = g.result + ' (Draw)';
+      resClass = 'dr';
+    } else { resDisplay = '—'; resClass = ''; }
+    var sides = g.a_is_white
+      ? (modelA + ' (W) vs ' + modelB + ' (B)')
+      : (modelB + ' (W) vs ' + modelA + ' (B)');
+    html += '<tr><td>'+(g.game_number||'—')+'</td><td class="'+resClass+'">'+resDisplay+'</td>'
+         + '<td>'+(g.num_moves||'—')+'</td><td>'+(g.termination||'—')+'</td>'
+         + '<td style="font-size:11px;color:#64748b">'+sides+'</td></tr>';
+  }
+  document.getElementById('results-body').innerHTML = html;
+}
+
+// SocketIO
+var socket = io();
+socket.on('connect', function() {
+  socket.emit('request_match_state');
+  socket.emit('request_match_game_history');
+});
+socket.on('match_state', function(state) {
+  if (state && (state.status === 'running' || state.status === 'complete')) {
+    $('#waiting').hide(); $('#scoreboard').show();
+  }
+  updateScoreboard(state);
+});
+socket.on('match_game_update', function(state) {
+  if (state && state.status === 'running' && !state.result) {
+    $('#waiting').hide(); $('#scoreboard').show();
+  }
+  if (state) updateScoreboard(state);
+});
+socket.on('match_complete', function(state) {
+  if (state) { updateScoreboard(state); socket.emit('request_match_game_history'); }
+});
+socket.on('match_game_history', function(history) { updateResultsTable(history); });
+
+$(document).ready(function() {
+  initBoard();
+  $.get('/api/match/state', function(state) {
+    if (state && state.status !== 'idle') {
+      updateScoreboard(state); $('#waiting').hide(); $('#scoreboard').show();
+    }
+  });
+  setInterval(function() {
+    socket.emit('request_match_game_history');
+    socket.emit('request_match_state');
+  }, 3000);
+});
+</script>
+</body>
+</html>
