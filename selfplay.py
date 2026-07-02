@@ -17,7 +17,7 @@ import time
 import io
 import os
 
-from encoding import board_to_tensor
+from encoding import board_to_tensor, get_legal_move_mask
 from network import AlphaZeroNet
 from mcts import MCTS
 from inference_client import InferenceClient
@@ -35,16 +35,19 @@ class ReplayBuffer:
         self.total_positions = 0
 
     def add_game(self, game_data):
-        for s, p, v in game_data:
-            self.buffer.append((s, p, v))
+        # game_data is a list of (state, policy, value, mask)
+        for s, p, v, m in game_data:
+            self.buffer.append((s, p, v, m))
             self.total_positions += 1
         self.total_games += 1
 
     def sample_batch(self, batch_size):
         ix = np.random.choice(len(self.buffer), size=min(batch_size, len(self.buffer)), replace=False)
-        return (np.array([self.buffer[i][0] for i in ix]),
-                np.array([self.buffer[i][1] for i in ix]),
-                np.array([self.buffer[i][2] for i in ix], dtype=np.float32))
+        states   = np.array([self.buffer[i][0] for i in ix])
+        policies = np.array([self.buffer[i][1] for i in ix])
+        values   = np.array([self.buffer[i][2] for i in ix], dtype=np.float32)
+        masks    = np.array([self.buffer[i][3] for i in ix])   # binary mask
+        return states, policies, values, masks
 
     def __len__(self): return len(self.buffer)
 
@@ -54,7 +57,7 @@ class ReplayBuffer:
         ix = np.random.choice(len(self.buffer), size=n, replace=False)
         ww=bw=dr=0
         for i in ix:
-            v=self.buffer[i][2]
+            v=self.buffer[i][2]   # value is at index 2
             if v>0.5: ww+=1
             elif v<-0.5: bw+=1
             else: dr+=1
@@ -62,7 +65,6 @@ class ReplayBuffer:
         return {'white_wins':int(ww*s),'black_wins':int(bw*s),'draws':int(dr*s)}
 
     # ── Serialization ──
-
     def save(self, path):
         """Save buffer to a compressed .npz file."""
         if not self.buffer:
@@ -71,9 +73,10 @@ class ReplayBuffer:
         states   = np.stack([self.buffer[i][0] for i in range(n)])
         policies = np.stack([self.buffer[i][1] for i in range(n)])
         values   = np.array([self.buffer[i][2] for i in range(n)], dtype=np.float32)
+        masks    = np.stack([self.buffer[i][3] for i in range(n)])   # NEW
         np.savez_compressed(
             path,
-            states=states, policies=policies, values=values,
+            states=states, policies=policies, values=values, masks=masks,
             total_games=self.total_games,
             total_positions=self.total_positions,
         )
@@ -87,9 +90,10 @@ class ReplayBuffer:
             states   = data['states']
             policies = data['policies']
             values   = data['values']
+            masks    = data['masks']          # NEW
             n = len(values)
             for i in range(n):
-                buf.buffer.append((states[i], policies[i], float(values[i])))
+                buf.buffer.append((states[i], policies[i], float(values[i]), masks[i]))
             buf.total_games      = int(data.get('total_games', n))
             buf.total_positions  = int(data.get('total_positions', n))
             return buf
@@ -152,7 +156,7 @@ def play_one_game(mcts_engine, max_game_length=150, adjudicate_material=True,
     move_count = 0
     termination = "unknown"
     outcome = 0.0
-    root = None  # Tree recycling
+    root = None
 
     # Original loop – stop only on automatic game‑overs (not claimable draws)
     while not board.is_game_over() and not board.is_repetition(3) and move_count < max_game_length:
@@ -177,8 +181,9 @@ def play_one_game(mcts_engine, max_game_length=150, adjudicate_material=True,
                 break
 
         st = board_to_tensor(board)
+        mask = get_legal_move_mask(board)                     # NEW: legal move mask
         cp = 1.0 if board.turn == chess.WHITE else -1.0
-        game_states.append((st, visit_policy.copy(), cp))
+        game_states.append((st, visit_policy.copy(), cp, mask)) # 4‑tuple now
         mcts_stats_list.append(stats)
 
         mcts_move_data = {'selected_move': selected_move.uci(), 'candidates': move_candidates}
@@ -227,7 +232,6 @@ def play_one_game(mcts_engine, max_game_length=150, adjudicate_material=True,
             elif outcome < 0:
                 termination = "material_black"
     else:
-        # Fallback – should not happen normally (kept for safety)
         outcome = 0.0
         termination = "unknown"
         with open("unknown_termination_log.txt", "a") as f:
@@ -250,7 +254,8 @@ def play_one_game(mcts_engine, max_game_length=150, adjudicate_material=True,
     else:
         result_str = "1/2-1/2"
 
-    game_data = [(s, p, outcome * pl) for s, p, pl in game_states]
+    # game_data now carries the mask as the 4th element
+    game_data = [(s, p, outcome * pl, m) for s, p, pl, m in game_states]
     avg_depth = float(np.mean([s.get('avg_depth', 0) for s in mcts_stats_list])) if mcts_stats_list else 0.0
 
     return game_data, {
@@ -300,10 +305,11 @@ def self_play_game(network, config, on_move=None):
 
 def _worker_process(worker_id, task_queue, result_queue, config_dict, shutdown_event,
                     request_queue=None, response_queue=None):
-    import torch, sys, os
+    import torch, sys, os, io
     from config import Config
     from network import AlphaZeroNet
     from mcts import MCTS
+    from encoding import board_to_tensor, get_legal_move_mask   # ensure get_legal_move_mask is imported
 
     config = Config(config_dict)
     pv = config.selfplay.piece_values
@@ -344,7 +350,6 @@ def _worker_process(worker_id, task_queue, result_queue, config_dict, shutdown_e
             dirichlet_epsilon=config.mcts.dirichlet_epsilon if noise else 0.0,
             batch_size=getattr(config.mcts,'batch_size',1),
             c_virtual_loss=getattr(config.mcts,'c_virtual_loss',0.5),
-            # ---- NEW: pass game‑length and adjudication parameters ----
             max_game_length=config.selfplay.max_game_length,
             adjudicate_material=config.selfplay.adjudicate_material,
             piece_values=config.selfplay.piece_values,
@@ -390,9 +395,10 @@ def _worker_process(worker_id, task_queue, result_queue, config_dict, shutdown_e
                 'worker_id': worker_id, 'type': 'live_end',
                 'result': gi['result_str'], 'termination': gi['termination'],
             })
+            # Serialize game_data with mask (4th element) now
             result_queue.put({
                 'worker_id': worker_id, 'type': 'selfplay',
-                'game_data': [(s.tolist(), p.tolist(), float(v)) for s, p, v in gd],
+                'game_data': [(s.tolist(), p.tolist(), float(v), m.tolist()) for s, p, v, m in gd],
                 'game_info': gi, 'fens': fens, 'moves': ucis, 'mcts_stats': mdata,
             })
 

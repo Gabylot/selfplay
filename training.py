@@ -72,29 +72,29 @@ def train_one_step(model: AlphaZeroNet, optimizer: torch.optim.Optimizer,
         Dict with 'policy_loss', 'value_loss', 'total_loss' (all float scalars)
     """
     model.train()
-    
     if device is None:
         device = next(model.parameters()).device
-    
-    # Sample batch from replay buffer
-    states, policies, values = replay_buffer.sample_batch(batch_size)
-    states = torch.from_numpy(states).float().to(device)
+
+    # Sample batch (now returns 4 items)
+    states, policies, values, masks = replay_buffer.sample_batch(batch_size)
+    states   = torch.from_numpy(states).float().to(device)
     policies = torch.from_numpy(policies).float().to(device)
-    values = torch.from_numpy(values).float().to(device)
-    
+    values   = torch.from_numpy(values).float().to(device)
+    masks    = torch.from_numpy(masks).float().to(device)
+
     # Forward pass
     policy_logits, value_pred = model(states)
-    
-    # Compute losses
-    p_loss = policy_loss_fn(policy_logits, policies)
+
+    # Compute losses – pass the legal move mask
+    p_loss = policy_loss_fn(policy_logits, policies, masks)
     v_loss = value_loss_fn(value_pred, values)
     total_loss = p_loss + v_loss
-    
+
     # Backward pass
     optimizer.zero_grad()
     total_loss.backward()
     optimizer.step()
-    
+
     return {
         'policy_loss': float(p_loss.item()),
         'value_loss': float(v_loss.item()),
