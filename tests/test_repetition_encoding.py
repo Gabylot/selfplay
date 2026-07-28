@@ -1,8 +1,16 @@
-"""Tests for repetition encoding planes in board_to_tensor.
+"""Tests for repetition detection in the 136-plane AlphaZero board encoding.
 
-Verifies that the new planes 18-19 correctly encode repetition history:
-- Plane 18: is_repetition(2) — position has appeared before
-- Plane 19: is_repetition(3) — on the verge of 3-fold repetition
+With the 136-plane encoding (8 history positions × 17 planes each), repetition
+is detected by comparing the current position's 17-plane group with previous
+groups. If the current position matches a position from 2 or 4 plies ago, the
+network can learn that this is a repetition.
+
+Key tests:
+1. Tensor shape is (136, 8, 8)
+2. A position repeated once has its current group matching a history group
+3. A position repeated twice has its current group matching two history groups
+4. Non-repeating positions have no matching history groups
+5. Child boards with stack=True preserve history for repetition detection
 """
 
 import sys
@@ -12,169 +20,103 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import chess
 import numpy as np
-from encoding import board_to_tensor, NUM_PLANES
+from encoding import board_to_tensor, NUM_PLANES, PLANES_PER_HISTORY, NUM_HISTORY_STEPS
 
 
 def test_tensor_shape():
-    """Verify the tensor has 20 planes, not 18."""
+    """Verify the tensor has 136 planes."""
     board = chess.Board()
     tensor = board_to_tensor(board)
-    assert tensor.shape == (20, 8, 8), f"Expected (20, 8, 8), got {tensor.shape}"
+    assert tensor.shape == (136, 8, 8), f"Expected (136, 8, 8), got {tensor.shape}"
+    assert NUM_PLANES == 136, f"Expected NUM_PLANES=136, got {NUM_PLANES}"
     print("  PASS: test_tensor_shape")
 
 
 def test_fresh_position_no_repetition():
-    """Starting position has no repetition history — both planes should be 0."""
+    """Starting position has no history of itself — no history group should match current."""
     board = chess.Board()
     tensor = board_to_tensor(board)
-    assert np.all(tensor[18] == 0.0), "Plane 18 should be 0 for fresh position"
-    assert np.all(tensor[19] == 0.0), "Plane 19 should be 0 for fresh position"
+
+    # Get the current position's 17-plane group
+    current_group = tensor[0:17]
+
+    # Check groups 1-7 (previous positions): none should match
+    for i in range(1, 8):
+        offset = i * 17
+        hist_group = tensor[offset:offset + 17]
+        assert not np.array_equal(current_group, hist_group), \
+            f"Group {i} should not match current group on fresh board"
+
     print("  PASS: test_fresh_position_no_repetition")
 
 
-def test_position_seen_twice_plane18():
-    """After returning to the starting position once, plane 18 should be 1.0."""
+def test_position_seen_twice():
+    """After returning to the starting position once, the current group should
+    match a previous group (2 plies ago)."""
     board = chess.Board()
-
-    # Play moves that return to the starting position:
-    # 1. Nf3  Nf6  2. Ng1  Ng6 (actually let's use a simpler approach)
-    # Try: 1. Nf3 Nf6 2. Ng1 Nf6 (back to starting with 2 occurrences of the start)
-    # Actually, python-chess tracks repetition from the game's move history.
-    # We need: position A -> move -> position A again. That's a repetition of 2.
-    # Example: 1. Nf3 Nf6 2. Nf3 (not legal, be2 not Nf3)
-    # Actually we need: start (pos A), play 1. Nf3 Nf6 2. Ng1 Ng6 (now pos is same as start)
-    # wait, the start position is after move 0. After 2 moves, we're NOT back to start.
-    # We need: white moves Nf3, black moves Nf6, white moves Ng1, black moves Ng6
-    # that's 4 half-moves, back to starting position?
-
-    # Let's use a known repetition setup:
-    # Position where the same FEN appears twice:
-    # 1. Nf3 Nf6 2. Ng1 Ng6 3. Nf3 Nf6 4. Ng1 Ng6 -> starts repeating.
-
-    # But is_repetition(2) checks from the current game's move_stack.
-    # A starting position has not been repeated. We need to create a position
-    # where the FEN appears twice in the game.
-
-    # Use: 1. Nf3 Nf6 2. Ng1 Ng6
-    # After 4 half-moves (2 full), we should be back to the starting position.
-    # Two occurrences: starting position and current position = is_repetition(2) = True.
-
-    # Actually, let's verify: the initial position is before any moves.
-    # After 1.Nf3, the board is in a new state. After ...Nf6, new state.
-    # After 2.Ng1, we're back to starting position.
-    # After ...Ng6, new state.
-    # So: position after 1.Nf3 Nf6 2.Ng1 should be the same as starting position.
-
-    # But we need both occurrences to be tracked by python-chess is_repetition().
-    # chess.Board.is_repetition(count) returns True if the current position
-    # has been visited `count` times in the current game's move history.
-
-    # So for is_repetition(2) to be True, the position must appear twice
-    # in the game (including the current occurrence).
-
-    # Let's use a line that definitely repeats the starting position:
-    # 1. Nf3 Nf6 2. Ng1 Ng6 3. Nf3 Nf6 4. Ng1 Ng6
-    # After move 4, we're back to start. And we've seen it: start + this position.
-    # Actually after move 2 (2.Ng1), we're back to start position (once seen before).
-    # After move 4 (4.Ng1), we're back to start position (seen twice before).
-
-    # But we need to check: does python-chess count the starting position?
-    # From the docs: "Detects if the current position has happened `count` times
-    # in the current game."
-    # The starting position is counted as the first occurrence.
-
-    # So after 1.Nf3 Nf6 2.Ng1, we're back to start. is_repetition(2) = True.
 
     # Play moves that return to the starting position:
     # 1. Nf3 Nf6 2. Ng1 Ng8
-    # Both knights return to original squares — starting position is repeated.
-    moves_so_far = [
-        chess.Move.from_uci("g1f3"),   # 1. Nf3
-        chess.Move.from_uci("g8f6"),   # ... Nf6
-        chess.Move.from_uci("f3g1"),   # 2. Ng1
-        chess.Move.from_uci("f6g8"),   # ... Ng8
-    ]
-
-    for m in moves_so_far:
-        board.push(m)
+    # After 4 plies, we're back to the starting position (second occurrence)
+    moves_uci = ["g1f3", "g8f6", "f3g1", "f6g8"]
+    for uci in moves_uci:
+        board.push(chess.Move.from_uci(uci))
 
     # Now we're back to the starting position (second occurrence)
     assert board.is_repetition(2), "Board should detect 2-fold repetition"
+
     tensor = board_to_tensor(board)
-    assert np.all(tensor[18] == 1.0), "Plane 18 should be 1.0 for seen-once position"
-    assert np.all(tensor[19] == 0.0), "Plane 19 should be 0.0 (not yet 3-fold)"
-    print("  PASS: test_position_seen_twice_plane18")
+
+    # After 4 moves, ply=4 (the 4th half-move has been pushed).
+    # Group 0 (current) = ply 4 = back to start position
+    # Group 1 = ply 3 = after Ng1, before Ng8
+    # Group 2 = ply 2 = after Nf6, before Ng1
+    # Group 3 = ply 1 = after Nf3
+    # Group 4 = ply 0 = original start position
+    # So group 0 and group 4 should match.
+    current_group = tensor[0:17]
+    group_4 = tensor[4 * 17: 4 * 17 + 17]
+    assert np.array_equal(current_group, group_4), \
+        "Current position should match position 4 plies ago (repetition)"
+
+    print("  PASS: test_position_seen_twice")
 
 
-def test_position_three_times_plane19():
-    """After 3 occurrences of the same position, both planes should be 1.0.
-
-    Note: In a real game, is_repetition(3) would also mean is_game_over()
-    returns True (the game ends in a draw by repetition). But we can still
-    check the encoding plane is set correctly.
-    """
-    # Play moves that return to the starting position 3 times:
-    # 1. Nf3 Nf6 2. Ng1 Ng6  3. Nf3 Nf6 4. Ng1 Ng6 5. Nf3 Nf6 6. Ng1
-    board = chess.Board()
-    moves_uci = [
-        "g1f3", "g8f6",   # 1. Nf3 Nf6
-        "f3g1", "f6g6",   # 2. Ng1 Ng6 -> not back to start yet...
-    ]
-    # Actually we need to go back to starting position 3 times.
-    # Starting position = before any moves.
-    # 1. Nf3 Nf6 2. Ng1Ng6 -> NOT back to start (Ng6 is not the start)
-    # Let me think more carefully:
-    # Starting position: all pieces on original squares
-    # 1. Nf3 -> knights on f3, g8
-    # 1...Nf6 -> knights on f3, f6
-    # 2. Ng1 -> knights on g1, f6 -> THIS is back to starting position (king's knight on g1,
-    #    queen's knight on b8... wait no)
-    # Wait, in the starting position:
-    # White: Rh1, Ng1, Bf1, Qd1, Ke1, Bc1, Nb1, Ra1
-    # Black: Ra8, Nb8, Bc8, Qd8, Ke8, Bf8, Ng8, Rh8
-
-    # After 1.Nf3 Nf6: White Nf3 (was Ng1) and Black Nf6 (was Ng8)
-    # After 2.Ng1 Ng6: White Ng1 (back to g1) and Black Ng6 (was Ng8... Ng6 is NOT Ng8)
-    # So the position after 2.Ng1 Ng6 is NOT the same as starting.
-
-    # We need: 1.Nf3 Nf6 2.Ng1 Ng8 (back to starting position for black too)
-    # But Ng8 is a retreat, is it legal? Yes, N is on f6, can go to g8.
-
-    # Actually the bug-free approach: play 1.Nf3 Nf6 2.Ng1 Ng8
-    # After that, board state = starting position (except it's still the old game)
-    # is_repetition(2) should detect it's been seen twice (start + now).
-
-    # But wait: is_repetition counts from the game start, and the starting position
-    # is position 0 (before any moves). The current position after 2.Ng1 Ng8 is
-    # position 4 (after 4 half-moves). Both have the same FEN.
-    # python-chess.is_repetition(2) should return True.
-
-    # For 3 occurrences:
-    # 1.Nf3 Nf6 2.Ng1 Ng8 3.Nf3 Nf6 4.Ng1 Ng8 -> third time at start position
-    # is_repetition(3) should return True.
-
+def test_position_three_times():
+    """After 3 occurrences of the same position, the current group should
+    match two different history groups."""
     board = chess.Board()
     moves = [
         chess.Move.from_uci("g1f3"),   # 1. Nf3
         chess.Move.from_uci("g8f6"),   # ... Nf6
         chess.Move.from_uci("f3g1"),   # 2. Ng1
-        chess.Move.from_uci("f6g8"),   # ... Ng8
+        chess.Move.from_uci("f6g8"),   # ... Ng8  (2nd occurrence of start)
         chess.Move.from_uci("g1f3"),   # 3. Nf3
         chess.Move.from_uci("g8f6"),   # ... Nf6
         chess.Move.from_uci("f3g1"),   # 4. Ng1
-        chess.Move.from_uci("f6g8"),   # ... Ng8
+        chess.Move.from_uci("f6g8"),   # ... Ng8  (3rd occurrence of start)
     ]
     for m in moves:
         board.push(m)
 
+    assert board.is_repetition(3), "Should detect 3-fold repetition"
+
     tensor = board_to_tensor(board)
-    assert np.all(tensor[18] == 1.0), "Plane 18 should be 1.0 (seen before)"
-    assert np.all(tensor[19] == 1.0), "Line 19 should be 1.0 (3-fold repetition imminent)"
-    print("  PASS: test_position_three_times_plane19")
+
+    current_group = tensor[0:17]
+
+    # After 8 plies, we're at start position again.
+    # Group 4 (4 plies ago) should also be the start position.
+    # Group 0 and group 4 should match.
+    group_4 = tensor[4 * 17: 4 * 17 + 17]
+    assert np.array_equal(current_group, group_4), \
+        "Current position should match position 4 plies ago (3rd repetition)"
+
+    print("  PASS: test_position_three_times")
 
 
 def test_nonrepeating_position():
-    """A random mid-game position should have both planes at 0."""
+    """A random mid-game position should have no matching history groups."""
     board = chess.Board()
     # Play a real opening (no repetition)
     moves_uci = [
@@ -185,36 +127,26 @@ def test_nonrepeating_position():
         board.push(chess.Move.from_uci(uci))
 
     tensor = board_to_tensor(board)
-    assert np.all(tensor[18] == 0.0), "Plane 18 should be 0 for non-repeating position"
-    assert np.all(tensor[19] == 0.0), "Plane 19 should be 0 for non-repeating position"
+    current_group = tensor[0:17]
+
+    # No history group should match the current position
+    matches = 0
+    for i in range(1, 8):
+        offset = i * 17
+        hist_group = tensor[offset:offset + 17]
+        if np.array_equal(current_group, hist_group):
+            matches += 1
+
+    assert matches == 0, f"Expected no matching history groups, found {matches}"
+
     print("  PASS: test_nonrepeating_position")
-
-
-def test_repetition_plane_is_full_plane():
-    """When set, the repetition planes should be fully set (1.0 everywhere)."""
-    board = chess.Board()
-    # Create a repetition
-    for uci in ["g1f3", "g8f6", "f3g1", "f6g8"]:
-        board.push(chess.Move.from_uci(uci))
-
-    tensor = board_to_tensor(board)
-    plane18 = tensor[18]
-    plane19 = tensor[19]
-
-    # Plane 18 should be all 1.0
-    assert plane18.shape == (8, 8)
-    assert np.all(plane18 == 1.0) or not np.any(plane18 == 1.0), \
-        "Plane 18 should be uniform (all 0 or all 1)"
-    # Plane 19 should be all 0.0 for double repetition (not triple)
-    assert np.all(plane19 == 0.0), "Plane 19 should be 0 for double repetition"
-    print("  PASS: test_repetition_plane_is_full_plane")
 
 
 def test_child_board_repetition_detection():
     """Verify that child boards (stack=True) can detect repetition.
 
     This tests the key MCTS fix: child boards are created with stack=True
-    so is_game_over() can detect threefold repetition for child nodes.
+    so they preserve move history for repetition detection.
     """
     board = chess.Board()
     # Play moves that lead to a repetition cycle:
@@ -233,16 +165,21 @@ def test_child_board_repetition_detection():
         board.push(m)
 
     # Now we have the starting position for the 3rd time.
-    # is_repetition(3) should detect this as a 3-fold repetition.
-    # Note: is_game_over() by default requires is_repetition(4) (automatic draw).
-    # For 3-fold repetition, use claim_draw=True or check is_repetition(3) directly.
     assert board.is_repetition(3), "Should detect 3-fold repetition"
     assert board.is_game_over(claim_draw=True), "Board should be game over with claim_draw"
 
     # Now create a child board with stack=True (as we do in MCTS)
-    child_board = board.copy()  # stack=True
+    child_board = board.copy(stack=True)
     assert child_board.is_repetition(3), "Child board should also detect repetition"
     assert child_board.is_game_over(claim_draw=True), "Child board should detect game over"
+
+    # The tensor from the child board should also show the repetition
+    child_tensor = board_to_tensor(child_board)
+    current_group = child_tensor[0:17]
+    group_4 = child_tensor[4 * 17: 4 * 17 + 17]
+    assert np.array_equal(current_group, group_4), \
+        "Child board tensor should show repetition in history planes"
+
     print("  PASS: test_child_board_repetition_detection")
 
 
@@ -250,7 +187,7 @@ def test_child_board_without_stack_cannot_detect():
     """Verify that child boards without stack FAIL to detect repetition.
 
     This demonstrates the bug that was fixed: child boards created with
-    stack=False cannot use is_game_over() to detect threefold repetition.
+    stack=False cannot use is_repetition() to detect threefold repetition.
     """
     board = chess.Board()
     # Play 3 cycles of Nf3/Nf6/Ng1/Ng8
@@ -268,7 +205,7 @@ def test_child_board_without_stack_cannot_detect():
         board.push(m)
 
     # With stack (correct behavior) — is_repetition(3) works
-    board_with_stack = board.copy()
+    board_with_stack = board.copy(stack=True)
     assert board_with_stack.is_repetition(3), "With stack: should detect 3-fold repetition"
 
     # Without stack (bug behavior) — is_repetition(3) fails because move history is lost
@@ -287,16 +224,15 @@ if __name__ == "__main__":
     import traceback
 
     print("=" * 60)
-    print("  Repetition Encoding Tests")
+    print("  Repetition Detection Tests (136-plane encoding)")
     print("=" * 60 + "\n")
 
     tests = [
         ("test_tensor_shape", test_tensor_shape),
         ("test_fresh_position_no_repetition", test_fresh_position_no_repetition),
-        ("test_position_seen_twice_plane18", test_position_seen_twice_plane18),
-        ("test_position_three_times_plane19", test_position_three_times_plane19),
+        ("test_position_seen_twice", test_position_seen_twice),
+        ("test_position_three_times", test_position_three_times),
         ("test_nonrepeating_position", test_nonrepeating_position),
-        ("test_repetition_plane_is_full_plane", test_repetition_plane_is_full_plane),
         ("test_child_board_repetition_detection", test_child_board_repetition_detection),
         ("test_child_board_without_stack_cannot_detect", test_child_board_without_stack_cannot_detect),
     ]

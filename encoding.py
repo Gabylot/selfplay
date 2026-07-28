@@ -1,13 +1,25 @@
 """Board state and move encoding for the AlphaZero chess engine.
 
-Board Representation (8x8x20):
-    Planes 0-5:   White P, N, B, R, Q, K
-    Planes 6-11:  Black P, N, B, R, Q, K
-    Plane 12:     Side to move (1.0 if white)
-    Planes 13-16: Castling rights (WK, WQ, BK, BQ)
-    Plane 17:     En passant square
-    Plane 18:     Repetition count >= 2 (position seen before)
-    Plane 19:     Repetition count >= 3 (on verge of 3-fold repetition)
+Board Representation (136 planes = 8 history positions × 17 planes each):
+    For each of the last 8 positions (current = t, t-1, ..., t-7):
+        Planes 0-5:   White P, N, B, R, Q, K
+        Planes 6-11:  Black P, N, B, R, Q, K
+        Plane 12:     Side to move (1.0 if white to move)
+        Plane 13:     Castling rights (WK)
+        Plane 14:     Castling rights (WQ)
+        Plane 15:     Castling rights (BK)
+        Plane 16:     Castling rights (BQ)
+
+    Total: 8 × 17 = 136 planes.
+
+    This follows the AlphaZero approach: the network sees the actual board
+    states of recent history, allowing it to detect threefold-repetition
+    by comparing piece configurations across time steps.
+
+    Note: En passant is NOT encoded as a separate plane — it is implicitly
+    determined by the board state (the en-passant square is a property of
+    the position, and the network can infer it from the piece positions
+    and the last move in the history).
 
 Move Encoding (8x8x73 = 4672 action space):
     Planes 0-55:  Queen-like moves (8 directions × 7 distances)
@@ -18,8 +30,9 @@ Move Encoding (8x8x73 = 4672 action space):
 
 import numpy as np
 import chess
+from typing import Optional
 
-# Piece type to plane index mapping
+# Piece type to plane index mapping (within a single 17-plane group)
 PIECE_PLANE = {
     (chess.PAWN, chess.WHITE): 0,
     (chess.KNIGHT, chess.WHITE): 1,
@@ -35,7 +48,21 @@ PIECE_PLANE = {
     (chess.KING, chess.BLACK): 11,
 }
 
-NUM_PLANES = 20
+# Planes within each 17-plane group:
+#   0-5:   White pieces
+#   6-11:  Black pieces
+#   12:    Side to move
+#   13-16: Castling rights (WK, WQ, BK, BQ)
+
+PLANE_SIDE_TO_MOVE = 12
+PLANE_CASTLING_WK = 13
+PLANE_CASTLING_WQ = 14
+PLANE_CASTLING_BK = 15
+PLANE_CASTLING_BQ = 16
+
+PLANES_PER_HISTORY = 17
+NUM_HISTORY_STEPS = 8
+NUM_PLANES = PLANES_PER_HISTORY * NUM_HISTORY_STEPS  # 136
 NUM_ACTIONS = 8 * 8 * 73  # 4672
 
 # Queen move directions: (dr, dc)
@@ -86,60 +113,115 @@ def _underpromotion_plane(piece_type, dir_idx):
     return 64 + piece_idx * 3 + dir_idx
 
 
-def board_to_tensor(board: chess.Board) -> np.ndarray:
-    """Encode a chess.Board as a (20, 8, 8) float32 numpy array.
-    
-    Planes 0-5:   White P, N, B, R, Q, K
-    Planes 6-11:  Black P, N, B, R, Q, K
-    Plane 12:     Side to move (1.0 if white to move)
-    Planes 13-16: Castling rights (WK, WQ, BK, BQ)
-    Plane 17:     En passant square
-    Plane 18:     Repetition count >= 2 (position seen before)
-    Plane 19:     Repetition count >= 3 (on verge of 3-fold repetition)
+def _encode_single_position(board: chess.Board, plane_offset: int,
+                            tensor: np.ndarray):
+    """Encode a single board position into the tensor at the given plane offset.
+
+    Encodes 17 planes: 12 piece planes + side-to-move + 4 castling planes.
+
+    Args:
+        board: The board position to encode
+        plane_offset: Starting plane index in the tensor (0, 17, 34, ...)
+        tensor: (NUM_PLANES, 8, 8) array to write into
     """
-    tensor = np.zeros((NUM_PLANES, 8, 8), dtype=np.float32)
-    
     # Piece positions
     for sq in chess.SQUARES:
         piece = board.piece_at(sq)
         if piece is not None:
             rank = chess.square_rank(sq)  # 0-7
             file = chess.square_file(sq)  # 0-7
-            plane = PIECE_PLANE[(piece.piece_type, piece.color)]
+            plane = plane_offset + PIECE_PLANE[(piece.piece_type, piece.color)]
             tensor[plane, rank, file] = 1.0
-    
+
     # Side to move
     if board.turn == chess.WHITE:
-        tensor[12, :, :] = 1.0
-    
+        tensor[plane_offset + PLANE_SIDE_TO_MOVE, :, :] = 1.0
+
     # Castling rights
     if board.has_kingside_castling_rights(chess.WHITE):
-        tensor[13, :, :] = 1.0
+        tensor[plane_offset + PLANE_CASTLING_WK, :, :] = 1.0
     if board.has_queenside_castling_rights(chess.WHITE):
-        tensor[14, :, :] = 1.0
+        tensor[plane_offset + PLANE_CASTLING_WQ, :, :] = 1.0
     if board.has_kingside_castling_rights(chess.BLACK):
-        tensor[15, :, :] = 1.0
+        tensor[plane_offset + PLANE_CASTLING_BK, :, :] = 1.0
     if board.has_queenside_castling_rights(chess.BLACK):
-        tensor[16, :, :] = 1.0
-    
-    # En passant
-    ep = board.ep_square
-    if ep is not None:
-        rank = chess.square_rank(ep)
-        file = chess.square_file(ep)
-        tensor[17, rank, file] = 1.0
-    
-    # Repetition count planes
-    if board.is_repetition(2):
-        tensor[18, :, :] = 1.0
-    if board.is_repetition(3):
-        tensor[19, :, :] = 1.0
-    
+        tensor[plane_offset + PLANE_CASTLING_BQ, :, :] = 1.0
+
+
+def _get_history_boards(board: chess.Board,
+                        history_length: int = 8) -> list:
+    """Get the last `history_length` board positions, most recent first.
+
+    Returns a list of chess.Board objects representing positions at
+    ply offsets 0, 1, 2, ..., history_length-1 from the current position.
+    Position 0 = current board, position 1 = one ply ago, etc.
+
+    If the game has fewer than `history_length` plies, earlier positions
+    are filled with the starting position (empty board for positions
+    before the game start).
+
+    Args:
+        board: Current board position (with full move history via stack=True)
+        history_length: Number of historical positions to return
+
+    Returns:
+        List of chess.Board objects, length = history_length
+    """
+    boards = []
+    # Work with a copy to avoid mutating the original
+    b = board.copy(stack=True)
+    move_stack = list(b.move_stack)
+    num_moves = len(move_stack)
+
+    # Current position (ply offset 0)
+    boards.append(b.copy(stack=True))
+
+    # Walk back through history by popping moves
+    for ply in range(1, history_length):
+        if ply <= num_moves:
+            # Pop the last move to go back one ply
+            b.pop()
+            boards.append(b.copy(stack=True))
+        else:
+            # Before the game started: use an empty board
+            boards.append(chess.Board.empty())
+
+    return boards
+
+
+def board_to_tensor(board: chess.Board,
+                    history_length: int = 8) -> np.ndarray:
+    """Encode a chess.Board as a (136, 8, 8) float32 numpy array.
+
+    The encoding uses the AlphaZero approach: the last 8 board positions
+    are each encoded as 17 planes (12 piece planes + side-to-move + 4
+    castling planes), for a total of 136 input planes.
+
+    This allows the network to detect threefold-repetition by comparing
+    piece configurations across time steps.
+
+    Args:
+        board: Current board position (must have full move history)
+        history_length: Number of historical positions to encode (default 8)
+
+    Returns:
+        tensor: (136, 8, 8) float32 numpy array
+    """
+    tensor = np.zeros((NUM_PLANES, 8, 8), dtype=np.float32)
+
+    # Get historical board positions
+    history_boards = _get_history_boards(board, history_length)
+
+    # Encode each position into its 17-plane chunk
+    for i, hist_board in enumerate(history_boards):
+        plane_offset = i * PLANES_PER_HISTORY
+        _encode_single_position(hist_board, plane_offset, tensor)
+
     return tensor
 
 
 def board_to_tensor_batch(board: chess.Board) -> np.ndarray:
-    """Encode board as batch tensor (1, 20, 8, 8)."""
+    """Encode board as batch tensor (1, 136, 8, 8)."""
     return board_to_tensor(board)[np.newaxis, ...]
 
 
@@ -155,7 +237,7 @@ def rank_file_to_square(rank: int, file: int) -> int:
 
 def move_to_policy_index(move: chess.Move, board: chess.Board) -> int:
     """Convert a chess.Move to a flat policy index (0-4671).
-    
+
     The policy space is organized as 8*8*73, where for each source square
     (in rank-file order, rank 0 first), there are 73 possible move planes.
     """
@@ -163,15 +245,15 @@ def move_to_policy_index(move: chess.Move, board: chess.Board) -> int:
     from_file = chess.square_file(move.from_square)
     to_rank = chess.square_rank(move.to_square)
     to_file = chess.square_file(move.to_square)
-    
+
     # dr, dc relative to source (in rank-file coordinates)
     dr = to_rank - from_rank
     dc = to_file - from_file
-    
+
     # Check if this is an underpromotion
     piece = board.piece_at(move.from_square)
     is_promotion = move.promotion is not None
-    
+
     if is_promotion and move.promotion in (chess.KNIGHT, chess.BISHOP, chess.ROOK):
         # Underpromotion
         # Determine direction offset
@@ -194,7 +276,7 @@ def move_to_policy_index(move: chess.Move, board: chess.Board) -> int:
                 dir_idx = 2  # forward-right
             else:
                 raise ValueError(f"Invalid underpromotion move: {move}")
-        
+
         plane = _underpromotion_plane(move.promotion, dir_idx)
     else:
         # Queen-like or knight move (including queen promotions)
@@ -205,7 +287,7 @@ def move_to_policy_index(move: chess.Move, board: chess.Board) -> int:
             plane = _find_knight_move_plane(dr, dc)
         if plane is None:
             raise ValueError(f"Cannot encode move {move} (dr={dr}, dc={dc})")
-    
+
     # Flat index: (from_rank * 8 + from_file) * 73 + plane
     source_idx = from_rank * 8 + from_file
     return source_idx * 73 + plane
@@ -215,7 +297,7 @@ def _find_queen_move_plane(dr, dc):
     """Find the plane index for a queen-like move with given delta."""
     if dr == 0 and dc == 0:
         return None
-    
+
     # Find direction
     for d_idx, (qdr, qdc) in enumerate(QUEEN_DIRECTIONS):
         # Check if (dr, dc) is in this direction
@@ -247,10 +329,10 @@ def _find_queen_move_plane(dr, dc):
             # Verify it's actually on the diagonal with matching magnitude
             if abs(dr) != abs(dc):
                 continue
-        
+
         if 1 <= dist <= 7:
             return d_idx * 7 + (dist - 1)
-    
+
     return None
 
 
@@ -264,20 +346,20 @@ def _find_knight_move_plane(dr, dc):
 
 def policy_index_to_move(index: int, board: chess.Board) -> chess.Move:
     """Convert a flat policy index (0-4671) to a chess.Move.
-    
+
     Returns None if the move is not valid for the given board state.
     """
     source_idx = index // 73
     plane = index % 73
-    
+
     from_rank = source_idx // 8
     from_file = source_idx % 8
     from_square = rank_file_to_square(from_rank, from_file)
-    
+
     piece = board.piece_at(from_square)
     if piece is None:
         return None
-    
+
     if plane < 56:
         # Queen-like move
         d_idx = plane // 7
@@ -297,24 +379,24 @@ def policy_index_to_move(index: int, board: chess.Board) -> chess.Move:
         piece_idx = under_idx // 3
         dir_idx = under_idx % 3
         promo_piece = UNDERPROMOTION_PIECES[piece_idx]
-        
+
         dir_name = UNDERPROMOTION_DIRS[dir_idx]
         dr, dc = UNDERPROMOTION_OFFSETS[dir_name]
-        
+
         # Adjust direction based on color
         if board.turn == chess.BLACK:
             dr = -dr
             dc = -dc
-        
+
         to_rank = from_rank + dr
         to_file = from_file + dc
-    
+
     # Bounds check
     if not (0 <= to_rank < 8 and 0 <= to_file < 8):
         return None
-    
+
     to_square = rank_file_to_square(to_rank, to_file)
-    
+
     # Determine promotion
     promotion = None
     if piece.piece_type == chess.PAWN:
@@ -329,20 +411,20 @@ def policy_index_to_move(index: int, board: chess.Board) -> chess.Move:
                     under_idx = plane - 64
                     piece_idx = under_idx // 3
                     promotion = UNDERPROMOTION_PIECES[piece_idx]
-    
+
     move = chess.Move(from_square, to_square, promotion=promotion)
-    
+
     # Verify the move is legal
     if move in board.legal_moves:
         return move
-    
+
     # If not legal, try without promotion (for queen-like pawn forward moves)
     if promotion == chess.QUEEN:
         move_no_promo = chess.Move(from_square, to_square, promotion=None)
         # This shouldn't happen for a pawn reaching the last rank, but just in case
         if move_no_promo in board.legal_moves:
             return move_no_promo
-    
+
     return None
 
 
@@ -361,14 +443,14 @@ def get_legal_move_mask(board: chess.Board) -> np.ndarray:
 
 def get_legal_move_mask_from_moves(legal_moves: list, board: chess.Board) -> np.ndarray:
     """Get a (4672,) binary mask from a precomputed list of legal moves.
-    
+
     This avoids a second iteration over board.legal_moves when the caller
     has already generated the legal moves list.
-    
+
     Args:
         legal_moves: List of chess.Move objects (already computed)
         board: Board state (needed for move_to_policy_index context)
-    
+
     Returns:
         mask: (4672,) binary mask
     """
@@ -396,31 +478,31 @@ def get_all_policy_indices(board: chess.Board) -> dict:
 
 def policy_to_move_dict(board: chess.Board, policy: np.ndarray, top_k: int = 5):
     """Convert a raw policy vector to the top-k legal moves with probabilities.
-    
+
     Args:
         board: Current board state
         policy: (4672,) raw policy logits or probabilities
         top_k: Number of top moves to return
-    
+
     Returns:
         List of (move, probability) tuples, sorted by probability descending.
     """
     mask = get_legal_move_mask(board)
     masked = policy * mask
-    
+
     # Renormalize
     total = masked.sum()
     if total > 0:
         masked = masked / total
-    
+
     # Get top-k indices
     flat_indices = np.argsort(-masked)[:top_k]
-    
+
     result = []
     for idx in flat_indices:
         if masked[idx] > 0:
             move = policy_index_to_move(idx, board)
             if move is not None:
                 result.append((move, float(masked[idx])))
-    
+
     return result
