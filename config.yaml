@@ -2,20 +2,20 @@
 
 # --- Network Architecture ---
 network:
-  num_residual_blocks: 6
+  num_residual_blocks: 10
   num_filters: 128
-  num_policy_channels: 32
-  num_value_channels: 32
+  num_policy_channels: 128
+  num_value_channels: 128
   value_fc_size: 256
 
 # --- MCTS ---
 mcts:
-  num_simulations: 256       # Per move (tunable: 50-800)
-  c_puct: 2.5                # PUCT exploration constant
-  dirichlet_alpha: 0.3        # Dirichlet noise alpha
-  dirichlet_epsilon: 0.35     # Weight of noise vs prior
-  batch_size: 64               # Batch size for tree-parallel MCTS (1 = sequential, no virtual loss)
-  c_virtual_loss: 0.1         # Virtual loss penalty for batch MCTS
+  num_simulations: 800       # Per move (tunable: 50-800)
+  c_puct: 1.5                # PUCT exploration constant
+  dirichlet_alpha: 0.25        # Dirichlet noise alpha
+  dirichlet_epsilon: 0.25     # Weight of noise vs prior
+  batch_size: 16               # Batch size for tree-parallel MCTS (1 = sequential, no virtual loss)
+  c_virtual_loss: 0.5         # Virtual loss penalty for batch MCTS
 
 # --- Self-Play ---
 selfplay:
@@ -33,7 +33,7 @@ selfplay:
   temperature_high: 1.0
   temperature_low: 0.1
   adjudicate_graded: true     # use tanh grading instead of flat ±1
-  adjudicate_scaling: 9.0     # queen = ~0.76, rook = ~0.51, pawn = ~0.11
+  adjudicate_scaling: 12.0     # queen = ~0.76, rook = ~0.51, pawn = ~0.11
 
 # --- Replay Buffer ---
 buffer:
@@ -41,7 +41,7 @@ buffer:
 
 # --- Training ---
 training:
-  batch_size: 256
+  batch_size: 512
   learning_rate: 0.001
   momentum: 0.9
   weight_decay: 1e-4
@@ -84,9 +84,9 @@ gui:
 # --- Inference ---
 inference:
   use_gpu: true              # true = centralized GPU inference server, false = CPU per-worker
-  max_batch: 64               # Max samples per GPU forward pass
+  max_batch: 16               # Max samples per GPU forward pass
   max_wait_ms: 2.0            # Max ms to wait before firing a partial batch
-  prewarm_batch_sizes: [1, 8, 16, 32, 64]  # Batch sizes to pre-warm
+  prewarm_batch_sizes: [1, 8, 16]  # Batch sizes to pre-warm
 
 # --- Main ---
 main:

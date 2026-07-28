@@ -250,10 +250,10 @@ class MCTS:
         # Run simulations
         max_depth = 0
         total_depth = 0
+        sims_done = 0
 
         if self.batch_size > 1:
             # Batched mode: collect leaves, evaluate in batch, backprop
-            sims_done = 0
             while sims_done < self.num_simulations:
                 # Determine batch size for this iteration
                 bs = min(self.batch_size, self.num_simulations - sims_done)
@@ -277,9 +277,10 @@ class MCTS:
                     max_depth = max(max_depth, depth)
                     total_depth += depth
 
-                sims_done += bs
+                sims_done += len(leaf_nodes)
         else:
             # Sequential mode (original behavior, no virtual loss overhead)
+            sims_done = self.num_simulations
             for _ in range(self.num_simulations):
                 node = root
                 depth = 0
@@ -306,27 +307,47 @@ class MCTS:
         visit_policy, best_move = self._get_visit_policy(root)
 
         stats = {
-            'avg_depth': total_depth / self.num_simulations if self.num_simulations > 0 else 0,
+            'avg_depth': total_depth / sims_done if sims_done > 0 else 0,
             'max_depth': max_depth,
-            'num_simulations': self.num_simulations,
+            'num_simulations': sims_done,
         }
 
         return visit_policy, best_move, stats
 
     def _select_child(self, node: MCTSNode) -> MCTSNode:
-        """Select the child with highest PUCT score, accounting for virtual losses."""
+        """Select the child with highest PUCT score, accounting for virtual losses.
+
+        Virtual loss is implemented as a coherent, single-mechanism correction:
+        we pretend each in-flight evaluation returned a win for the child's side.
+        This inflates BOTH N (shrinking the exploration bonus) AND W (raising Q
+        from the child's perspective, which lowers -Q from the parent's perspective),
+        making the child less attractive to re-select within the same batch.
+
+        NOTE: ``self.c_virtual_loss`` is a dead parameter for this function — it
+        no longer appears in the UCB formula. The virtual loss now enters solely
+        through ``effective_N`` and ``effective_W``. The parameter is preserved
+        in the constructor for backward compatibility but has no effect here.
+        """
         best_score = -float('inf')
         best_child = None
 
         sqrt_parent_n = math.sqrt(node.N + 1)
 
         for action_idx, child in node.children.items():
-            # Effective visit count includes virtual losses
+            # Virtual loss: pretend in-flight evaluations already returned a
+            # win for the child's side. This inflates N (shrinking exploration
+            # bonus) AND inflates W (raising Q from the child's perspective,
+            # which lowers -Q from the parent's perspective, making the child
+            # less attractive to select again).
             effective_N = child.N + child.virtual_loss
+            effective_W = child.W + child.virtual_loss
+            effective_Q = effective_W / effective_N if effective_N > 0 else 0.0
 
-            # PUCT formula with virtual loss penalty
-            ucb = -child.Q + self.c_puct * child.P * sqrt_parent_n / (1 + effective_N) \
-                - self.c_virtual_loss * child.virtual_loss
+            # PUCT formula (standard AlphaZero style — no separate penalty term).
+            # -effective_Q: Q is stored from the child's side-to-move perspective,
+            # so we negate it for the parent's selection decision.
+            ucb = -effective_Q + self.c_puct * child.P * sqrt_parent_n / (1 + effective_N)
+
             if ucb > best_score:
                 best_score = ucb
                 best_child = child
@@ -340,27 +361,54 @@ class MCTS:
         by 1 on each node visited. This discourages multiple selections from
         choosing the same path.
 
+        **Deduplication**: If a leaf is selected for the second time within
+        the same batch (before it has been evaluated and expanded), the
+        duplicate is skipped and its virtual losses are rolled back. This
+        prevents:
+        1. Wasted network evaluations of the same position
+        2. Double-expansion of the same node (``_expand_node_with_data``
+           would create duplicate children on the second call)
+        3. Double-backprop of values from the same leaf
+
+        If the tree is exhausted and every path leads to already-selected
+        leaves, fewer than ``batch_size`` leaves may be returned. The caller
+        must handle this (``search()`` uses ``len(leaf_nodes)`` for the
+        simulation counter in the batched path).
+
         Args:
             root: Root node
-            batch_size: Number of leaf nodes to collect
+            batch_size: Target number of leaf nodes to collect
 
         Returns:
-            List of leaf MCTSNode objects (may include duplicates if all
-            paths converge to the same terminal).
+            List of unique leaf MCTSNode objects (may be shorter than batch_size).
         """
         leaves = []
+        selected_leaf_ids: set = set()
 
         for _ in range(batch_size):
             node = root
+            path: list = []  # nodes we applied VL to (for rollback if duplicate)
 
             # Selection with virtual loss
             while node.is_expanded and node.children:
                 # Apply virtual loss to this node before selecting child
                 node.virtual_loss += 1
+                path.append(node)
                 node = self._select_child(node)
 
-            # Apply virtual loss to the leaf
+            # If this leaf was already selected earlier in this batch, roll back
+            # and skip.  (``virtual_loss`` on the leaf itself hasn't been
+            # incremented yet, so we check ``selected_leaf_ids`` rather than VL.)
+            if id(node) in selected_leaf_ids:
+                # Undo virtual losses applied to interior nodes along the path
+                for n in path:
+                    n.virtual_loss -= 1
+                # Don't count this iteration — caller handles shorter returns
+                continue
+
+            # Apply virtual loss to the leaf and record it
             node.virtual_loss += 1
+            selected_leaf_ids.add(id(node))
             leaves.append(node)
 
         return leaves
@@ -622,6 +670,8 @@ class MCTS:
 
         for child in root.children.values():
             if child.N > 0 and child.board.is_checkmate():
+                root._checkmate_child_cached = True
+                root._checkmate_child_move = child.move
                 return child.move
         # No checkmate found - cache the negative results as well
         root._checkmate_child_cached = True
