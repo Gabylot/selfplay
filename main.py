@@ -188,8 +188,9 @@ def run_training(config, gui_enabled=False, num_workers=None):
             # Deserialise
             raw       = result['game_data']
             game_data = [(np.array(s,dtype=np.float32),
-                          np.array(p,dtype=np.float32),
-                          float(v)) for s,p,v in raw]
+                        np.array(p,dtype=np.float32),
+                        float(v),
+                        np.array(m,dtype=np.float32)) for s,p,v,m in raw]
             game_info = result['game_info']
             fens      = result.get('fens', [])
             moves     = result.get('moves', [])
@@ -264,8 +265,9 @@ def run_training(config, gui_enabled=False, num_workers=None):
                     praw = pr['game_data']
                     pgi  = pr['game_info']
                     pgd  = [(np.array(s,dtype=np.float32),
-                              np.array(p,dtype=np.float32),
-                              float(v)) for s,p,v in praw]
+                            np.array(p,dtype=np.float32),
+                            float(v),
+                            np.array(m,dtype=np.float32)) for s,p,v,m in praw]
                     buffer.add_game(pgd)
                     game_id          += 1
                     games_since_train += 1
