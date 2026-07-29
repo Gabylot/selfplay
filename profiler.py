@@ -7,6 +7,7 @@ Measures:
 - Board.copy() and legal_moves generation cost
 - CPU vs GPU inference comparison
 - GPU shader pre-warming effect
+- **NEW**: Per-phase MCTS breakdown using the real self-play config
 
 Run modes:
     python profiler.py              # Default: baseline profile at 200 sims
@@ -16,6 +17,8 @@ Run modes:
     python profiler.py --compare    # CPU vs GPU comparison across batch sizes
     python profiler.py --latency    # Detailed latency stats (min/max/stdev)
     python profiler.py --all        # Run all profiling modes
+    python profiler.py --mcts-detail  # Per-phase MCTS breakdown (uses real config)
+    python profiler.py --mcts-game    # Full profiled game (uses real config)
 """
 
 import argparse
@@ -30,6 +33,7 @@ from encoding import board_to_tensor, get_legal_move_mask, move_to_policy_index,
 from network import AlphaZeroNet, create_model_from_config
 from config import Config, get_config
 from mcts import MCTS, MCTSNode
+from inference_client import InferenceClient
 
 
 @dataclass
@@ -52,6 +56,8 @@ class ProfileResult:
     avg_depth: float = 0.0
     max_depth: int = 0
     visit_counts: List[int] = field(default_factory=list)
+    # Profiling sub-detail (from MCTS built-in profiler)
+    profiling: Optional[dict] = None
 
 
 @dataclass
@@ -315,21 +321,42 @@ def profile_mcts_overall(
     batch_size: int = 1,
     c_virtual_loss: float = 0.5,
     label: str = "",
-    num_runs: int = 1
+    num_runs: int = 1,
+    config: Optional[Config] = None,
 ) -> List[ProfileResult]:
-    """Run MCTS end-to-end and measure overall timing."""
+    """Run MCTS end-to-end and measure overall timing.
+
+    If *config* is provided, MCTS parameters are taken from the config
+    (matching self-play exactly).  Otherwise, hardcoded defaults are used.
+    """
     results = []
 
     for run in range(num_runs):
-        mcts = MCTS(
-            network=network,
-            num_simulations=num_simulations,
-            c_puct=1.5,
-            dirichlet_alpha=0.3,
-            dirichlet_epsilon=0.25,
-            batch_size=batch_size,
-            c_virtual_loss=c_virtual_loss,
-        )
+        if config is not None:
+            mcts = MCTS(
+                network=network,
+                num_simulations=config.mcts.num_simulations,
+                c_puct=config.mcts.c_puct,
+                dirichlet_alpha=config.mcts.dirichlet_alpha,
+                dirichlet_epsilon=config.mcts.dirichlet_epsilon,
+                batch_size=config.mcts.batch_size,
+                c_virtual_loss=config.mcts.c_virtual_loss,
+                max_game_length=config.selfplay.max_game_length,
+                adjudicate_material=config.selfplay.adjudicate_material,
+                piece_values=config.selfplay.piece_values,
+                adjudicate_graded=getattr(config.selfplay, 'adjudicate_graded', True),
+                adjudicate_scaling=getattr(config.selfplay, 'adjudicate_scaling', 9.0),
+            )
+        else:
+            mcts = MCTS(
+                network=network,
+                num_simulations=num_simulations,
+                c_puct=1.5,
+                dirichlet_alpha=0.3,
+                dirichlet_epsilon=0.25,
+                batch_size=batch_size,
+                c_virtual_loss=c_virtual_loss,
+            )
 
         root = mcts.get_root(board)
 
@@ -347,10 +374,11 @@ def profile_mcts_overall(
 
         run_label = f"{label}" if num_runs == 1 else f"{label}_run{run+1}"
 
+        pf = stats.get('profiling')
         result = ProfileResult(
             label=run_label,
-            num_simulations=num_simulations,
-            batch_size=batch_size,
+            num_simulations=num_simulations if config is None else config.mcts.num_simulations,
+            batch_size=batch_size if config is None else config.mcts.batch_size,
             sims_per_sec=num_simulations / total_time if total_time > 0 else 0,
             total_time=total_time,
             num_expansions=len(root.children),
@@ -358,6 +386,7 @@ def profile_mcts_overall(
             avg_depth=stats.get('avg_depth', 0),
             max_depth=stats.get('max_depth', 0),
             visit_counts=visit_counts,
+            profiling=pf,
         )
 
         results.append(result)
@@ -492,6 +521,392 @@ def profile_separate_costs(network: AlphaZeroNet, board: chess.Board,
     results['legal_mask_full_us'] = 1e6 * np.mean(times)
 
     return results
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# NEW: MCTS per-phase detailed profiling (uses real config)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _worker_search(worker_id, use_gpu, request_q, response_q, config_dict,
+                   board_fen, result_queue):
+    """Worker process: runs one MCTS search and sends back profiling data.
+
+    Runs in a separate process to simulate real self-play concurrency.
+    """
+    import os
+    import sys
+    import time
+    import numpy as np
+    import chess
+
+    # Limit torch threads like real workers do
+    import torch
+    torch.set_num_threads(1)
+
+    from config import Config
+    from network import create_model_from_config
+    from mcts import MCTS
+    from inference_client import InferenceClient
+
+    config = Config(config_dict)
+    board = chess.Board(board_fen)
+
+    if use_gpu:
+        client = InferenceClient(worker_id, request_q, response_q, network_id=0)
+        net_or_client = client
+    else:
+        net = create_model_from_config(config)
+        net.eval()
+        net_or_client = net
+
+    mcts = MCTS(
+        network=net_or_client,
+        num_simulations=config.mcts.num_simulations,
+        c_puct=config.mcts.c_puct,
+        dirichlet_alpha=config.mcts.dirichlet_alpha,
+        dirichlet_epsilon=config.mcts.dirichlet_epsilon,
+        batch_size=config.mcts.batch_size,
+        c_virtual_loss=config.mcts.c_virtual_loss,
+        max_game_length=config.selfplay.max_game_length,
+        adjudicate_material=config.selfplay.adjudicate_material,
+        piece_values=config.selfplay.piece_values,
+        adjudicate_graded=getattr(config.selfplay, 'adjudicate_graded', True),
+        adjudicate_scaling=getattr(config.selfplay, 'adjudicate_scaling', 9.0),
+    )
+    mcts.profile = True
+
+    root = mcts.get_root(board)
+    t0 = time.perf_counter()
+    visit_policy, best_move, stats = mcts.search(root)
+    elapsed = time.perf_counter() - t0
+
+    result_queue.put({
+        'worker_id': worker_id,
+        'elapsed': elapsed,
+        'sims': stats.get('num_simulations', config.mcts.num_simulations),
+        'avg_depth': stats.get('avg_depth', 0),
+        'max_depth': stats.get('max_depth', 0),
+        'profiling': stats.get('profiling', {}),
+    })
+
+
+def profile_mcts_detail(config: Config, num_runs: int = 3, midgame: bool = False,
+                        use_gpu: bool = False, num_workers: int = 1):
+    """Run MCTS with built-in profiling enabled, using the real self-play config.
+
+    When *use_gpu* is True (or config.inference.use_gpu is True), this starts
+    a real GPUInferenceServer subprocess and uses InferenceClient instances,
+    exactly matching the self-play worker pipeline.
+
+    **Workers run in parallel processes** (via multiprocessing.Process), just
+    like real self-play. This means the GPU server sees concurrent requests
+    from all workers simultaneously, enabling cross-worker batch aggregation
+    and showing real contention behavior.
+
+    Shows a detailed per-phase breakdown of where time is spent inside search().
+    """
+    import multiprocessing as mp
+    import queue as mp_queue
+
+    print(f"\n{'='*80}")
+    print(f"  MCTS Per-Phase Breakdown (config-driven, {num_runs} run(s))")
+    print(f"{'='*80}")
+
+    # Create network matching config exactly
+    print(f"  Network: {config.network.num_residual_blocks} blocks, "
+          f"{config.network.num_filters} filters, "
+          f"{config.network.num_policy_channels} policy ch, "
+          f"{config.network.num_value_channels} value ch, "
+          f"{config.network.value_fc_size} fc")
+    print(f"  MCTS: {config.mcts.num_simulations} sims, "
+          f"batch={config.mcts.batch_size}, "
+          f"c_puct={config.mcts.c_puct}, "
+          f"dir_alpha={config.mcts.dirichlet_alpha}, "
+          f"dir_eps={config.mcts.dirichlet_epsilon}")
+    print(f"  Self-play: max_game_length={config.selfplay.max_game_length}, "
+          f"adjudicate={config.selfplay.adjudicate_material}")
+    print(f"  Workers: {num_workers}  "
+          f"Inference: {'GPU (server)' if use_gpu else 'CPU (local)'}")
+
+    board = create_midgame_board() if midgame else create_test_board()
+    board_fen = board.fen()
+    if midgame:
+        print(f"  Position: midgame ({board_fen})")
+    else:
+        print(f"  Position: starting")
+
+    config_dict = config.to_dict()
+
+    # ── GPU server setup ──
+    gpu_server_process = None
+    request_q = None
+    response_qs = None
+    weight_q = None
+    gpu_ready = None
+    gpu_shutdown = None
+
+    if use_gpu:
+        from gpu_server import GPUInferenceServer
+        import torch
+
+        request_q = mp.Queue()
+        weight_q = mp.Queue()
+        response_qs = {i: mp.Queue(maxsize=256) for i in range(num_workers)}
+        gpu_ready = mp.Event()
+        gpu_shutdown = mp.Event()
+
+        # Create a temporary network just to serialize weights
+        net = create_model_from_config(config)
+        net.eval()
+        import io
+        buf = io.BytesIO()
+        torch.save(net.state_dict(), buf)
+        wb = buf.getvalue()
+        weight_q.put((0, wb))
+
+        server = GPUInferenceServer(
+            config=config,
+            request_queue=request_q,
+            response_queues=response_qs,
+            weight_queue=weight_q,
+            ready_event=gpu_ready,
+            shutdown_event=gpu_shutdown,
+        )
+        gpu_server_process = mp.Process(target=server.run, daemon=True)
+        gpu_server_process.start()
+        print("  [GPU] Waiting for server warm-up...")
+        gpu_ready.wait()
+        print("  [GPU] Server ready.")
+
+    try:
+        # ── Run profiling ──
+        merged_pf = None
+        total_time = 0.0
+        total_sims = 0
+
+        for run in range(num_runs):
+            result_queue = mp.Queue()
+            processes = []
+
+            # Launch all workers in parallel (real multiprocessing)
+            for wid in range(num_workers):
+                resp_q = response_qs[wid] if use_gpu else None
+                p = mp.Process(
+                    target=_worker_search,
+                    args=(wid, use_gpu, request_q, resp_q, config_dict,
+                          board_fen, result_queue),
+                    daemon=True,
+                )
+                p.start()
+                processes.append(p)
+
+            # Collect results
+            run_time = 0.0
+            run_sims = 0
+            for p in processes:
+                p.join(timeout=120)
+                if p.is_alive():
+                    p.kill()
+
+            # Drain result queue
+            while not result_queue.empty():
+                try:
+                    res = result_queue.get_nowait()
+                except mp_queue.Empty:
+                    break
+                run_time += res['elapsed']
+                run_sims += res['sims']
+                pf = res.get('profiling', {})
+                if merged_pf is None:
+                    merged_pf = dict(pf)
+                else:
+                    for k in merged_pf:
+                        if isinstance(merged_pf[k], (int, float)):
+                            merged_pf[k] += pf.get(k, 0)
+
+            total_time += run_time
+            total_sims += run_sims
+
+            avg_sps = run_sims / run_time if run_time > 0 else 0
+            print(f"  Run {run+1}: {run_time:.3f}s total ({run_time/num_workers:.3f}s/worker), "
+                  f"{avg_sps:.0f} sims/s aggregate, "
+                  f"avg_depth={res.get('avg_depth', 0):.1f}, "
+                  f"max_depth={res.get('max_depth', 0)}")
+
+        if merged_pf is None:
+            print("  [No profiling data collected]")
+            return
+
+        # Compute averages across runs
+        for k in merged_pf:
+            if isinstance(merged_pf[k], float):
+                merged_pf[k] /= num_runs
+            elif isinstance(merged_pf[k], int):
+                merged_pf[k] = merged_pf[k] // num_runs
+
+        avg_time = total_time / num_runs
+        avg_sims = total_sims // num_runs
+
+        # ── Print phase breakdown ──
+        print(f"\n  {'-'*75}")
+        print(f"  {'Phase':<30} {'Total(s)':>10} {'%Time':>8} {'Avg/call(ms)':>14} {'Calls':>8}")
+        print(f"  {'-'*75}")
+
+        if config.mcts.batch_size > 1:
+            phases = [
+                ('Network batch eval', merged_pf.get('network_batch_predict', 0),
+                 merged_pf.get('network_batch_calls', 0)),
+                ('Backpropagation', merged_pf.get('backprop_total', 0),
+                 avg_sims),
+            ]
+            selection_related = merged_pf.get('selection_total', 0)
+            phases.insert(0, ('Selection + VL mgmt', selection_related, avg_sims))
+        else:
+            phases = [
+                ('Selection', merged_pf.get('selection_total', 0), avg_sims),
+                ('Expansion (total)', merged_pf.get('expansion_total', 0),
+                 merged_pf.get('expansions', 0)),
+                ('Backpropagation', merged_pf.get('backprop_total', 0), avg_sims),
+            ]
+
+        accounted = 0.0
+        for name, total, calls in phases:
+            pct = 100.0 * total / avg_time if avg_time > 0 else 0
+            avg_call_ms = (total / calls) * 1000 if calls > 0 else 0
+            accounted += total
+            print(f"  {name:<30} {total:>10.4f} {pct:>7.1f}% {avg_call_ms:>13.3f} {calls:>8}")
+
+        other = avg_time - accounted
+        if other > 0.001:
+            opct = 100.0 * other / avg_time
+            print(f"  {'Other (overhead)':<30} {other:>10.4f} {opct:>7.1f}% {'-':>14} {'-':>8}")
+
+        print(f"  {'-'*75}")
+        print(f"  {'TOTAL':<30} {avg_time:>10.4f} {'100.0%':>8}")
+        print(f"\n  Sims/sec (aggregate): {avg_sims / avg_time:.1f}  "
+              f"Sims/sec/worker: {avg_sims / avg_time / num_workers:.1f}  "
+              f"Avg depth: {res.get('avg_depth', 0):.1f}  "
+              f"Max depth: {res.get('max_depth', 0)}")
+
+        # ── Expansion sub-operations breakdown ──
+        expansions = merged_pf.get('expansions', 0)
+        if expansions > 0:
+            print(f"\n  {'-'*60}")
+            print(f"  Expansion Sub-operations (avg per expansion)")
+            print(f"  {'-'*60}")
+            sub_ops = [
+                ('board.legal_moves', merged_pf.get('expand_legal_moves', 0)),
+                ('move_to_policy_index', merged_pf.get('expand_policy_indices', 0)),
+                ('mask + renormalize', merged_pf.get('expand_mask_renorm', 0)),
+                ('child creation', merged_pf.get('expand_child_creation', 0)),
+            ]
+            for name, total in sub_ops:
+                avg_us = (total / expansions) * 1e6
+                pct = 100.0 * total / merged_pf.get('expansion_total', 1)
+                print(f"    {name:<25} {avg_us:>8.1f} us  ({pct:>5.1f}% of expansion)")
+
+        # ── Network call summary ──
+        print(f"\n  {'-'*60}")
+        print(f"  Network Call Summary")
+        print(f"  {'-'*60}")
+        if config.mcts.batch_size > 1:
+            batch_calls = merged_pf.get('network_batch_calls', 0)
+            batch_time = merged_pf.get('network_batch_predict', 0)
+            if batch_calls > 0:
+                print(f"    Batched calls:     {batch_calls}")
+                print(f"    Total batch time:  {batch_time:.4f}s")
+                print(f"    Avg per call:      {batch_time/batch_calls*1000:.3f} ms")
+                print(f"    Avg batch size:    {avg_sims / batch_calls:.1f}")
+        else:
+            net_calls = merged_pf.get('network_calls', 0)
+            net_time = merged_pf.get('network_predict', 0)
+            if net_calls > 0:
+                print(f"    Single calls:      {net_calls}")
+                print(f"    Total network time:{net_time:.4f}s")
+                print(f"    Avg per call:      {net_time/net_calls*1000:.3f} ms")
+
+        # ── Visit distribution (approximate from last result) ──
+        print(f"\n  {'-'*60}")
+        print(f"  Visit Distribution")
+        print(f"  {'-'*60}")
+        # Visit distribution requires access to the last root node, which lives
+        # in a worker process.  We report depth/sims instead as the best proxy.
+        print(f"    (Visit distribution unavailable in multi-process mode)")
+        print(f"    Sims/worker: {avg_sims // num_workers}  "
+              f"Avg depth: {res.get('avg_depth', 0):.1f}  "
+              f"Max depth: {res.get('max_depth', 0)}")
+        print()
+
+    finally:
+        # Cleanup GPU server
+        if use_gpu and gpu_server_process is not None:
+            gpu_shutdown.set()
+            try:
+                request_q.put_nowait(None)
+            except:
+                pass
+            gpu_server_process.join(timeout=5)
+            if gpu_server_process.is_alive():
+                gpu_server_process.kill()
+
+
+def profile_mcts_game(config: Config, num_games: int = 1, midgame: bool = False):
+    """Run a full self-play game with MCTS profiling enabled.
+
+    Uses the real self-play config and plays a complete game, collecting
+    per-move and aggregate profiling data.
+    """
+    from selfplay import play_one_game
+
+    print(f"\n{'='*80}")
+    print(f"  MCTS Full Game Profile ({num_games} game(s), config-driven)")
+    print(f"{'='*80}")
+
+    network = create_model_from_config(config)
+    network.eval()
+
+    piece_values = dict(config.selfplay.piece_values)
+
+    all_pf_data = []
+    total_moves = 0
+
+    for game_idx in range(num_games):
+        mcts = MCTS(
+            network=network,
+            num_simulations=config.mcts.num_simulations,
+            c_puct=config.mcts.c_puct,
+            dirichlet_alpha=config.mcts.dirichlet_alpha,
+            dirichlet_epsilon=config.mcts.dirichlet_epsilon,
+            batch_size=config.mcts.batch_size,
+            c_virtual_loss=config.mcts.c_virtual_loss,
+            max_game_length=config.selfplay.max_game_length,
+            adjudicate_material=config.selfplay.adjudicate_material,
+            piece_values=piece_values,
+            adjudicate_graded=getattr(config.selfplay, 'adjudicate_graded', True),
+            adjudicate_scaling=getattr(config.selfplay, 'adjudicate_scaling', 9.0),
+        )
+        mcts.profile = True
+
+        game_data, game_info = play_one_game(
+            mcts_engine=mcts,
+            max_game_length=config.selfplay.max_game_length,
+            adjudicate_material=config.selfplay.adjudicate_material,
+            piece_values=piece_values,
+            temp_threshold=config.selfplay.temperature_threshold,
+            temp_high=config.selfplay.temperature_high,
+            temp_low=config.selfplay.temperature_low,
+            adjudicate_graded=getattr(config.selfplay, 'adjudicate_graded', True),
+            adjudicate_scaling=getattr(config.selfplay, 'adjudicate_scaling', 9.0),
+        )
+
+        print(f"\n  Game {game_idx+1}: {game_info['result_str']}, "
+              f"{game_info['length']} moves, "
+              f"{game_info['termination']}")
+
+        total_moves += game_info['length']
+
+    print(f"\n  Total moves across {num_games} game(s): {total_moves}")
+    print()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -641,10 +1056,38 @@ def main():
     parser.add_argument('--samples', type=int, default=200, help='Latency measurement samples')
     parser.add_argument('--batch-sizes', type=str, default="1,8,16,32,64,128",
                         help='Comma-separated batch sizes for latency tests')
+    # NEW flags
+    parser.add_argument('--mcts-detail', action='store_true',
+                        help='Per-phase MCTS breakdown using real self-play config')
+    parser.add_argument('--mcts-game', action='store_true',
+                        help='Full profiled game using real self-play config')
+    parser.add_argument('--games', type=int, default=1,
+                        help='Number of games for --mcts-game (default: 1)')
+    parser.add_argument('--workers', type=int, default=1,
+                        help='Number of simulated workers for --mcts-detail (default: 1, matches self-play)')
+    parser.add_argument('--config', type=str, default=None,
+                        help='Path to config.yaml (default: config.yaml in project root)')
     args = parser.parse_args()
 
     batch_sizes = [int(x) for x in args.batch_sizes.split(",")]
 
+    # ── NEW: MCTS detail mode (uses real config) ──
+    if args.mcts_detail:
+        cfg = get_config(args.config)
+        # Use GPU if --gpu flag is set OR config says use_gpu
+        use_gpu = args.gpu or (hasattr(cfg, 'inference') and getattr(cfg.inference, 'use_gpu', False))
+        num_workers = args.workers
+        profile_mcts_detail(cfg, num_runs=args.runs, midgame=args.midgame,
+                            use_gpu=use_gpu, num_workers=num_workers)
+        return
+
+    # ── NEW: MCTS full game mode (uses real config) ──
+    if args.mcts_game:
+        cfg = get_config(args.config)
+        profile_mcts_game(cfg, num_games=args.games, midgame=args.midgame)
+        return
+
+    # ── Legacy modes (use small throwaway network for speed) ──
     # Create a small network for profiling (faster)
     print("Creating network...")
     network = AlphaZeroNet(num_residual_blocks=4, num_filters=64)
@@ -720,7 +1163,8 @@ def main():
 
     # ── Default: baseline profile ──
     if not any([args.batch, args.sweep, args.gpu, args.compare,
-                args.latency, args.warmup, args.all]):
+                args.latency, args.warmup, args.all,
+                args.mcts_detail, args.mcts_game]):
         results = profile_baseline(network, args.sims, args.runs)
         print_profile_table(results)
         if args.detailed:

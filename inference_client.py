@@ -59,6 +59,11 @@ class InferenceClient:
 
     # ── Public interface (matches AlphaZeroNet) ─────────────────────────
 
+    def predictBatch(self, states: np.ndarray):
+        """Alias for predict_batch() to match AlphaZeroNet interface."""
+        return self.predict_batch(states)
+
+
     def predict(self, state: np.ndarray):
         """Predict policy and value for a single board state.
 

@@ -13,6 +13,7 @@ Implements the AlphaZero PUCT variant with optional batched inference:
 """
 
 import math
+import time
 import numpy as np
 import chess
 from typing import Optional, Tuple, List, Dict
@@ -179,6 +180,9 @@ class MCTS:
         self.adjudicate_graded = adjudicate_graded
         self.adjudicate_scaling = adjudicate_scaling
 
+        # Profiling: when True, search() collects per-phase timing into stats['profiling']
+        self.profile = False
+
     def get_root(self, board: chess.Board) -> MCTSNode:
         """Create a root node for the given board (eagerly stores the board)."""
         return MCTSNode(board.copy())
@@ -235,6 +239,9 @@ class MCTS:
         Uses batched inference if self.batch_size > 1, otherwise falls back
         to the standard sequential search.
 
+        When ``self.profile`` is ``True``, the returned ``stats`` dict includes
+        a ``'profiling'`` sub-dict with detailed per-phase timing.
+
         Args:
             root: Root node of the search tree
 
@@ -250,6 +257,27 @@ class MCTS:
         # Add Dirichlet noise to root priors
         self._add_dirichlet_noise(root)
 
+        # Profiling accumulators
+        if self.profile:
+            pf = {
+                'selection_total': 0.0,
+                'expansion_total': 0.0,
+                'backprop_total': 0.0,
+                'expand_legal_moves': 0.0,
+                'expand_policy_indices': 0.0,
+                'expand_mask_renorm': 0.0,
+                'expand_child_creation': 0.0,
+                'network_predict': 0.0,
+                'network_batch_predict': 0.0,
+                'collection_vl_mgmt': 0.0,
+                'network_calls': 0,
+                'network_batch_calls': 0,
+                'expansions': 0,
+                'total_nodes_created': 0,
+            }
+        else:
+            pf = None
+
         # Run simulations
         max_depth = 0
         total_depth = 0
@@ -262,27 +290,26 @@ class MCTS:
                 bs = min(self.batch_size, self.num_simulations - sims_done)
 
                 # Collect leaf nodes via selection with virtual loss.
-                # Returns (leaf, depth) tuples where depth is the number of
-                # selection steps from root — always correct regardless of
-                # tree recycling (unlike the cached node.depth field).
                 leaf_depth_pairs = self._collect_batch(root, bs)
 
                 if not leaf_depth_pairs:
-                    # Shouldn't happen, but safety check
                     break
 
-                # Extract just the leaf nodes for batch evaluation
                 leaf_nodes = [ld[0] for ld in leaf_depth_pairs]
 
                 # Evaluate all leaves in a single batch network call
+                t0 = time.perf_counter() if pf else 0
                 values = self._evaluate_batch(leaf_nodes)
+                if pf:
+                    pf['network_batch_predict'] += time.perf_counter() - t0
+                    pf['network_batch_calls'] += 1
 
                 # Backpropagate each leaf, removing virtual losses
                 for (leaf, depth), value in zip(leaf_depth_pairs, values):
+                    t0 = time.perf_counter() if pf else 0
                     self._backpropagate_with_virtual_loss(leaf, value)
-
-                    # Track depth — use the traversal-counted depth from
-                    # _collect_batch, not the stale cached node.depth field.
+                    if pf:
+                        pf['backprop_total'] += time.perf_counter() - t0
                     max_depth = max(max_depth, depth)
                     total_depth += depth
 
@@ -295,19 +322,28 @@ class MCTS:
                 depth = 0
 
                 # Selection: traverse tree using PUCT
+                t0 = time.perf_counter() if pf else 0
                 while node.is_expanded and node.children:
                     node = self._select_child(node)
                     depth += 1
+                if pf:
+                    pf['selection_total'] += time.perf_counter() - t0
 
                 # Expansion and evaluation
                 if not node.is_expanded:
+                    t0 = time.perf_counter() if pf else 0
                     value = self._expand_node(node)
+                    if pf:
+                        pf['expansion_total'] += time.perf_counter() - t0
+                        pf['expansions'] += 1
                 else:
-                    # Terminal node -- value is the game result
                     value = self._get_terminal_value(node)
 
                 # Backpropagation
+                t0 = time.perf_counter() if pf else 0
                 self._backpropagate(node, value)
+                if pf:
+                    pf['backprop_total'] += time.perf_counter() - t0
 
                 max_depth = max(max_depth, depth)
                 total_depth += depth
@@ -320,6 +356,9 @@ class MCTS:
             'max_depth': max_depth,
             'num_simulations': sims_done,
         }
+
+        if pf:
+            stats['profiling'] = pf
 
         return visit_policy, best_move, stats
 
