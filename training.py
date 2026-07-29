@@ -4,6 +4,11 @@ Samples batches from the replay buffer and trains the dual-head network
 with separate policy loss (cross-entropy) and value loss (MSE).
 
 Both losses are logged separately to the stats database.
+
+NOTE: policy_loss_fn now receives a legal_move_mask for every sample so the
+softmax normalizes only over actually-legal moves in that position, instead
+of over the full 4672-action space (which wastes gradient signal modeling
+probabilities for moves that could never be played).
 """
 
 import torch
@@ -58,7 +63,8 @@ def value_loss_fn(value_pred: torch.Tensor, target_values: torch.Tensor) -> torc
 
 def train_one_step(model: AlphaZeroNet, optimizer: torch.optim.Optimizer,
                    replay_buffer: ReplayBuffer, batch_size: int, 
-                   device: torch.device = None) -> dict:
+                   device: torch.device = None,
+                   grad_clip_norm: Optional[float] = 1.0) -> dict:
     """Perform a single training step.
     
     Args:
@@ -67,38 +73,46 @@ def train_one_step(model: AlphaZeroNet, optimizer: torch.optim.Optimizer,
         replay_buffer: Replay buffer to sample from
         batch_size: Batch size
         device: Torch device
+        grad_clip_norm: Max gradient norm for clipping (None to disable)
     
     Returns:
-        Dict with 'policy_loss', 'value_loss', 'total_loss' (all float scalars)
+        Dict with 'policy_loss', 'value_loss', 'total_loss', 'grad_norm' (all float scalars)
     """
     model.train()
     
     if device is None:
         device = next(model.parameters()).device
     
-    # Sample batch from replay buffer
-    states, policies, values = replay_buffer.sample_batch(batch_size)
+    # Sample batch from replay buffer (now includes legal-move masks)
+    states, policies, values, masks = replay_buffer.sample_batch(batch_size)
     states = torch.from_numpy(states).float().to(device)
     policies = torch.from_numpy(policies).float().to(device)
     values = torch.from_numpy(values).float().to(device)
+    masks = torch.from_numpy(masks).float().to(device)
     
     # Forward pass
     policy_logits, value_pred = model(states)
     
     # Compute losses
-    p_loss = policy_loss_fn(policy_logits, policies)
+    p_loss = policy_loss_fn(policy_logits, policies, legal_move_masks=masks)
     v_loss = value_loss_fn(value_pred, values)
     total_loss = p_loss + v_loss
     
     # Backward pass
     optimizer.zero_grad()
     total_loss.backward()
+
+    grad_norm = None
+    if grad_clip_norm is not None:
+        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip_norm)
+
     optimizer.step()
     
     return {
         'policy_loss': float(p_loss.item()),
         'value_loss': float(v_loss.item()),
         'total_loss': float(total_loss.item()),
+        'grad_norm': float(grad_norm.item()) if grad_norm is not None else 0.0,
     }
 
 

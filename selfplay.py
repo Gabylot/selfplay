@@ -5,6 +5,18 @@ Parallel self-play:
   - The same worker pool handles both self-play AND eval games.
   - During eval the main loop stops pushing self-play tasks;
     workers drain their queue and receive eval tasks instead.
+
+NOTE 1: each stored position is a 4-tuple (state, policy, value, legal_move_mask)
+instead of a 3-tuple. This lets training.py mask illegal moves out of the
+policy-loss softmax. See ReplayBuffer.load() for backward-compat handling of
+old buffer files saved before this change.
+
+NOTE 2: when GPU inference is enabled (config.inference.use_gpu), gating eval
+(network A vs network B) is routed through the centralized dual-network GPU
+server via InferenceClient(network_id=0 / 1) instead of loading both networks
+onto CPU. Reference eval (network vs alpha-beta) also uses network_id=0 when
+GPU inference is active. This mirrors the self-play path and avoids the CPU
+fallback silently running whenever use_gpu is set.
 """
 
 import numpy as np
@@ -17,7 +29,7 @@ import time
 import io
 import os
 
-from encoding import board_to_tensor
+from encoding import board_to_tensor, get_legal_move_mask, NUM_ACTIONS
 from network import AlphaZeroNet
 from mcts import MCTS
 from inference_client import InferenceClient
@@ -35,8 +47,12 @@ class ReplayBuffer:
         self.total_positions = 0
 
     def add_game(self, game_data):
-        for s, p, v in game_data:
-            self.buffer.append((s, p, v))
+        """Add a completed game's positions to the buffer.
+
+        game_data: list of (state, policy, value, legal_move_mask) tuples.
+        """
+        for s, p, v, m in game_data:
+            self.buffer.append((s, p, v, m))
             self.total_positions += 1
         self.total_games += 1
 
@@ -44,7 +60,8 @@ class ReplayBuffer:
         ix = np.random.choice(len(self.buffer), size=min(batch_size, len(self.buffer)), replace=False)
         return (np.array([self.buffer[i][0] for i in ix]),
                 np.array([self.buffer[i][1] for i in ix]),
-                np.array([self.buffer[i][2] for i in ix], dtype=np.float32))
+                np.array([self.buffer[i][2] for i in ix], dtype=np.float32),
+                np.array([self.buffer[i][3] for i in ix], dtype=np.float32))
 
     def __len__(self): return len(self.buffer)
 
@@ -71,16 +88,25 @@ class ReplayBuffer:
         states   = np.stack([self.buffer[i][0] for i in range(n)])
         policies = np.stack([self.buffer[i][1] for i in range(n)])
         values   = np.array([self.buffer[i][2] for i in range(n)], dtype=np.float32)
+        masks    = np.stack([self.buffer[i][3] for i in range(n)])
         np.savez_compressed(
             path,
-            states=states, policies=policies, values=values,
+            states=states, policies=policies, values=values, masks=masks,
             total_games=self.total_games,
             total_positions=self.total_positions,
         )
 
     @classmethod
     def load(cls, path, max_size=100000):
-        """Load buffer from a .npz file. Returns a new ReplayBuffer, or None on failure."""
+        """Load buffer from a .npz file. Returns a new ReplayBuffer, or None on failure.
+
+        Backward compatibility: buffers saved before legal-move masking was
+        added won't have a 'masks' array. In that case we fill in all-ones
+        masks (i.e. no masking effect) for those old positions rather than
+        crashing or discarding the buffer. This is a soft transition — those
+        old positions just won't get the masking benefit until they age out
+        of the buffer naturally.
+        """
         try:
             data = np.load(path, allow_pickle=False)
             buf = cls(max_size=max_size)
@@ -88,8 +114,15 @@ class ReplayBuffer:
             policies = data['policies']
             values   = data['values']
             n = len(values)
+            if 'masks' in data:
+                masks = data['masks']
+            else:
+                print(f"[WARN] {path} has no saved legal-move masks (old format). "
+                      f"Filling with all-ones masks for {n} positions — these will "
+                      f"train without masking until they age out of the buffer.")
+                masks = np.ones((n, NUM_ACTIONS), dtype=np.float32)
             for i in range(n):
-                buf.buffer.append((states[i], policies[i], float(values[i])))
+                buf.buffer.append((states[i], policies[i], float(values[i]), masks[i]))
             buf.total_games      = int(data.get('total_games', n))
             buf.total_positions  = int(data.get('total_positions', n))
             return buf
@@ -178,7 +211,8 @@ def play_one_game(mcts_engine, max_game_length=150, adjudicate_material=True,
 
         st = board_to_tensor(board)
         cp = 1.0 if board.turn == chess.WHITE else -1.0
-        game_states.append((st, visit_policy.copy(), cp))
+        legal_mask = get_legal_move_mask(board)
+        game_states.append((st, visit_policy.copy(), cp, legal_mask))
         mcts_stats_list.append(stats)
 
         mcts_move_data = {'selected_move': selected_move.uci(), 'candidates': move_candidates}
@@ -250,7 +284,7 @@ def play_one_game(mcts_engine, max_game_length=150, adjudicate_material=True,
     else:
         result_str = "1/2-1/2"
 
-    game_data = [(s, p, outcome * pl) for s, p, pl in game_states]
+    game_data = [(s, p, outcome * pl, m) for s, p, pl, m in game_states]
     avg_depth = float(np.mean([s.get('avg_depth', 0) for s in mcts_stats_list])) if mcts_stats_list else 0.0
 
     return game_data, {
@@ -299,7 +333,7 @@ def self_play_game(network, config, on_move=None):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _worker_process(worker_id, task_queue, result_queue, config_dict, shutdown_event,
-                    request_queue=None, response_queue=None, weight_queue=None):
+                    request_queue=None, response_queue=None):
     import torch, sys, os
     from config import Config
     from network import AlphaZeroNet
@@ -312,10 +346,10 @@ def _worker_process(worker_id, task_queue, result_queue, config_dict, shutdown_e
     use_gpu = (getattr(config, 'inference', None)
                and getattr(config.inference, 'use_gpu', False))
     inference_client = None
-    inference_client_b = None
     if use_gpu and request_queue is not None and response_queue is not None:
+        # network_id=0 by default; gating eval below spins up a second
+        # client bound to network_id=1 for the "best" network.
         inference_client = InferenceClient(worker_id, request_queue, response_queue, network_id=0)
-        inference_client_b = InferenceClient(worker_id, request_queue, response_queue, network_id=1)
 
     def make_net():
         n = AlphaZeroNet(
@@ -391,12 +425,11 @@ def _worker_process(worker_id, task_queue, result_queue, config_dict, shutdown_e
             })
             result_queue.put({
                 'worker_id': worker_id, 'type': 'selfplay',
-                'game_data': [(s.tolist(), p.tolist(), float(v)) for s, p, v in gd],
+                'game_data': [(s.tolist(), p.tolist(), float(v), m.tolist()) for s, p, v, m in gd],
                 'game_info': gi, 'fens': fens, 'moves': ucis, 'mcts_stats': mdata,
             })
 
         elif t == 'eval':
-            load(net_a, task['weights_a'])
             a_is_white = task['a_is_white']
             eval_type = task['eval_type']
             game_label = task.get('game_label', '')
@@ -416,11 +449,15 @@ def _worker_process(worker_id, task_queue, result_queue, config_dict, shutdown_e
                 })
 
             if eval_type == 'gating':
-                load(net_b, task['weights_b'])
-                if use_gpu and inference_client is not None and inference_client_b is not None:
-                    ea = mcts(inference_client, False); eb = mcts(inference_client_b, False)
+                # ── GPU path: route both nets through the dual-network server ──
+                if inference_client is not None:
+                    client_a = InferenceClient(worker_id, request_queue, response_queue, network_id=0)
+                    client_b = InferenceClient(worker_id, request_queue, response_queue, network_id=1)
+                    ea = mcts(client_a, False); eb = mcts(client_b, False)
                 else:
+                    load(net_a, task['weights_a']); load(net_b, task['weights_b'])
                     ea = mcts(net_a, False); eb = mcts(net_b, False)
+
                 board = chess.Board(); mc = 0
                 root_a = None; root_b = None
                 while not board.is_game_over() and mc < config.selfplay.max_game_length:
@@ -453,10 +490,15 @@ def _worker_process(worker_id, task_queue, result_queue, config_dict, shutdown_e
             else:  # reference
                 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
                 from evaluation import alpha_beta_best_move
-                if use_gpu and inference_client is not None:
-                    ea = mcts(inference_client, False)
+
+                # ── GPU path: network A via the GPU server (network_id=0) ──
+                if inference_client is not None:
+                    client_a = InferenceClient(worker_id, request_queue, response_queue, network_id=0)
+                    ea = mcts(client_a, False)
                 else:
+                    load(net_a, task['weights_a'])
                     ea = mcts(net_a, False)
+
                 board = chess.Board(); mc = 0
                 root_net = None
                 while not board.is_game_over() and mc < config.selfplay.max_game_length:
@@ -548,7 +590,6 @@ class ParallelSelfPlay:
             if self._use_gpu:
                 kwargs['request_queue'] = self._request_q
                 kwargs['response_queue'] = self._response_qs[i]
-                kwargs['weight_queue'] = self._weight_q
             p = mp.Process(target=_worker_process,
                            args=(i, tq, self._result_q, cd, self._shutdown),
                            kwargs=kwargs, daemon=True)
@@ -582,6 +623,7 @@ class ParallelSelfPlay:
             while not self._weight_q.empty():
                 try: self._weight_q.get_nowait()
                 except: pass
+            # network_id 0 = the network self-play (and reference eval) uses.
             self._weight_q.put((0, wb))
 
         for tq in self._task_qs:
@@ -594,23 +636,20 @@ class ParallelSelfPlay:
             try: tq.put_nowait(task)
             except queue.Full: pass
 
-    def push_eval_weights(self, weights_a, weights_b=None):
-        """Push both networks' weights to the GPU server for evaluation.
+    def push_weights(self, network): self.push_selfplay(network)
 
-        Args:
-            weights_a: Serialized weights for network A (network_id=0)
-            weights_b: Serialized weights for network B (network_id=1), or None
+    def push_eval_weights(self, wb_latest, wb_best):
+        """Push both networks to the GPU server ahead of a gating eval round.
+
+        network_id 0 = latest (network A), network_id 1 = best (network B).
+        No-op if GPU inference is disabled — in that case each eval task
+        carries its own weights ('weights_a'/'weights_b') and workers load
+        them locally instead.
         """
         if not self._use_gpu:
             return
-        while not self._weight_q.empty():
-            try: self._weight_q.get_nowait()
-            except: pass
-        self._weight_q.put((0, weights_a))
-        if weights_b is not None:
-            self._weight_q.put((1, weights_b))
-
-    def push_weights(self, network): self.push_selfplay(network)
+        self._weight_q.put((0, wb_latest))
+        self._weight_q.put((1, wb_best))
 
     def dispatch_eval_games(self, tasks):
         done = 0
