@@ -4,15 +4,19 @@ Runs in a dedicated process, owns the GPU (torch_directml), and serves
 inference requests from all worker processes.  Includes shader pre-warming
 to eliminate DirectML's lazy-compilation latency spikes.
 
+Supports **two** networks simultaneously (network_id 0 and 1) so that
+gating evaluation (network A vs network B) can run entirely on the GPU
+server without round-tripping weights.
+
 Protocol
 --------
-Request  : (worker_id, request_id, state)
-           - state ndim == 3 (20,8,8):   single request (timer-aggregated)
-           - state ndim == 4 (N,20,8,8):  batch request (processed immediately)
+Weight  : (network_id, raw_bytes)           — network_id ∈ {0, 1}
+Request : (worker_id, request_id, network_id, state)
+          - state ndim == 3 (20,8,8):   single request (timer-aggregated)
+          - state ndim == 4 (N,20,8,8):  batch request (processed immediately)
 Response : (request_id, policy, value)
-           - single response:  policy (4672,) ndarray, value float
-           - batch response:   policy (N,4672) ndarray, values (N,) ndarray
-Weight   : raw bytes (serialized state_dict via torch.save)
+          - single response:  policy (4672,) ndarray, value float
+          - batch response:   policy (N,4672) ndarray, values (N,) ndarray
 Shutdown : None sentinel in request_queue
 """
 
@@ -51,7 +55,7 @@ def warmup_shaders(network, device, batch_sizes=(1, 8, 16, 32, 64, 128)):
 # ─────────────────────────────────────────────────────────────────────────────
 
 class GPUInferenceServer:
-    """Centralized GPU inference server.
+    """Centralized GPU inference server with dual-network support.
 
     Parameters
     ----------
@@ -59,13 +63,14 @@ class GPUInferenceServer:
         Must contain ``config.inference.max_batch`` and
         ``config.inference.max_wait_ms``.
     request_queue : mp.Queue
-        Workers put ``(worker_id, request_id, state)`` tuples here.
+        Workers put ``(worker_id, request_id, network_id, state)`` tuples here.
     response_queues : dict[int, mp.Queue]
         Per-worker queues.  Server puts ``(request_id, policy, value)``
         tuples here so each worker only receives its own results.
     weight_queue : mp.Queue
-        Main process puts raw weight bytes here.  The server drains this
-        queue every iteration to always use the latest weights.
+        Main process puts ``(network_id, raw_bytes)`` tuples here.  The server
+        drains this queue every iteration to always use the latest weights
+        for each network.
     ready_event : mp.Event
         Set after shader pre-warming is complete.
     shutdown_event : mp.Event
@@ -96,43 +101,51 @@ class GPUInferenceServer:
         device = torch_directml.device()
         print(f"[GPU-Server] DirectML device: {torch_directml.device_name(0)}")
 
-        # Build network
-        net = AlphaZeroNet(
-            num_residual_blocks=self.config.network.num_residual_blocks,
-            num_filters=self.config.network.num_filters,
-            num_policy_channels=self.config.network.num_policy_channels,
-            num_value_channels=self.config.network.num_value_channels,
-            value_fc_size=self.config.network.value_fc_size,
-        ).to(device)
-        net.eval()
+        # Build two networks (network_id 0 = primary/latest,
+        # network_id 1 = best/secondary for gating evaluation)
+        def _build_net():
+            n = AlphaZeroNet(
+                num_residual_blocks=self.config.network.num_residual_blocks,
+                num_filters=self.config.network.num_filters,
+                num_policy_channels=self.config.network.num_policy_channels,
+                num_value_channels=self.config.network.num_value_channels,
+                value_fc_size=self.config.network.value_fc_size,
+            ).to(device)
+            n.eval()
+            return n
 
-        # Pre-warm shaders
+        net_a = _build_net()
+        net_b = _build_net()
+        nets = {0: net_a, 1: net_b}
+
+        # Pre-warm shaders for both networks
         print(f"[GPU-Server] Pre-warming shaders for batch sizes: {self.prewarm_sizes}")
         t0 = time.perf_counter()
-        warmup_shaders(net, device, self.prewarm_sizes)
+        for label, net in [("net_a", net_a), ("net_b", net_b)]:
+            warmup_shaders(net, device, self.prewarm_sizes)
 
-        # Verify the fast path is stable after warming
-        with torch.no_grad():
-            for bs in self.prewarm_sizes:
-                dummy = torch.randn(bs, NUM_PLANES, 8, 8, device=device)
-                times = []
-                for _ in range(5):
-                    t = time.perf_counter()
-                    net(dummy)
-                    times.append((time.perf_counter() - t) * 1000)
-                print(f"[GPU-Server] bs={bs}: min={min(times):.1f}ms max={max(times):.1f}ms")
+            # Verify the fast path is stable after warming
+            with torch.no_grad():
+                for bs in self.prewarm_sizes:
+                    dummy = torch.randn(bs, NUM_PLANES, 8, 8, device=device)
+                    times = []
+                    for _ in range(5):
+                        t = time.perf_counter()
+                        net(dummy)
+                        times.append((time.perf_counter() - t) * 1000)
+                    print(f"[GPU-Server] {label} bs={bs}: min={min(times):.1f}ms max={max(times):.1f}ms")
 
         elapsed = (time.perf_counter() - t0) * 1000
         print(f"[GPU-Server] Shader pre-warming done in {elapsed:.0f} ms")
         self.ready_event.set()
 
         # Load any weights already in the queue
-        self._drain_weight_queue(net, device)
+        self._drain_weight_queue(nets, device)
 
         # ── Main inference loop ──
         while not self.shutdown_event.is_set():
             # Drain weight queue first (non-blocking)
-            self._drain_weight_queue(net, device)
+            self._drain_weight_queue(nets, device)
 
             # Get one request (blocking, with timeout to allow weight checks)
             try:
@@ -145,7 +158,8 @@ class GPUInferenceServer:
                 self._send_shutdown_to_workers()
                 return
 
-            worker_id, request_id, state = req
+            worker_id, request_id, network_id, state = req
+            net = nets.get(network_id, net_a)
 
             # Differentiate: batch request (ndim == 4) vs single (ndim == 3)
             if state.ndim == 4:
@@ -153,7 +167,7 @@ class GPUInferenceServer:
                 self._process_single_batch(net, device, worker_id, request_id, state)
             else:
                 # ── Single request: collect more for timer-based batching ──
-                batch = [(worker_id, request_id, state)]
+                batch = [(worker_id, request_id, network_id, state)]
                 deadline = time.monotonic() + self.max_wait_ms / 1000.0
 
                 while len(batch) < self.max_batch:
@@ -165,48 +179,57 @@ class GPUInferenceServer:
                         if req2 is None:
                             # Shutdown — fire what we have first
                             break
-                        w2, rid2, st2 = req2
+                        w2, rid2, nid2, st2 = req2
                         if st2.ndim == 4:
                             # Another batch request arrived during our window.
                             # Process the current accumulation first, then handle
-                            # the batch request on the next loop iteration.
-                            # Push it back by prepending (not possible reliably),
-                            # so we just fall through and fire the timer batch,
-                            # then put the batch request back by sending it again.
-                            # Actually simpler: process the timer batch now,
-                            # then handle the batch request immediately.
+                            # the batch request immediately.
                             if batch:
-                                self._process_batch(net, device, batch)
-                            self._process_single_batch(net, device, w2, rid2, st2)
+                                self._process_batch(nets, device, batch)
+                            self._process_single_batch(
+                                nets.get(nid2, net_a), device, w2, rid2, st2
+                            )
                             batch = []
                             break
-                        batch.append((w2, rid2, st2))
+                        batch.append((w2, rid2, nid2, st2))
                     except queue.Empty:
                         break
 
                 if batch:
-                    self._process_batch(net, device, batch)
+                    self._process_batch(nets, device, batch)
 
         print("[GPU-Server] Shutting down")
 
     # ── Internal helpers ────────────────────────────────────────────────
 
-    def _drain_weight_queue(self, net, device):
-        """Load the most recent weights from the weight queue."""
-        latest_bytes = None
+    def _drain_weight_queue(self, nets, device):
+        """Load the most recent weights for each network from the weight queue.
+
+        Accepts both the new ``(network_id, raw_bytes)`` format and the
+        legacy raw-bytes format (treated as network_id 0 for backward
+        compatibility).
+        """
+        latest = {0: None, 1: None}
         while True:
             try:
-                wb = self.weight_queue.get_nowait()
-                if wb is not None:
-                    latest_bytes = wb
+                item = self.weight_queue.get_nowait()
+                if item is None:
+                    continue
+                # Backward compat: raw bytes (old format) → network_id 0
+                if isinstance(item, tuple) and len(item) == 2:
+                    network_id, wb = item
+                else:
+                    network_id, wb = 0, item
+                latest[network_id] = wb
             except queue.Empty:
                 break
 
-        if latest_bytes is not None:
-            buf = io.BytesIO(latest_bytes)
-            state_dict = torch.load(buf, map_location='cpu', weights_only=True)
-            net.load_state_dict(state_dict)
-            net.eval()
+        for nid in (0, 1):
+            if latest[nid] is not None:
+                buf = io.BytesIO(latest[nid])
+                state_dict = torch.load(buf, map_location='cpu', weights_only=True)
+                nets[nid].load_state_dict(state_dict)
+                nets[nid].eval()
 
     def _process_single_batch(self, net, device, worker_id, request_id, states):
         """Process a pre-stacked batch request ``(N, {NUM_PLANES}, 8, 8)`` immediately.
@@ -228,29 +251,47 @@ class GPUInferenceServer:
         except Exception:
             pass  # queue full or closed — worker likely dead
 
-    def _process_batch(self, net, device, batch):
-        """Run a single GPU forward pass and distribute results.
+    def _process_batch(self, nets, device, batch):
+        """Run GPU forward passes and distribute results.
 
-        ``batch`` is a list of ``(worker_id, request_id, state)`` tuples
-        where each ``state.shape == ({NUM_PLANES}, 8, 8)`` (individual requests
-        aggregated by the timer).
+        ``batch`` is a list of ``(worker_id, request_id, network_id, state)``
+        tuples where each ``state.shape == ({NUM_PLANES}, 8, 8)`` (individual
+        requests aggregated by the timer).
+
+        Requests are **grouped by ``network_id``** so each group is processed
+        with the correct network.  This allows timer-batched single requests
+        from different networks (e.g. gating eval) to be handled correctly.
         """
-        states = np.stack([r[2] for r in batch], axis=0)  # (N, {NUM_PLANES}, 8, 8)
-        states_t = torch.from_numpy(states).float().to(device)
+        # Group by network_id, preserving insertion order
+        groups = {}
+        order = []
+        for item in batch:
+            w, rid, nid, st = item
+            if nid not in groups:
+                groups[nid] = []
+                order.append(nid)
+            groups[nid].append(item)
 
-        with torch.no_grad():
-            policy_logits, values = net(states_t)
-            policies = F.softmax(policy_logits, dim=1).cpu().numpy()
-            values = values.squeeze(-1).cpu().numpy()
+        # Process each group with the appropriate network
+        for nid in order:
+            group = groups[nid]
+            net = nets.get(nid, list(nets.values())[0])
+            states = np.stack([r[3] for r in group], axis=0)  # (N, {NUM_PLANES}, 8, 8)
+            states_t = torch.from_numpy(states).float().to(device)
 
-        # Distribute results to per-worker response queues
-        for i, (worker_id, request_id, _) in enumerate(batch):
-            try:
-                self.response_queues[worker_id].put_nowait(
-                    (request_id, policies[i], float(values[i]))
-                )
-            except Exception:
-                pass  # queue full or closed — worker likely dead
+            with torch.no_grad():
+                policy_logits, values = net(states_t)
+                policies = F.softmax(policy_logits, dim=1).cpu().numpy()
+                values = values.squeeze(-1).cpu().numpy()
+
+            # Distribute results to per-worker response queues
+            for i, (worker_id, request_id, _, _) in enumerate(group):
+                try:
+                    self.response_queues[worker_id].put_nowait(
+                        (request_id, policies[i], float(values[i]))
+                    )
+                except Exception:
+                    pass  # queue full or closed — worker likely dead
 
     def _send_shutdown_to_workers(self):
         """Send a sentinel to each worker's response queue so they unblock."""

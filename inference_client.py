@@ -39,11 +39,15 @@ class InferenceClient:
     """
 
     def __init__(self, worker_id: int, request_queue: mp.Queue,
-                 response_queue: mp.Queue):
+                 response_queue: mp.Queue, network_id: int = 0):
         self.worker_id = worker_id
         self.request_queue = request_queue
         self.response_queue = response_queue
+        self.network_id = network_id
         self._req_counter = 0
+        # Cache for out-of-order responses (needed when multiple
+        # InferenceClients share the same response queue, e.g. gating eval)
+        self._response_cache = {}
 
     # ── Public interface (matches AlphaZeroNet) ─────────────────────────
 
@@ -58,7 +62,7 @@ class InferenceClient:
             value: scalar float in [-1, 1]
         """
         req_id = self._next_id()
-        self.request_queue.put((self.worker_id, req_id, state))
+        self.request_queue.put((self.worker_id, req_id, self.network_id, state))
         return self._wait_response(req_id)
 
     def predict_batch(self, states: np.ndarray):
@@ -82,7 +86,7 @@ class InferenceClient:
         # Send the entire stacked batch as one message.
         # The server differentiates: ndim == 4  =>  batch request (immediate)
         #                     ndim == 3  =>  single request (timer-batched)
-        self.request_queue.put((self.worker_id, req_id, states))
+        self.request_queue.put((self.worker_id, req_id, self.network_id, states))
 
         # Wait for a single response containing the full batch.
         resp = self.response_queue.get()
@@ -100,6 +104,9 @@ class InferenceClient:
 
     def _wait_response(self, req_id):
         """Block until a response matching *req_id* arrives."""
+        # Check cache for any previously received out-of-order response
+        if req_id in self._response_cache:
+            return self._response_cache.pop(req_id)
         while True:
             resp = self.response_queue.get()
             if resp is None:
@@ -108,7 +115,5 @@ class InferenceClient:
             resp_id, policy, value = resp
             if resp_id == req_id:
                 return policy, value
-            # If out-of-order (shouldn't happen for single predict),
-            # we still need to handle it — store and keep waiting.
-            # In practice this path is never hit for predict() because
-            # there's only one outstanding request at a time.
+            # Out-of-order response — cache it and keep waiting
+            self._response_cache[resp_id] = (policy, value)

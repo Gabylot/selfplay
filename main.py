@@ -333,6 +333,10 @@ def run_training(config, gui_enabled=False, num_workers=None):
                 wb_latest = _wb(network)
                 wb_best   = _wb(best_network)
 
+                # Push both networks' weights to the GPU server for eval
+                if getattr(config, 'inference', None) and getattr(config.inference, 'use_gpu', False):
+                    psp.push_eval_weights(wb_latest, wb_best)
+
                 n_gate = config.evaluation.gate_games
                 n_ref  = config.evaluation.ref_opponent_games
                 total_eval = n_gate + n_ref
@@ -582,6 +586,10 @@ def main():
         start_gui_server(stats=None, config=config, worker_live_games=[], eval_live_game=None)
 
     elif args.mode == "evaluate":
+        use_gpu = getattr(config, 'inference', None) and getattr(config.inference, 'use_gpu', False)
+        if use_gpu:
+            print("[INFO] Inference: GPU (DirectML centralized server)")
+
         dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         net = create_model_from_config(config); net.to(dev)
         cp  = Path(config.main.output_dir)/config.main.run_name/"checkpoints"/"latest.pt"
@@ -589,7 +597,56 @@ def main():
         else: print("[WARN] No checkpoint")
         s   = StatsLogger(str(Path(config.main.output_dir)/config.main.run_name/config.stats.db_path))
         ev  = Evaluator(config, s)
-        r   = ev.run_reference_match(net, step=0, verbose=True)
+
+        if use_gpu:
+            # Start GPU server, push weights, create InferenceClient
+            import multiprocessing as _mp
+            if _mp.get_start_method(allow_none=True) is None:
+                try: _mp.set_start_method('spawn')
+                except RuntimeError: pass
+
+            weight_q = _mp.Queue()
+            request_q = _mp.Queue()
+            response_q = _mp.Queue(maxsize=256)
+            gpu_ready = _mp.Event()
+            gpu_shutdown = _mp.Event()
+
+            from gpu_server import GPUInferenceServer
+            server = GPUInferenceServer(
+                config=config,
+                request_queue=request_q,
+                response_queues={0: response_q},
+                weight_queue=weight_q,
+                ready_event=gpu_ready,
+                shutdown_event=gpu_shutdown,
+            )
+            gpu_proc = _mp.Process(target=server.run, daemon=True)
+            gpu_proc.start()
+            print("[INFO] Waiting for GPU server to warm up shaders...")
+            gpu_ready.wait()
+            print("[INFO] GPU server ready")
+
+            # Push weights
+            import torch as _t, io as _io
+            buf = _io.BytesIO(); _t.save(net.state_dict(), buf)
+            weight_q.put((0, buf.getvalue()))
+
+            # Create InferenceClient
+            from inference_client import InferenceClient
+            client = InferenceClient(worker_id=0, request_queue=request_q,
+                                     response_queue=response_q, network_id=0)
+
+            r = ev.run_reference_match(client, step=0, verbose=True)
+
+            # Shutdown GPU server
+            gpu_shutdown.set()
+            try: request_q.put_nowait(None)
+            except: pass
+            gpu_proc.join(timeout=10)
+            if gpu_proc.is_alive(): gpu_proc.kill()
+        else:
+            r = ev.run_reference_match(net, step=0, verbose=True)
+
         print(f"vs Alpha-Beta: {r['win_rate']:.1%}")
         s.close()
 

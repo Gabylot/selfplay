@@ -299,7 +299,7 @@ def self_play_game(network, config, on_move=None):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _worker_process(worker_id, task_queue, result_queue, config_dict, shutdown_event,
-                    request_queue=None, response_queue=None):
+                    request_queue=None, response_queue=None, weight_queue=None):
     import torch, sys, os
     from config import Config
     from network import AlphaZeroNet
@@ -312,8 +312,10 @@ def _worker_process(worker_id, task_queue, result_queue, config_dict, shutdown_e
     use_gpu = (getattr(config, 'inference', None)
                and getattr(config.inference, 'use_gpu', False))
     inference_client = None
+    inference_client_b = None
     if use_gpu and request_queue is not None and response_queue is not None:
-        inference_client = InferenceClient(worker_id, request_queue, response_queue)
+        inference_client = InferenceClient(worker_id, request_queue, response_queue, network_id=0)
+        inference_client_b = InferenceClient(worker_id, request_queue, response_queue, network_id=1)
 
     def make_net():
         n = AlphaZeroNet(
@@ -415,7 +417,10 @@ def _worker_process(worker_id, task_queue, result_queue, config_dict, shutdown_e
 
             if eval_type == 'gating':
                 load(net_b, task['weights_b'])
-                ea = mcts(net_a, False); eb = mcts(net_b, False)
+                if use_gpu and inference_client is not None and inference_client_b is not None:
+                    ea = mcts(inference_client, False); eb = mcts(inference_client_b, False)
+                else:
+                    ea = mcts(net_a, False); eb = mcts(net_b, False)
                 board = chess.Board(); mc = 0
                 root_a = None; root_b = None
                 while not board.is_game_over() and mc < config.selfplay.max_game_length:
@@ -448,7 +453,10 @@ def _worker_process(worker_id, task_queue, result_queue, config_dict, shutdown_e
             else:  # reference
                 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
                 from evaluation import alpha_beta_best_move
-                ea = mcts(net_a, False)
+                if use_gpu and inference_client is not None:
+                    ea = mcts(inference_client, False)
+                else:
+                    ea = mcts(net_a, False)
                 board = chess.Board(); mc = 0
                 root_net = None
                 while not board.is_game_over() and mc < config.selfplay.max_game_length:
@@ -540,6 +548,7 @@ class ParallelSelfPlay:
             if self._use_gpu:
                 kwargs['request_queue'] = self._request_q
                 kwargs['response_queue'] = self._response_qs[i]
+                kwargs['weight_queue'] = self._weight_q
             p = mp.Process(target=_worker_process,
                            args=(i, tq, self._result_q, cd, self._shutdown),
                            kwargs=kwargs, daemon=True)
@@ -573,7 +582,7 @@ class ParallelSelfPlay:
             while not self._weight_q.empty():
                 try: self._weight_q.get_nowait()
                 except: pass
-            self._weight_q.put(wb)
+            self._weight_q.put((0, wb))
 
         for tq in self._task_qs:
             while not tq.empty():
@@ -584,6 +593,22 @@ class ParallelSelfPlay:
                 task['weights'] = wb
             try: tq.put_nowait(task)
             except queue.Full: pass
+
+    def push_eval_weights(self, weights_a, weights_b=None):
+        """Push both networks' weights to the GPU server for evaluation.
+
+        Args:
+            weights_a: Serialized weights for network A (network_id=0)
+            weights_b: Serialized weights for network B (network_id=1), or None
+        """
+        if not self._use_gpu:
+            return
+        while not self._weight_q.empty():
+            try: self._weight_q.get_nowait()
+            except: pass
+        self._weight_q.put((0, weights_a))
+        if weights_b is not None:
+            self._weight_q.put((1, weights_b))
 
     def push_weights(self, network): self.push_selfplay(network)
 
