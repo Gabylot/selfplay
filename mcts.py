@@ -26,12 +26,10 @@ from network import AlphaZeroNet
 
 # ---- Helper for material adjudication (copied from selfplay.py to avoid circular import) ----
 def adjudicate_by_material(board, piece_values, graded=False, scaling=9.0):
-    """Return +1/-1/0 (or tanh‑scaled) based on material difference."""
+    """Return +1/-1/0 (or tanh-scaled) based on material difference."""
+    # Use piece_map() to iterate only occupied squares (~32) instead of all 64.
     w = b = 0
-    for sq in chess.SQUARES:
-        p = board.piece_at(sq)
-        if p is None:
-            continue
+    for sq, p in board.piece_map().items():
         v = piece_values.get(p.symbol().upper(), 0)
         if p.color == chess.WHITE:
             w += v
@@ -66,7 +64,7 @@ class MCTSNode:
                  'legal_moves_cached', 'visit_count', 'virtual_loss',
                  '_game_over_cached', '_terminal_value_cached',
                  '_checkmate_child_cached', '_checkmate_child_move',
-                 '_position_hash']
+                 '_position_hash', 'depth']
 
     def __init__(self, board: Optional[chess.Board] = None,
                  parent: Optional['MCTSNode'] = None,
@@ -92,6 +90,8 @@ class MCTSNode:
         self._position_hash: Optional[int] = None  # Zobrist hash, cached on first materialisation
         self._checkmate_child_cached: bool = False  # Whether a checkmate child has been found (cached)
         self._checkmate_child_move: Optional[chess.Move] = None  # The move that leads to checkmate, if found
+        # Cached depth from root — avoids O(depth) walk in _node_depth()
+        self.depth = 0 if parent is None else parent.depth + 1
 
     @property
     def board(self) -> chess.Board:
@@ -124,14 +124,14 @@ class MCTS:
     Batched mode uses virtual loss to collect multiple leaf nodes before
     evaluating them together in a single network forward pass.
 
-    **NEW** parameters for respecting self‑play game‑length limit:
-        max_game_length: int – number of half‑moves after which the game is
+    **NEW** parameters for respecting self-play game-length limit:
+        max_game_length: int - number of half-moves after which the game is
                           adjudicated (material or draw).
-        adjudicate_material: bool – if True, use material to decide winner;
+        adjudicate_material: bool - if True, use material to decide winner;
                                if False, treat as draw (0.0).
-        piece_values: dict – mapping from piece symbol to material points.
-        adjudicate_graded: bool – if True, use tanh scaling; else flat ±1.
-        adjudicate_scaling: float – tanh denominator (only if graded).
+        piece_values: dict - mapping from piece symbol to material points.
+        adjudicate_graded: bool - if True, use tanh scaling; else flat +/-1.
+        adjudicate_scaling: float - tanh denominator (only if graded).
     """
 
     def __init__(self,
@@ -158,10 +158,10 @@ class MCTS:
             batch_size: Number of leaves to collect before network eval.
                        1 = sequential (no virtual loss). >1 = batched inference.
             c_virtual_loss: Virtual loss penalty constant for batched mode.
-            max_game_length: Maximum half‑moves before adjudication.
+            max_game_length: Maximum half-moves before adjudication.
             adjudicate_material: Whether to decide winner by material at limit.
             piece_values: Material values for adjudication.
-            adjudicate_graded: Use tanh grading (True) or ±1 (False).
+            adjudicate_graded: Use tanh grading (True) or +/-1 (False).
             adjudicate_scaling: Scaling for tanh (if graded).
         """
         self.network = network
@@ -215,6 +215,9 @@ class MCTS:
                     child._board = b
                     child._board_ready = True
 
+                # Reset depth since this is now a root node
+                child.depth = 0
+
                 # Clear visit_count (backward-compat duplicate of N).
                 # N/W/Q are intentionally kept so the next search
                 # benefits from accumulated visit information.
@@ -258,22 +261,28 @@ class MCTS:
                 # Determine batch size for this iteration
                 bs = min(self.batch_size, self.num_simulations - sims_done)
 
-                # Collect leaf nodes via selection with virtual loss
-                leaf_nodes = self._collect_batch(root, bs)
+                # Collect leaf nodes via selection with virtual loss.
+                # Returns (leaf, depth) tuples where depth is the number of
+                # selection steps from root — always correct regardless of
+                # tree recycling (unlike the cached node.depth field).
+                leaf_depth_pairs = self._collect_batch(root, bs)
 
-                if not leaf_nodes:
+                if not leaf_depth_pairs:
                     # Shouldn't happen, but safety check
                     break
+
+                # Extract just the leaf nodes for batch evaluation
+                leaf_nodes = [ld[0] for ld in leaf_depth_pairs]
 
                 # Evaluate all leaves in a single batch network call
                 values = self._evaluate_batch(leaf_nodes)
 
                 # Backpropagate each leaf, removing virtual losses
-                for leaf, value in zip(leaf_nodes, values):
+                for (leaf, depth), value in zip(leaf_depth_pairs, values):
                     self._backpropagate_with_virtual_loss(leaf, value)
 
-                    # Track depth
-                    depth = self._node_depth(leaf)
+                    # Track depth — use the traversal-counted depth from
+                    # _collect_batch, not the stale cached node.depth field.
                     max_depth = max(max_depth, depth)
                     total_depth += depth
 
@@ -323,7 +332,7 @@ class MCTS:
         from the child's perspective, which lowers -Q from the parent's perspective),
         making the child less attractive to re-select within the same batch.
 
-        NOTE: ``self.c_virtual_loss`` is a dead parameter for this function — it
+        NOTE: ``self.c_virtual_loss`` is a dead parameter for this function - it
         no longer appears in the UCB formula. The virtual loss now enters solely
         through ``effective_N`` and ``effective_W``. The parameter is preserved
         in the constructor for backward compatibility but has no effect here.
@@ -343,7 +352,7 @@ class MCTS:
             effective_W = child.W + child.virtual_loss
             effective_Q = effective_W / effective_N if effective_N > 0 else 0.0
 
-            # PUCT formula (standard AlphaZero style — no separate penalty term).
+            # PUCT formula (standard AlphaZero style - no separate penalty term).
             # -effective_Q: Q is stored from the child's side-to-move perspective,
             # so we negate it for the parent's selection decision.
             ucb = -effective_Q + self.c_puct * child.P * sqrt_parent_n / (1 + effective_N)
@@ -354,7 +363,7 @@ class MCTS:
 
         return best_child
 
-    def _collect_batch(self, root: MCTSNode, batch_size: int) -> List[MCTSNode]:
+    def _collect_batch(self, root: MCTSNode, batch_size: int) -> List[Tuple[MCTSNode, int]]:
         """Run batch_size selections, applying virtual loss along each path.
 
         Each selection traverses from root to a leaf, incrementing virtual_loss
@@ -380,7 +389,9 @@ class MCTS:
             batch_size: Target number of leaf nodes to collect
 
         Returns:
-            List of unique leaf MCTSNode objects (may be shorter than batch_size).
+            List of ``(leaf_node, depth)`` tuples where depth is the number
+            of selection steps from root to the leaf (always correct,
+            regardless of tree recycling). May be shorter than batch_size.
         """
         leaves = []
         selected_leaf_ids: set = set()
@@ -403,13 +414,17 @@ class MCTS:
                 # Undo virtual losses applied to interior nodes along the path
                 for n in path:
                     n.virtual_loss -= 1
-                # Don't count this iteration — caller handles shorter returns
+                # Don't count this iteration - caller handles shorter returns
                 continue
 
             # Apply virtual loss to the leaf and record it
             node.virtual_loss += 1
             selected_leaf_ids.add(id(node))
-            leaves.append(node)
+            # Depth = number of interior nodes traversed from root to this leaf.
+            # This is always correct, unlike the cached ``node.depth`` field
+            # which becomes stale after tree recycling (recycle_tree only
+            # resets the promoted root's depth, not its descendants').
+            leaves.append((node, len(path)))
 
         return leaves
 
@@ -417,10 +432,10 @@ class MCTS:
         """Evaluate a batch of leaf nodes.
 
         Terminal nodes are those where the game is over, a threefold repetition
-        has occurred, the 50‑move rule has been exceeded, **or** the maximum
+        has occurred, the 50-move rule has been exceeded, **or** the maximum
         game length has been reached (adjudicated according to config).
 
-        Non‑terminal, unexpanded leaves are stacked and evaluated in one
+        Non-terminal, unexpanded leaves are stacked and evaluated in one
         batched network call.
         """
         terminal_values = {}
@@ -428,7 +443,7 @@ class MCTS:
         expandable_nodes = []
 
         for i, node in enumerate(leaf_nodes):
-            # ---- Terminal check: ACTUAL game‑ending + max_length ----
+            # ---- Terminal check: ACTUAL game-ending + max_length ----
             if node._game_over_cached is None:
                 node._game_over_cached = (
                     node.board.is_game_over() or
@@ -501,6 +516,12 @@ class MCTS:
         store only ``(parent, move)`` and materialize the board on
         first access via the ``MCTSNode.board`` property.
 
+        **Optimization**: Computes policy indices for all legal moves in a
+        single pass, then reuses them for both the legal move mask and
+        child node creation.  This avoids calling ``move_to_policy_index``
+        twice per move (once in ``get_legal_move_mask_from_moves`` and
+        once in the child-creation loop).
+
         Args:
             node: Node to expand
             policy: (4672,) policy probability vector from network
@@ -517,8 +538,28 @@ class MCTS:
             # No legal moves -- shouldn't happen if game_over check above works
             return 0.0
 
-        # Build legal move mask from the already-computed legal_moves list
-        mask = get_legal_move_mask_from_moves(legal_moves, node.board)
+        # ---- Single-pass: compute policy indices for all legal moves ----
+        # This avoids calling move_to_policy_index twice per move
+        # (once for the mask, once for child creation).
+        move_indices = []
+        for move in legal_moves:
+            try:
+                action_idx = move_to_policy_index(move, node.board)
+                move_indices.append(action_idx)
+            except ValueError as e:
+                # Log the board and the move that failed encoding
+                with open("encoding_failures.log", "a") as f:
+                    f.write(f"FEN: {node.board.fen()}\n"
+                            f"Move: {move.uci()}\n"
+                            f"Error: {e}\n\n")
+                move_indices.append(None)
+
+        # Build legal move mask from the precomputed indices
+        mask = np.zeros(NUM_ACTIONS, dtype=np.float32)
+        for action_idx in move_indices:
+            if action_idx is not None:
+                mask[action_idx] = 1.0
+
         legal_policy = policy * mask
         legal_sum = legal_policy.sum()
 
@@ -530,16 +571,9 @@ class MCTS:
 
         # Create child nodes with lazy board construction
         # (no board.copy() / push() -- done on first access via the property)
-        for move in legal_moves:
-            try:
-                action_idx = move_to_policy_index(move, node.board)
-            except ValueError as e:
-                # Log the board and the move that failed encoding
-                with open("encoding_failures.log", "a") as f:
-                    f.write(f"FEN: {node.board.fen()}\n"
-                            f"Move: {move.uci()}\n"
-                            f"Error: {e}\n\n")
-                continue
+        for move, action_idx in zip(legal_moves, move_indices):
+            if action_idx is None:
+                continue  # Skip moves that failed encoding
 
             prior = float(legal_policy[action_idx])
 
@@ -625,7 +659,16 @@ class MCTS:
             v = -v  # Flip value for opponent's perspective
 
     def _node_depth(self, node: MCTSNode) -> int:
-        """Compute the depth of a node from root."""
+        """Compute the depth of a node from root.
+
+        Uses the cached ``depth`` field (O(1)) when available.
+        Falls back to walking up the tree for nodes created before
+        the depth field was added.
+        """
+        # Fast path: use cached depth
+        if hasattr(node, 'depth'):
+            return node.depth
+        # Fallback: walk up the tree
         depth = 0
         current = node.parent
         while current is not None:

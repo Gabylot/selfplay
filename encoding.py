@@ -124,14 +124,13 @@ def _encode_single_position(board: chess.Board, plane_offset: int,
         plane_offset: Starting plane index in the tensor (0, 17, 34, ...)
         tensor: (NUM_PLANES, 8, 8) array to write into
     """
-    # Piece positions
-    for sq in chess.SQUARES:
-        piece = board.piece_at(sq)
-        if piece is not None:
-            rank = chess.square_rank(sq)  # 0-7
-            file = chess.square_file(sq)  # 0-7
-            plane = plane_offset + PIECE_PLANE[(piece.piece_type, piece.color)]
-            tensor[plane, rank, file] = 1.0
+    # Piece positions — use piece_map() to iterate only occupied squares
+    # (~32) instead of all 64 squares.
+    for sq, piece in board.piece_map().items():
+        rank = chess.square_rank(sq)  # 0-7
+        file = chess.square_file(sq)  # 0-7
+        plane = plane_offset + PIECE_PLANE[(piece.piece_type, piece.color)]
+        tensor[plane, rank, file] = 1.0
 
     # Side to move
     if board.turn == chess.WHITE:
@@ -148,47 +147,6 @@ def _encode_single_position(board: chess.Board, plane_offset: int,
         tensor[plane_offset + PLANE_CASTLING_BQ, :, :] = 1.0
 
 
-def _get_history_boards(board: chess.Board,
-                        history_length: int = 8) -> list:
-    """Get the last `history_length` board positions, most recent first.
-
-    Returns a list of chess.Board objects representing positions at
-    ply offsets 0, 1, 2, ..., history_length-1 from the current position.
-    Position 0 = current board, position 1 = one ply ago, etc.
-
-    If the game has fewer than `history_length` plies, earlier positions
-    are filled with the starting position (empty board for positions
-    before the game start).
-
-    Args:
-        board: Current board position (with full move history via stack=True)
-        history_length: Number of historical positions to return
-
-    Returns:
-        List of chess.Board objects, length = history_length
-    """
-    boards = []
-    # Work with a copy to avoid mutating the original
-    b = board.copy(stack=True)
-    move_stack = list(b.move_stack)
-    num_moves = len(move_stack)
-
-    # Current position (ply offset 0)
-    boards.append(b.copy(stack=True))
-
-    # Walk back through history by popping moves
-    for ply in range(1, history_length):
-        if ply <= num_moves:
-            # Pop the last move to go back one ply
-            b.pop()
-            boards.append(b.copy(stack=True))
-        else:
-            # Before the game started: use an empty board
-            boards.append(chess.Board.empty())
-
-    return boards
-
-
 def board_to_tensor(board: chess.Board,
                     history_length: int = 8) -> np.ndarray:
     """Encode a chess.Board as a (136, 8, 8) float32 numpy array.
@@ -200,6 +158,14 @@ def board_to_tensor(board: chess.Board,
     This allows the network to detect threefold-repetition by comparing
     piece configurations across time steps.
 
+    **Optimization**: Instead of creating 8 separate board copies (one per
+    history step), we copy the board once and walk backwards by popping
+    moves, encoding each position in-place.  ``_encode_single_position``
+    only reads piece positions / castling rights / side to move, so the
+    move stack is irrelevant for encoding — we just need the board state
+    at each ply.  This eliminates 8 ``board.copy(stack=True)`` calls per
+    tensor (a major hot-path saving).
+
     Args:
         board: Current board position (must have full move history)
         history_length: Number of historical positions to encode (default 8)
@@ -209,13 +175,25 @@ def board_to_tensor(board: chess.Board,
     """
     tensor = np.zeros((NUM_PLANES, 8, 8), dtype=np.float32)
 
-    # Get historical board positions
-    history_boards = _get_history_boards(board, history_length)
+    # Work on a single copy — we'll pop moves to walk back in history.
+    b = board.copy(stack=True)
+    num_moves = len(b.move_stack)
 
-    # Encode each position into its 17-plane chunk
-    for i, hist_board in enumerate(history_boards):
-        plane_offset = i * PLANES_PER_HISTORY
-        _encode_single_position(hist_board, plane_offset, tensor)
+    # Encode positions from most-recent (ply 0) backwards.
+    for ply in range(history_length):
+        plane_offset = ply * PLANES_PER_HISTORY
+
+        if ply <= num_moves:
+            # Encode the current state of `b` (which is ply `ply` ago)
+            _encode_single_position(b, plane_offset, tensor)
+            # Pop one move to go back another ply (if available)
+            if ply < num_moves and ply + 1 < history_length:
+                b.pop()
+        else:
+            # Before the game started: fill with an empty board.
+            # (No pieces, no castling rights, side to move is irrelevant.)
+            # Nothing to do — tensor is already zeroed for these planes.
+            pass
 
     return tensor
 

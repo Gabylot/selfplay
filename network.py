@@ -132,7 +132,8 @@ class AlphaZeroNet(nn.Module):
             value: scalar float in [-1, 1]
         """
         self.eval()
-        with torch.no_grad():
+        # inference_mode is faster than no_grad (no version counter tracking)
+        with torch.inference_mode():
             x = torch.from_numpy(state).unsqueeze(0).float()
             device = next(self.parameters()).device
             x = x.to(device)
@@ -141,7 +142,7 @@ class AlphaZeroNet(nn.Module):
             value = value.item()
         return policy, value
     
-    def predict_batch(self, states: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    def predictBatch(self, states: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         """Predict policy and value for a batch of board states.
         
         Args:
@@ -152,7 +153,8 @@ class AlphaZeroNet(nn.Module):
             values: (batch,) numpy array of scalars
         """
         self.eval()
-        with torch.no_grad():
+        # inference_mode is faster than no_grad (no version counter tracking)
+        with torch.inference_mode():
             x = torch.from_numpy(states).float()
             device = next(self.parameters()).device
             x = x.to(device)

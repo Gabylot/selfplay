@@ -290,6 +290,15 @@ def run_training(config, gui_enabled=False, num_workers=None):
                                          learning_rate=config.training.learning_rate,
                                          grad_norm=ld['grad_norm'])
 
+                # ── Push updated weights to the GPU inference server ──
+                # train_one_step() calls model.train() and updates weights via
+                # optimizer.step().  In GPU mode, workers use InferenceClient and
+                # never load per-task weights — the GPU server must be explicitly
+                # notified.  Without this, self-play between eval cycles uses
+                # stale weights, producing near-zero Q values.
+                network.eval()
+                psp.push_weights_to_gpu(network)
+
                 # ── Handle self-play results that arrived while training ──
                 for pr in _pending_selfplay:
                     pw   = pr['worker_id']
@@ -344,7 +353,7 @@ def run_training(config, gui_enabled=False, num_workers=None):
                     n   = min(50, len(buffer))
                     ix  = np.random.choice(len(buffer), size=n, replace=False)
                     sts = np.array([buffer.buffer[i][0] for i in ix])
-                    ps, vs = network.predict_batch(sts)
+                    ps, vs = network.predictBatch(sts)
                     stats.log_network_stats(step,
                                             float(np.mean(np.max(ps,axis=1))),
                                             float(np.mean(np.abs(vs))))

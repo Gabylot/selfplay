@@ -40,9 +40,19 @@ from inference_client import InferenceClient
 # ─────────────────────────────────────────────────────────────────────────────
 
 class ReplayBuffer:
+    """FIFO replay buffer with O(1) random access.
+
+    Uses a plain ``list`` with manual size management instead of
+    ``collections.deque``.  ``deque`` does NOT support O(1) random
+    access — ``deque[i]`` is O(n/2) on average, which makes
+    ``sample_batch`` extremely slow for large buffers (100k positions).
+    A list gives true O(1) indexing.
+    """
+
     def __init__(self, max_size=100000):
         self.max_size = max_size
-        self.buffer   = deque(maxlen=max_size)
+        self.buffer = []          # list, not deque — O(1) random access
+        self._write_idx = 0       # circular write pointer
         self.total_games = 0
         self.total_positions = 0
 
@@ -52,12 +62,20 @@ class ReplayBuffer:
         game_data: list of (state, policy, value, legal_move_mask) tuples.
         """
         for s, p, v, m in game_data:
-            self.buffer.append((s, p, v, m))
+            if len(self.buffer) < self.max_size:
+                # Buffer not yet full — append
+                self.buffer.append((s, p, v, m))
+                self._write_idx = (self._write_idx + 1) % self.max_size
+            else:
+                # Buffer full — overwrite oldest (circular buffer)
+                self.buffer[self._write_idx] = (s, p, v, m)
+                self._write_idx = (self._write_idx + 1) % self.max_size
             self.total_positions += 1
         self.total_games += 1
 
     def sample_batch(self, batch_size):
-        ix = np.random.choice(len(self.buffer), size=min(batch_size, len(self.buffer)), replace=False)
+        n = len(self.buffer)
+        ix = np.random.choice(n, size=min(batch_size, n), replace=False)
         return (np.array([self.buffer[i][0] for i in ix]),
                 np.array([self.buffer[i][1] for i in ix]),
                 np.array([self.buffer[i][2] for i in ix], dtype=np.float32),
@@ -140,10 +158,9 @@ def get_temperature(move_number, threshold=30, temp_high=1.0, temp_low=0.1):
 
 
 def adjudicate_by_material(board, piece_values, graded=False, scaling=9.0):
+    # Use piece_map() to iterate only occupied squares (~32) instead of all 64.
     w=b=0
-    for sq in chess.SQUARES:
-        p=board.piece_at(sq)
-        if p is None: continue
+    for sq, p in board.piece_map().items():
         v=piece_values.get(p.symbol().upper(),0)
         if p.color==chess.WHITE: w+=v
         else: b+=v
@@ -158,10 +175,9 @@ def adjudicate_by_material(board, piece_values, graded=False, scaling=9.0):
 
 def material_point_difference(board, piece_values):
     """Return raw material point difference (white - black) at current position."""
+    # Use piece_map() to iterate only occupied squares (~32) instead of all 64.
     w=b=0
-    for sq in chess.SQUARES:
-        p=board.piece_at(sq)
-        if p is None: continue
+    for sq, p in board.piece_map().items():
         v=piece_values.get(p.symbol().upper(),0)
         if p.color==chess.WHITE: w+=v
         else: b+=v
@@ -338,6 +354,12 @@ def _worker_process(worker_id, task_queue, result_queue, config_dict, shutdown_e
     from config import Config
     from network import AlphaZeroNet
     from mcts import MCTS
+
+    # Limit Torch to a single intra-op thread per worker process.
+    # With 8+ worker processes each running MCTS with small inference
+    # batches, multi-threading causes contention and cache thrashing.
+    # Single-thread is faster for small batches and avoids oversubscription.
+    torch.set_num_threads(1)
 
     config = Config(config_dict)
     pv = config.selfplay.piece_values
@@ -637,6 +659,27 @@ class ParallelSelfPlay:
             except queue.Full: pass
 
     def push_weights(self, network): self.push_selfplay(network)
+
+    def push_weights_to_gpu(self, network):
+        """Push updated weights to the GPU server without disturbing task queues.
+
+        Called after training so the GPU inference server picks up the latest
+        network weights on its next iteration.  Unlike ``push_selfplay``, this
+        does NOT clear or refill the per-worker task queues — in-flight
+        self-play games continue with their current task while the GPU server
+        seamlessly switches to the new weights for subsequent inference
+        requests.
+
+        No-op when GPU inference is disabled.
+        """
+        if not self._use_gpu:
+            return
+        wb = self._serialize_weights(network)
+        while not self._weight_q.empty():
+            try: self._weight_q.get_nowait()
+            except: pass
+        # network_id 0 = the network self-play (and reference eval) uses.
+        self._weight_q.put((0, wb))
 
     def push_eval_weights(self, wb_latest, wb_best):
         """Push both networks to the GPU server ahead of a gating eval round.
