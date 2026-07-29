@@ -11,12 +11,17 @@ Push events emitted:
 """
 
 import threading
+import time
 from typing import List, Optional, Dict, Any
 from collections import deque
 
 
 class LiveGameState:
     """Thread-safe live game state. One instance per worker (or eval board)."""
+
+    # Minimum seconds between throttled emits (prevents flooding Socket.IO
+    # with too many packets when replaying a full game in a tight loop).
+    _MIN_EMIT_INTERVAL = 0.1  # 100ms
 
     def __init__(self, socketio=None, max_history: int = 20,
                  worker_id: int = -1, is_eval: bool = False):
@@ -49,6 +54,11 @@ class LiveGameState:
         # Completed games history
         self._game_history: deque = deque(maxlen=max_history)
 
+        # Emit throttling
+        self._last_emit_time: float   = 0.0
+        self._emit_pending:   bool    = False
+        self._emit_timer:     Optional[threading.Timer] = None
+
     # ── Public API called by training/eval loops ──────────────────────────
 
     def start_game(self, game_id: int, step: int,
@@ -68,7 +78,7 @@ class LiveGameState:
             self._move_number = 0
             self._game_type   = game_type
             self._match_info  = match_info
-        self._emit()
+        self._emit(force=True)
 
     def update(self, board_fen: str, move_uci: str, move_number: int,
                mcts_stats: dict = None):
@@ -86,7 +96,7 @@ class LiveGameState:
             self._termination = termination
             self._status      = "finished"
             self._save_game()
-        self._emit()
+        self._emit(force=True)
 
     # ── State getters ─────────────────────────────────────────────────────
 
@@ -166,11 +176,47 @@ class LiveGameState:
             'match_info':         self._match_info,
         })
 
-    def _emit(self):
-        """Push update to all connected browser clients."""
+    def _emit(self, force: bool = False):
+        """Push update to all connected browser clients.
+
+        Emits are throttled to at most one per ``_MIN_EMIT_INTERVAL`` seconds
+        to avoid flooding Socket.IO with too many packets (which triggers
+        Engine.IO's "Too many packets in payload" error when a full game is
+        replayed in a tight loop).
+
+        Args:
+            force: If True, emit immediately bypassing the throttle.
+                   Use for important state transitions (start_game, game_over).
+        """
         if self._socketio is None:
             return
 
+        now = time.monotonic()
+        elapsed = now - self._last_emit_time
+
+        if force or elapsed >= self._MIN_EMIT_INTERVAL:
+            # Emit now
+            self._last_emit_time = now
+            self._emit_pending = False
+            self._do_emit()
+        else:
+            # Defer this emit — schedule a flush for when the interval expires
+            self._emit_pending = True
+            if self._emit_timer is None or not self._emit_timer.is_alive():
+                delay = self._MIN_EMIT_INTERVAL - elapsed
+                self._emit_timer = threading.Timer(delay, self._flush_pending)
+                self._emit_timer.daemon = True
+                self._emit_timer.start()
+
+    def _flush_pending(self):
+        """Flush a deferred (throttled) emit if one is still pending."""
+        if self._emit_pending:
+            self._emit_pending = False
+            self._last_emit_time = time.monotonic()
+            self._do_emit()
+
+    def _do_emit(self):
+        """Actual emit logic — sends the appropriate Socket.IO event(s)."""
         if self._is_eval:
             # Eval board — single full-state event
             with self._lock:
