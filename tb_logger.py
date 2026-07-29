@@ -36,7 +36,7 @@ class TensorBoardLogger:
     """
 
     def __init__(self, log_dir: str, enabled: bool = True,
-                 rolling_window: int = 100):
+                 rolling_window: int = 100, initial_step: int = 0):
         """Initialise the TensorBoard logger.
 
         Args:
@@ -44,10 +44,18 @@ class TensorBoardLogger:
             enabled: If False, all logging calls become no-ops.
             rolling_window: Number of recent games to track for
                 rolling-average metrics.
+            initial_step: Step to resume from.  When > 0, the
+                ``SummaryWriter`` is told to purge (discard) any events
+                at or beyond this step from *previous* event files in
+                the same log directory.  This is essential for correct
+                training continuation: without it, TensorBoard sees
+                overlapping step ranges from the old and new event files
+                and the plots appear to restart or jump.
         """
         self.enabled = enabled
         self.log_dir = log_dir
-        self.writer = SummaryWriter(log_dir) if enabled else None
+        purge = initial_step if initial_step > 0 else None
+        self.writer = SummaryWriter(log_dir, purge_step=purge) if enabled else None
         self.rolling_window = rolling_window
 
         # Rolling buffers for computed metrics

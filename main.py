@@ -99,13 +99,13 @@ def run_training(config, gui_enabled=False, num_workers=None):
     stats_db_path = output_dir / config.stats.db_path
     stats = StatsLogger(str(stats_db_path))
 
-    # TensorBoard logger
+    # TensorBoard logger — created after checkpoint load so we can pass
+    # the resumed step as purge_step.  This makes TensorBoard discard any
+    # events at or beyond the resumed step from previous event files,
+    # preventing overlapping step ranges that make plots appear to restart.
     tb_enabled = getattr(config, 'tensorboard', None) and getattr(config.tensorboard, 'enabled', True)
     tb_log_dir = str(output_dir / getattr(config.tensorboard, 'log_dir', 'runs')) if tb_enabled else None
-    tb = TensorBoardLogger(tb_log_dir, enabled=tb_enabled)
-    if tb_enabled:
-        print(f"[INFO] TensorBoard logging → {tb_log_dir}")
-        print(f"[INFO] Run: tensorboard --logdir {tb_log_dir}")
+    tb = None  # instantiated after checkpoint restore
 
     # One LiveGameState per worker (worker_id set, not eval)
     worker_live_games = [
@@ -131,7 +131,6 @@ def run_training(config, gui_enabled=False, num_workers=None):
     best_network.to(device)
 
     stats.log_config(step, config.to_dict())
-    tb.log_config(step, config.to_dict())
 
     # GUI
     if gui_enabled:
@@ -154,6 +153,16 @@ def run_training(config, gui_enabled=False, num_workers=None):
         if 'best_elo' in ckpt: evaluator.best_elo = ckpt['best_elo']
         if 'ref_elo'  in ckpt: evaluator.ref_elo  = ckpt['ref_elo']
         print(f"[INFO] Resumed step={step} game={game_id}")
+
+    # Create TensorBoard logger now that we know the resumed step.
+    # purge_step tells TensorBoard to discard any events at or beyond
+    # this step from previous event files, so new logs continue
+    # seamlessly from where the last run left off.
+    tb = TensorBoardLogger(tb_log_dir, enabled=tb_enabled, initial_step=step)
+    if tb_enabled:
+        print(f"[INFO] TensorBoard logging → {tb_log_dir}  (resuming from step {step})")
+        print(f"[INFO] Run: tensorboard --logdir {tb_log_dir}")
+    tb.log_config(step, config.to_dict())
 
     # Load replay buffer
     buffer_path = checkpoints_dir / "replay_buffer.npz"
@@ -571,7 +580,8 @@ def run_training(config, gui_enabled=False, num_workers=None):
         buffer.save(str(buffer_path))
         print(f"[INFO] Saved replay buffer: {len(buffer)} positions")
         stats.close()
-        tb.close()
+        if tb is not None:
+            tb.close()
         print("[INFO] Done.")
 
 
