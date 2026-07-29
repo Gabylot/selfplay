@@ -159,6 +159,7 @@ def run_training(config, gui_enabled=False, num_workers=None):
     psp.push_selfplay(network)   # kick off first round
 
     games_since_train = 0
+    positions_since_train = 0   # track new positions added between training steps
     games_since_eval  = 0
     train_interval    = config.training.training_steps_per_iteration
     eval_interval     = config.evaluation.eval_interval
@@ -196,6 +197,7 @@ def run_training(config, gui_enabled=False, num_workers=None):
             moves     = result.get('moves', [])
             mcts_s    = result.get('mcts_stats', [])
 
+            positions_since_train += game_info['num_positions']   # track new data
             buffer.add_game(game_data)
             game_id          += 1
             games_since_train += 1
@@ -231,6 +233,10 @@ def run_training(config, gui_enabled=False, num_workers=None):
             if (games_since_train >= train_interval
                     and len(buffer) >= int(config.training.batch_size)):
                 games_since_train = 0
+
+                # Log how many new positions arrived since the last training step
+                print(f"[Cycle] Added {positions_since_train} positions, buffer size now {len(buffer)}")
+                positions_since_train = 0
 
                 # Drain live GUI messages BEFORE and BETWEEN training batches
                 # so the browser stays in sync instead of showing a burst later.
@@ -268,6 +274,7 @@ def run_training(config, gui_enabled=False, num_workers=None):
                             np.array(p,dtype=np.float32),
                             float(v),
                             np.array(m,dtype=np.float32)) for s,p,v,m in praw]
+                    positions_since_train += pgi['num_positions']   # track pending games too
                     buffer.add_game(pgd)
                     game_id          += 1
                     games_since_train += 1
