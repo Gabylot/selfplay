@@ -76,6 +76,10 @@ def load_config(path: Optional[str] = None) -> dict:
             "db_path": "stats.db",
             "log_interval": 1,
         },
+        "tensorboard": {
+            "enabled": True,
+            "log_dir": "runs",
+        },
         "gui": {
             "host": "127.0.0.1",
             "port": 5000,

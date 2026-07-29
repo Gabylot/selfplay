@@ -27,6 +27,7 @@ from selfplay import self_play_game, ReplayBuffer, ParallelSelfPlay
 from training import train_one_step, create_optimizer
 from evaluation import Evaluator
 from stats import StatsLogger
+from tb_logger import TensorBoardLogger
 from gui.live_game import LiveGameState
 
 
@@ -98,6 +99,14 @@ def run_training(config, gui_enabled=False, num_workers=None):
     stats_db_path = output_dir / config.stats.db_path
     stats = StatsLogger(str(stats_db_path))
 
+    # TensorBoard logger
+    tb_enabled = getattr(config, 'tensorboard', None) and getattr(config.tensorboard, 'enabled', True)
+    tb_log_dir = str(output_dir / getattr(config.tensorboard, 'log_dir', 'runs')) if tb_enabled else None
+    tb = TensorBoardLogger(tb_log_dir, enabled=tb_enabled)
+    if tb_enabled:
+        print(f"[INFO] TensorBoard logging → {tb_log_dir}")
+        print(f"[INFO] Run: tensorboard --logdir {tb_log_dir}")
+
     # One LiveGameState per worker (worker_id set, not eval)
     worker_live_games = [
         LiveGameState(max_history=5, worker_id=i, is_eval=False)
@@ -122,6 +131,7 @@ def run_training(config, gui_enabled=False, num_workers=None):
     best_network.to(device)
 
     stats.log_config(step, config.to_dict())
+    tb.log_config(step, config.to_dict())
 
     # GUI
     if gui_enabled:
@@ -214,9 +224,18 @@ def run_training(config, gui_enabled=False, num_workers=None):
                            avg_mcts_depth=game_info['avg_mcts_depth'],
                            num_positions=game_info['num_positions'],
                            material_diff=game_info.get('material_diff', 0))
+            tb.log_game(game_id=game_id, step=step,
+                        result=game_info['result'], result_str=game_info['result_str'],
+                        length=game_info['length'], termination=game_info['termination'],
+                        avg_mcts_depth=game_info['avg_mcts_depth'],
+                        num_positions=game_info['num_positions'],
+                        material_diff=game_info.get('material_diff', 0))
             stats.log_mcts_stats(game_id=game_id, step=step,
                                  avg_tree_depth=game_info['avg_mcts_depth'],
                                  avg_sims_per_move=config.mcts.num_simulations)
+            tb.log_mcts_stats(game_id=game_id, step=step,
+                              avg_tree_depth=game_info['avg_mcts_depth'],
+                              avg_sims_per_move=config.mcts.num_simulations)
 
             print(f"  [W{wid}] Game {game_id}: {game_info['termination']:18s} | "
                   f"{game_info['result_str']} | {game_info['length']} moves | buf={len(buffer)}")
@@ -264,6 +283,12 @@ def run_training(config, gui_enabled=False, num_workers=None):
                                             value_loss=ld['value_loss'],
                                             total_loss=ld['total_loss'],
                                             learning_rate=config.training.learning_rate)
+                    tb.log_training_step(step=step,
+                                         policy_loss=ld['policy_loss'],
+                                         value_loss=ld['value_loss'],
+                                         total_loss=ld['total_loss'],
+                                         learning_rate=config.training.learning_rate,
+                                         grad_norm=ld['grad_norm'])
 
                 # ── Handle self-play results that arrived while training ──
                 for pr in _pending_selfplay:
@@ -286,9 +311,18 @@ def run_training(config, gui_enabled=False, num_workers=None):
                                    avg_mcts_depth=pgi['avg_mcts_depth'],
                                    num_positions=pgi['num_positions'],
                                    material_diff=pgi.get('material_diff', 0))
+                    tb.log_game(game_id=game_id, step=step,
+                                result=pgi['result'], result_str=pgi['result_str'],
+                                length=pgi['length'], termination=pgi['termination'],
+                                avg_mcts_depth=pgi['avg_mcts_depth'],
+                                num_positions=pgi['num_positions'],
+                                material_diff=pgi.get('material_diff', 0))
                     stats.log_mcts_stats(game_id=game_id, step=step,
                                          avg_tree_depth=pgi['avg_mcts_depth'],
                                          avg_sims_per_move=config.mcts.num_simulations)
+                    tb.log_mcts_stats(game_id=game_id, step=step,
+                                      avg_tree_depth=pgi['avg_mcts_depth'],
+                                      avg_sims_per_move=config.mcts.num_simulations)
 
                     print(f"  [W{pw}] Game {game_id}: {pgi['termination']:18s} | "
                           f"{pgi['result_str']} | {pgi['length']} moves | buf={len(buffer)}")
@@ -303,6 +337,9 @@ def run_training(config, gui_enabled=False, num_workers=None):
                 stats.log_buffer_stats(step=step, buffer_size=len(buffer),
                                        white_wins=od['white_wins'],
                                        black_wins=od['black_wins'], draws=od['draws'])
+                tb.log_buffer_stats(step=step, buffer_size=len(buffer),
+                                    white_wins=od['white_wins'],
+                                    black_wins=od['black_wins'], draws=od['draws'])
                 if len(buffer) > 0:
                     n   = min(50, len(buffer))
                     ix  = np.random.choice(len(buffer), size=n, replace=False)
@@ -311,6 +348,9 @@ def run_training(config, gui_enabled=False, num_workers=None):
                     stats.log_network_stats(step,
                                             float(np.mean(np.max(ps,axis=1))),
                                             float(np.mean(np.abs(vs))))
+                    tb.log_network_stats(step,
+                                         float(np.mean(np.max(ps,axis=1))),
+                                         float(np.mean(np.abs(vs))))
 
                 # Checkpoint
                 if step % config.training.checkpoint_interval == 0:
@@ -478,8 +518,15 @@ def run_training(config, gui_enabled=False, num_workers=None):
                                                 wins=gate_wins, losses=gate_losses,
                                                 draws=gate_draws,
                                                 old_elo=old_elo, new_elo=evaluator.best_elo)
+                    tb.log_promotion_attempt(step=step, promoted=promoted,
+                                             win_rate=wr, games_played=total_g,
+                                             wins=gate_wins, losses=gate_losses,
+                                             draws=gate_draws,
+                                             old_elo=old_elo, new_elo=evaluator.best_elo)
                     stats.log_elo(evaluator.best_elo,"gating",step,
                                   total_g,gate_wins,gate_losses,gate_draws)
+                    tb.log_elo(evaluator.best_elo,"gating",step,
+                               total_g,gate_wins,gate_losses,gate_draws)
 
                 # Reference stats
                 total_r = ref_wins+ref_losses+ref_draws
@@ -490,10 +537,16 @@ def run_training(config, gui_enabled=False, num_workers=None):
                                          games_played=total_r,
                                          wins=ref_wins, losses=ref_losses,
                                          draws=ref_draws, win_rate=rwr)
+                    tb.log_evaluation(step=step, opponent="alpha_beta_ref",
+                                      games_played=total_r,
+                                      wins=ref_wins, losses=ref_losses,
+                                      draws=ref_draws, win_rate=rwr)
                     net_elo = evaluator.ref_elo + 200
                     new_ne  = net_elo + k*(rwr - 0.5)
                     stats.log_elo(new_ne,"alpha_beta_ref",step,
                                   total_r,ref_wins,ref_losses,ref_draws)
+                    tb.log_elo(new_ne,"alpha_beta_ref",step,
+                               total_r,ref_wins,ref_losses,ref_draws)
 
                 print(f"  === EVAL DONE — resuming self-play ===\n")
                 # Resume self-play: push tasks to all workers
@@ -509,6 +562,7 @@ def run_training(config, gui_enabled=False, num_workers=None):
         buffer.save(str(buffer_path))
         print(f"[INFO] Saved replay buffer: {len(buffer)} positions")
         stats.close()
+        tb.close()
         print("[INFO] Done.")
 
 
