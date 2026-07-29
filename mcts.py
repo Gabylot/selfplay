@@ -466,7 +466,7 @@ class MCTS:
             states_list = [board_to_tensor(n.board) for n in expandable_nodes]
             states_batch = np.stack(states_list, axis=0)
 
-            policies_batch, values_batch = self.network.predict_batch(states_batch)
+            policies_batch, values_batch = self.network.predictBatch(states_batch)
 
             for idx, node in enumerate(expandable_nodes):
                 self._expand_node_with_data(node, policies_batch[idx], values_batch[idx])

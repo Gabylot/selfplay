@@ -446,7 +446,7 @@ def profile_separate_costs(network: AlphaZeroNet, board: chess.Board,
         times = []
         for _ in range(num_measurements):
             t0 = time.perf_counter()
-            policies, values = network.predict_batch(states)
+            policies, values = network.predictBatch(states)
             t1 = time.perf_counter()
             times.append(t1 - t0)
         results[f'batch{batch_size}_network_call_us'] = 1e6 * np.mean(times)
