@@ -116,6 +116,15 @@ table.dt tr:hover td{background:#0f172a}
 .eval-card{border-color:#450a0a}
 .eval-card h2{color:#f87171}
 
+/* Eval result boxes */
+.eval-res{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:12px}
+@media(max-width:860px){.eval-res{grid-template-columns:1fr}}
+.erbox{background:#0f172a;border:1px solid #1e3a5f;border-radius:6px;padding:10px}
+.erbox .etitle{font-size:10px;color:#64748b;text-transform:uppercase;letter-spacing:1px;margin-bottom:6px}
+.erbox .ewld{font-size:15px;font-weight:700;margin-bottom:4px}
+.erbox .ewr{font-size:11px;color:#94a3b8}
+.erbox .eprom{font-size:10px;font-weight:700;margin-top:4px}
+
 .seclbl{font-size:9px;color:#374151;text-transform:uppercase;letter-spacing:1px;margin-bottom:3px}
 </style>
 </head>
@@ -205,6 +214,20 @@ table.dt tr:hover td{background:#0f172a}
       <div><div class="seclbl">Recent Eval Games</div><div class="rlist" id="erec"><div style="color:#374151;padding:4px 7px">No eval games yet</div></div></div>
     </div>
   </div>
+  <!-- Latest eval results summary -->
+  <div class="eval-res" id="eres_summary">
+    <div class="erbox">
+      <div class="etitle">vs Best Network (Gating)</div>
+      <div class="ewld" id="er_gate_wld" style="color:#475569">—</div>
+      <div class="ewr" id="er_gate_wr">No data</div>
+      <div class="eprom" id="er_gate_prom" style="color:#475569"></div>
+    </div>
+    <div class="erbox">
+      <div class="etitle">vs Alpha-Beta (Reference)</div>
+      <div class="ewld" id="er_ref_wld" style="color:#475569">—</div>
+      <div class="ewr" id="er_ref_wr">No data</div>
+    </div>
+  </div>
 </div>
 
 <!-- Charts -->
@@ -220,6 +243,10 @@ table.dt tr:hover td{background:#0f172a}
 <div class="card"><h2>Promotion Attempts</h2>
   <table class="dt"><thead><tr><th>Step</th><th>Promoted</th><th>Win Rate</th><th>W/L/D</th><th>Old Elo</th><th>New Elo</th></tr></thead>
   <tbody id="ptbl"><tr><td colspan="6" style="text-align:center;color:#1f2937">No data</td></tr></tbody></table>
+</div>
+<div class="card"><h2>Evaluation History</h2>
+  <table class="dt"><thead><tr><th>Step</th><th>Opponent</th><th>W/L/D</th><th>Win Rate</th><th>Promoted</th></tr></thead>
+  <tbody id="etbl"><tr><td colspan="5" style="text-align:center;color:#1f2937">No data</td></tr></tbody></table>
 </div>
 <div class="card"><h2>Recent Game Outcomes</h2>
   <table class="dt"><thead><tr><th>Game</th><th>Result</th><th>Length</th><th>Termination</th><th>Step</th><th>Depth</th><th>Material</th></tr></thead>
@@ -578,11 +605,58 @@ function updSum(d){
   }
 }
 
+function updEvalSummary(promo,evalh){
+  // Latest gating result (promo is ordered ASC, so last entry is most recent)
+  if(promo&&promo.length){
+    const g=promo[promo.length-1];
+    const wld=`${g.wins}W / ${g.losses}L / ${g.draws}D`;
+    document.getElementById('er_gate_wld').textContent=wld;
+    document.getElementById('er_gate_wld').style.color='#d1d5db';
+    document.getElementById('er_gate_wr').textContent=`Win Rate: ${(g.win_rate*100).toFixed(1)}% (${g.games_played} games, step ${g.step})`;
+    const pe=document.getElementById('er_gate_prom');
+    pe.textContent=g.promoted?'✓ PROMOTED':'✗ Not promoted';
+    pe.style.color=g.promoted?'#22c55e':'#ef4444';
+  }
+  // Latest reference result (evalh is ordered ASC, so last entry is most recent)
+  if(evalh&&evalh.length){
+    const r=evalh[evalh.length-1];
+    const wld=`${r.wins}W / ${r.losses}L / ${r.draws}D`;
+    document.getElementById('er_ref_wld').textContent=wld;
+    document.getElementById('er_ref_wld').style.color='#d1d5db';
+    document.getElementById('er_ref_wr').textContent=`Win Rate: ${(r.win_rate*100).toFixed(1)}% (${r.games_played} games, step ${r.step})`;
+  }
+}
+
+function updEvalTable(promo,evalh){
+  const et=document.getElementById('etbl');
+  if((!promo||!promo.length)&&(!evalh||!evalh.length)){
+    et.innerHTML='<tr><td colspan="5" style="text-align:center;color:#1f2937">No data</td></tr>';
+    return;
+  }
+  // Combine both histories into unified rows
+  let rows=[];
+  if(promo)promo.forEach(d=>rows.push({step:d.step,opponent:'Best Network (Gating)',wins:d.wins,losses:d.losses,draws:d.draws,win_rate:d.win_rate,promoted:d.promoted}));
+  if(evalh)evalh.forEach(d=>rows.push({step:d.step,opponent:'Alpha-Beta (Reference)',wins:d.wins,losses:d.losses,draws:d.draws,win_rate:d.win_rate,promoted:null}));
+  // Sort by step descending, show most recent 30
+  rows.sort((a,b)=>b.step-a.step);
+  et.innerHTML=rows.slice(0,30).map(d=>{
+    const wr=(d.win_rate*100).toFixed(1)+'%';
+    const wld=`${d.wins}/${d.losses}/${d.draws}`;
+    let ps='—',pc='#475569';
+    if(d.promoted===true){ps='YES';pc='#22c55e';}
+    else if(d.promoted===false){ps='NO';pc='#ef4444';}
+    return`<tr><td>${d.step}</td><td>${d.opponent}</td><td>${wld}</td><td>${wr}</td><td style="color:${pc};font-weight:700">${ps}</td></tr>`;
+  }).join('');
+}
+
 async function pollAll(){
-  const [sum,loss,games,elo,promo,net,buf]=await Promise.all([
+  const [sum,loss,games,elo,promo,net,buf,evalh]=await Promise.all([
     fj('/api/summary'),fj('/api/training_losses'),fj('/api/game_outcomes'),
-    fj('/api/elo_history'),fj('/api/promotion_history'),fj('/api/network_stats'),fj('/api/buffer_stats')]);
+    fj('/api/elo_history'),fj('/api/promotion_history'),fj('/api/network_stats'),fj('/api/buffer_stats'),
+    fj('/api/evaluation_history')]);
   updSum(sum);
+  updEvalSummary(promo,evalh);
+  updEvalTable(promo,evalh);
   fill(CL,loss,['policy_loss','value_loss','total_loss']);
   fill(CE,elo,['elo']);
   fill(CN,games,['length']);
