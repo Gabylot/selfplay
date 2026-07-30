@@ -10,7 +10,7 @@ Board Representation (136 planes = 8 history positions × 17 planes each):
         Plane 15:     Castling rights (BK)
         Plane 16:     Castling rights (BQ)
 
-    Total: 8 × 17 = 136 planes.
+    Total: 8 × 17 + 1 = 137 planes.
 
     This follows the AlphaZero approach: the network sees the actual board
     states of recent history, allowing it to detect threefold-repetition
@@ -20,6 +20,14 @@ Board Representation (136 planes = 8 history positions × 17 planes each):
     determined by the board state (the en-passant square is a property of
     the position, and the network can infer it from the piece positions
     and the last move in the history).
+
+    Note on the move-count plane: the fullmove number is a cheap, monotonic
+    signal for game phase/progress that the history planes don't otherwise
+    expose (a repeated position looks identical regardless of how deep into
+    the game it occurs). It's stored as a single full-board plane (constant
+    value across all 64 squares, like side-to-move), normalized by dividing
+    by ``MOVE_COUNT_NORM`` so it stays in a small, bounded-ish range instead
+    of growing unboundedly over very long games.
 
 Move Encoding (8x8x73 = 4672 action space):
     Planes 0-55:  Queen-like moves (8 directions × 7 distances)
@@ -62,7 +70,23 @@ PLANE_CASTLING_BQ = 16
 
 PLANES_PER_HISTORY = 17
 NUM_HISTORY_STEPS = 8
-NUM_PLANES = PLANES_PER_HISTORY * NUM_HISTORY_STEPS  # 136
+NUM_HISTORY_PLANES = PLANES_PER_HISTORY * NUM_HISTORY_STEPS  # 136
+
+# Move-count plane: one extra global plane appended after all history
+# planes, holding the (normalized) fullmove number broadcast across the
+# whole 8x8 board — the same broadcasting pattern used for side-to-move
+# and castling-rights planes.
+PLANE_MOVE_COUNT = NUM_HISTORY_PLANES  # index 136
+NUM_EXTRA_PLANES = 1
+NUM_PLANES = NUM_HISTORY_PLANES + NUM_EXTRA_PLANES  # 137
+
+# Normalization divisor for the move-count plane. Typical games run well
+# under 100 full moves; dividing by this keeps the plane in a small,
+# roughly [0, ~1.5] range for games up to ~150 full moves (300 half-moves,
+# matching the default max_game_length in half-moves) without hard-clipping
+# longer games.
+MOVE_COUNT_NORM = 100.0
+
 NUM_ACTIONS = 8 * 8 * 73  # 4672
 
 # Queen move directions: (dr, dc)
@@ -149,14 +173,16 @@ def _encode_single_position(board: chess.Board, plane_offset: int,
 
 def board_to_tensor(board: chess.Board,
                     history_length: int = 8) -> np.ndarray:
-    """Encode a chess.Board as a (136, 8, 8) float32 numpy array.
+    """Encode a chess.Board as a (137, 8, 8) float32 numpy array.
 
     The encoding uses the AlphaZero approach: the last 8 board positions
     are each encoded as 17 planes (12 piece planes + side-to-move + 4
-    castling planes), for a total of 136 input planes.
+    castling planes), for a total of 136 history planes, plus one final
+    global plane holding the normalized fullmove number.
 
     This allows the network to detect threefold-repetition by comparing
-    piece configurations across time steps.
+    piece configurations across time steps, and to condition on game
+    phase/progress via the move-count plane.
 
     **Optimization**: Instead of creating 8 separate board copies (one per
     history step), we copy the board once and walk backwards by popping
@@ -171,7 +197,7 @@ def board_to_tensor(board: chess.Board,
         history_length: Number of historical positions to encode (default 8)
 
     Returns:
-        tensor: (136, 8, 8) float32 numpy array
+        tensor: (137, 8, 8) float32 numpy array
     """
     tensor = np.zeros((NUM_PLANES, 8, 8), dtype=np.float32)
 
@@ -195,11 +221,15 @@ def board_to_tensor(board: chess.Board,
             # Nothing to do — tensor is already zeroed for these planes.
             pass
 
+    # Move-count plane: normalized fullmove number of the *current* position
+    # (not affected by the history walk above, which only reads `b`).
+    tensor[PLANE_MOVE_COUNT, :, :] = board.fullmove_number / MOVE_COUNT_NORM
+
     return tensor
 
 
 def board_to_tensor_batch(board: chess.Board) -> np.ndarray:
-    """Encode board as batch tensor (1, 136, 8, 8)."""
+    """Encode board as batch tensor (1, 137, 8, 8)."""
     return board_to_tensor(board)[np.newaxis, ...]
 
 

@@ -17,6 +17,11 @@ server via InferenceClient(network_id=0 / 1) instead of loading both networks
 onto CPU. Reference eval (network vs alpha-beta) also uses network_id=0 when
 GPU inference is active. This mirrors the self-play path and avoids the CPU
 fallback silently running whenever use_gpu is set.
+
+NOTE 3: when GPU inference is enabled and ``config.inference.use_shared_memory``
+is True (default), per-worker shared-memory buffers are allocated to eliminate
+pickle/pipe overhead for state and policy/value arrays. Only ~100 bytes of
+metadata travel through the queue per inference request.
 """
 
 import numpy as np
@@ -33,6 +38,7 @@ from encoding import board_to_tensor, get_legal_move_mask, NUM_ACTIONS
 from network import AlphaZeroNet
 from mcts import MCTS
 from inference_client import InferenceClient
+from shared_memory_transport import SharedMemoryTransport
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -349,7 +355,7 @@ def self_play_game(network, config, on_move=None):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _worker_process(worker_id, task_queue, result_queue, config_dict, shutdown_event,
-                    request_queue=None, response_queue=None):
+                    request_queue=None, response_queue=None, shared_buffers=None):
     import torch, sys, os
     from config import Config
     from network import AlphaZeroNet
@@ -371,7 +377,11 @@ def _worker_process(worker_id, task_queue, result_queue, config_dict, shutdown_e
     if use_gpu and request_queue is not None and response_queue is not None:
         # network_id=0 by default; gating eval below spins up a second
         # client bound to network_id=1 for the "best" network.
-        inference_client = InferenceClient(worker_id, request_queue, response_queue, network_id=0)
+        # Pass shared_buffers for zero-copy IPC when available.
+        inference_client = InferenceClient(
+            worker_id, request_queue, response_queue, network_id=0,
+            shared_buffers=shared_buffers,
+        )
 
     def make_net():
         n = AlphaZeroNet(
@@ -473,8 +483,10 @@ def _worker_process(worker_id, task_queue, result_queue, config_dict, shutdown_e
             if eval_type == 'gating':
                 # ── GPU path: route both nets through the dual-network server ──
                 if inference_client is not None:
-                    client_a = InferenceClient(worker_id, request_queue, response_queue, network_id=0)
-                    client_b = InferenceClient(worker_id, request_queue, response_queue, network_id=1)
+                    client_a = InferenceClient(worker_id, request_queue, response_queue, network_id=0,
+                                               shared_buffers=shared_buffers)
+                    client_b = InferenceClient(worker_id, request_queue, response_queue, network_id=1,
+                                               shared_buffers=shared_buffers)
                     ea = mcts(client_a, False); eb = mcts(client_b, False)
                 else:
                     load(net_a, task['weights_a']); load(net_b, task['weights_b'])
@@ -515,7 +527,8 @@ def _worker_process(worker_id, task_queue, result_queue, config_dict, shutdown_e
 
                 # ── GPU path: network A via the GPU server (network_id=0) ──
                 if inference_client is not None:
-                    client_a = InferenceClient(worker_id, request_queue, response_queue, network_id=0)
+                    client_a = InferenceClient(worker_id, request_queue, response_queue, network_id=0,
+                                               shared_buffers=shared_buffers)
                     ea = mcts(client_a, False)
                 else:
                     load(net_a, task['weights_a'])
@@ -591,12 +604,44 @@ class ParallelSelfPlay:
         self._use_gpu = (getattr(config, 'inference', None)
                          and getattr(config.inference, 'use_gpu', False))
         self._gpu_server_process = None
+
+        # Shared-memory transport for zero-copy IPC
+        self._use_shared_memory = False
+        self._shared_transport = None
+
         if self._use_gpu:
             self._request_q = mp.Queue()
             self._weight_q = mp.Queue()
             self._response_qs = {}
             self._gpu_ready = mp.Event()
             self._gpu_shutdown = mp.Event()
+
+            # Check if shared memory is enabled in config
+            inf_cfg = getattr(config, 'inference', None)
+            self._use_shared_memory = (
+                inf_cfg is not None and
+                getattr(inf_cfg, 'use_shared_memory', True)
+            )
+
+            if self._use_shared_memory:
+                # Buffer must be large enough for the largest possible batch.
+                # MCTS batch_size can exceed inference.max_batch (the latter
+                # only limits timer-based single-request aggregation, not
+                # pre-stacked batch requests from MCTS).
+                inf_max_batch = getattr(inf_cfg, 'max_batch', 64) if inf_cfg else 64
+                mcts_batch_size = getattr(config.mcts, 'batch_size', 1)
+                max_batch = max(inf_max_batch, mcts_batch_size)
+                state_dtype_str = getattr(inf_cfg, 'state_dtype', 'float16') if inf_cfg else 'float16'
+                import numpy as _np
+                state_dtype = _np.float16 if state_dtype_str == 'float16' else _np.float32
+                self._shared_transport = SharedMemoryTransport(
+                    num_workers=num_workers,
+                    max_batch=max_batch,
+                    state_dtype=state_dtype,
+                )
+                self._shared_transport.create_buffers()
+                print(f"[INFO] Shared-memory IPC enabled "
+                      f"(dtype={state_dtype_str}, max_batch={max_batch})")
 
     def start(self):
         if self._use_gpu:
@@ -612,6 +657,8 @@ class ParallelSelfPlay:
             if self._use_gpu:
                 kwargs['request_queue'] = self._request_q
                 kwargs['response_queue'] = self._response_qs[i]
+                if self._use_shared_memory and self._shared_transport is not None:
+                    kwargs['shared_buffers'] = self._shared_transport.get_worker_buffers(i)
             p = mp.Process(target=_worker_process,
                            args=(i, tq, self._result_q, cd, self._shutdown),
                            kwargs=kwargs, daemon=True)
@@ -620,6 +667,9 @@ class ParallelSelfPlay:
 
     def _start_gpu_server(self):
         from gpu_server import GPUInferenceServer
+        shared_bufs = None
+        if self._use_shared_memory and self._shared_transport is not None:
+            shared_bufs = self._shared_transport.get_all_worker_buffers()
         server = GPUInferenceServer(
             config=self.config,
             request_queue=self._request_q,
@@ -627,6 +677,7 @@ class ParallelSelfPlay:
             weight_queue=self._weight_q,
             ready_event=self._gpu_ready,
             shutdown_event=self._gpu_shutdown,
+            shared_buffers=shared_bufs,
         )
         self._gpu_server_process = mp.Process(target=server.run, daemon=True)
         self._gpu_server_process.start()

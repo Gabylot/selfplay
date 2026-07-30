@@ -2,11 +2,11 @@
 
 # --- Network Architecture ---
 network:
-  num_residual_blocks: 10
-  num_filters: 128
-  num_policy_channels: 128
-  num_value_channels: 128
-  value_fc_size: 256
+  num_residual_blocks: 4
+  num_filters: 64
+  num_policy_channels: 64
+  num_value_channels: 64
+  value_fc_size: 128
 
 # --- MCTS ---
 mcts:
@@ -14,14 +14,14 @@ mcts:
   c_puct: 1.5                # PUCT exploration constant
   dirichlet_alpha: 0.25        # Dirichlet noise alpha
   dirichlet_epsilon: 0.25     # Weight of noise vs prior
-  batch_size: 16               # Batch size for tree-parallel MCTS (1 = sequential, no virtual loss)
+  batch_size: 32               # Batch size for tree-parallel MCTS (1 = sequential, no virtual loss)
   c_virtual_loss: 0.5         # Virtual loss penalty for batch MCTS
 
 # --- Self-Play ---
 selfplay:
   network_source: latest      # "latest" (always use newest network) or "gated_best"
-  max_game_length: 150        # Max half-moves before adjudication
-  adjudicate_material: true   # When max length hit, judge by material instead of draw
+  max_game_length: 200        # Max half-moves before adjudication
+  adjudicate_material: false   # When max length hit, judge by material instead of draw
   # Material values for adjudication
   piece_values:
     P: 1
@@ -29,11 +29,11 @@ selfplay:
     B: 3
     R: 5
     Q: 9
-  temperature_threshold: 30   # Move number to switch from high to low temperature
+  temperature_threshold: 20   # Move number to switch from high to low temperature
   temperature_high: 1.0
   temperature_low: 0.1
-  adjudicate_graded: true     # use tanh grading instead of flat ±1
-  adjudicate_scaling: 12.0     # queen = ~0.76, rook = ~0.51, pawn = ~0.11
+  adjudicate_graded: false     # use tanh grading instead of flat ±1
+  adjudicate_scaling: 7.0     # queen = ~0.76, rook = ~0.51, pawn = ~0.11
 
 # --- Replay Buffer ---
 buffer:
@@ -41,17 +41,17 @@ buffer:
 
 # --- Training ---
 training:
-  batch_size: 512
-  learning_rate: 0.001
+  batch_size: 1024
+  learning_rate: 0.02
   momentum: 0.9
   weight_decay: 1e-4
-  num_batches_per_step: 10    # Training steps between self-play batches
-  checkpoint_interval: 50     # Save checkpoint every N training steps
-  training_steps_per_iteration: 5  # Training steps per outer loop iteration
+  num_batches_per_step: 4    # Number of gradient steps per training session
+  checkpoint_interval: 200     # Save checkpoint every N training steps
+  training_steps_per_iteration: 10  # Games completed between training sessions
 
 # --- Evaluation ---
 evaluation:
-  eval_interval: 200           # Run eval every N self-play games
+  eval_interval: 20000           # Run eval every N self-play games
   gate_games: 20              # Games for network-vs-network gating
   gate_win_threshold: 0.55    # Win rate needed to promote
   ref_opponent_games: 20      # Games vs alpha-beta reference
@@ -75,6 +75,11 @@ stats:
   db_path: "stats.db"
   log_interval: 1             # Log stats every N self-play games
 
+# --- TensorBoard ---
+tensorboard:
+  enabled: true               # Enable TensorBoard logging
+  log_dir: "runs"             # Directory for event files (relative to output/run_name)
+
 # --- GUI ---
 gui:
   host: "127.0.0.1"
@@ -84,6 +89,8 @@ gui:
 # --- Inference ---
 inference:
   use_gpu: true              # true = centralized GPU inference server, false = CPU per-worker
+  use_shared_memory: true    # true = shared-memory IPC (zero-copy), false = queue-based pickle
+  state_dtype: "float16"     # dtype for shared-memory buffers: "float16" (halves size) or "float32"
   max_batch: 16               # Max samples per GPU forward pass
   max_wait_ms: 2.0            # Max ms to wait before firing a partial batch
   prewarm_batch_sizes: [1, 8, 16]  # Batch sizes to pre-warm

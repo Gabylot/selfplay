@@ -11,12 +11,27 @@ server without round-tripping weights.
 Protocol
 --------
 Weight  : (network_id, raw_bytes)           — network_id ∈ {0, 1}
-Request : (worker_id, request_id, network_id, state)
-          - state ndim == 3 (20,8,8):   single request (timer-aggregated)
-          - state ndim == 4 (N,20,8,8):  batch request (processed immediately)
-Response : (request_id, policy, value)
-          - single response:  policy (4672,) ndarray, value float
-          - batch response:   policy (N,4672) ndarray, values (N,) ndarray
+
+Request (queue mode):
+    (worker_id, request_id, network_id, state)
+      - state ndim == 3 (20,8,8):   single request (timer-aggregated)
+      - state ndim == 4 (N,20,8,8):  batch request (processed immediately)
+
+Request (shared-memory mode):
+    (worker_id, request_id, network_id, batch_size)
+      - batch_size == 1:  single request (timer-aggregated)
+      - batch_size > 1:   batch request (processed immediately)
+    The actual state data lives in the worker's shared request buffer.
+
+Response (queue mode):
+    (request_id, policy, value)
+      - single response:  policy (4672,) ndarray, value float
+      - batch response:   policy (N,4672) ndarray, values (N,) ndarray
+
+Response (shared-memory mode):
+    (request_id, batch_size)
+    The actual policy/value data lives in the worker's shared response buffer.
+
 Shutdown : None sentinel in request_queue
 """
 
@@ -29,6 +44,7 @@ import torch.nn.functional as F
 
 from network import AlphaZeroNet
 from encoding import NUM_PLANES
+from shared_memory_transport import SharedMemoryTransport, WorkerSharedBuffers
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -75,16 +91,23 @@ class GPUInferenceServer:
         Set after shader pre-warming is complete.
     shutdown_event : mp.Event
         Checked each iteration; when set the server exits its loop.
+    shared_buffers : dict[int, WorkerSharedBuffers], optional
+        Per-worker shared-memory buffers.  When provided, state data is
+        read from / results written to shared memory instead of being
+        pickled through the queues.  When ``None`` (default), the original
+        queue-based transport is used.
     """
 
     def __init__(self, config, request_queue, response_queues,
-                 weight_queue, ready_event, shutdown_event):
+                 weight_queue, ready_event, shutdown_event,
+                 shared_buffers=None):
         self.config = config
         self.request_queue = request_queue
         self.response_queues = response_queues
         self.weight_queue = weight_queue
         self.ready_event = ready_event
         self.shutdown_event = shutdown_event
+        self.shared_buffers = shared_buffers  # dict[worker_id → buffers]
 
         inf_cfg = getattr(config, 'inference', None)
         self.max_batch = getattr(inf_cfg, 'max_batch', 64) if inf_cfg else 64
@@ -158,47 +181,97 @@ class GPUInferenceServer:
                 self._send_shutdown_to_workers()
                 return
 
-            worker_id, request_id, network_id, state = req
-            net = nets.get(network_id, net_a)
-
-            # Differentiate: batch request (ndim == 4) vs single (ndim == 3)
-            if state.ndim == 4:
-                # ── Batch request: process immediately, no timer ──
-                self._process_single_batch(net, device, worker_id, request_id, state)
-            else:
-                # ── Single request: collect more for timer-based batching ──
-                batch = [(worker_id, request_id, network_id, state)]
-                deadline = time.monotonic() + self.max_wait_ms / 1000.0
-
-                while len(batch) < self.max_batch:
-                    remaining = max(0.0, deadline - time.monotonic())
-                    if remaining <= 0:
-                        break  # timer expired
-                    try:
-                        req2 = self.request_queue.get(timeout=min(remaining, 0.001))
-                        if req2 is None:
-                            # Shutdown — fire what we have first
-                            break
-                        w2, rid2, nid2, st2 = req2
-                        if st2.ndim == 4:
-                            # Another batch request arrived during our window.
-                            # Process the current accumulation first, then handle
-                            # the batch request immediately.
-                            if batch:
-                                self._process_batch(nets, device, batch)
-                            self._process_single_batch(
-                                nets.get(nid2, net_a), device, w2, rid2, st2
-                            )
-                            batch = []
-                            break
-                        batch.append((w2, rid2, nid2, st2))
-                    except queue.Empty:
-                        break
-
-                if batch:
-                    self._process_batch(nets, device, batch)
+            self._handle_request(req, nets, device, net_a)
 
         print("[GPU-Server] Shutting down")
+
+    def _handle_request(self, req, nets, device, net_a):
+        """Dispatch a single request, handling both shared-memory and queue modes.
+
+        In shared-memory mode the 4th element of *req* is an ``int``
+        (batch_size); in queue mode it is an ``np.ndarray`` (state).
+        """
+        worker_id, request_id, network_id, fourth = req
+
+        # ── Determine if this is a shared-memory request ──
+        is_shm = isinstance(fourth, int)
+
+        if is_shm:
+            batch_size = fourth
+            buf = self.shared_buffers.get(worker_id)
+            if buf is None:
+                # No shared buffers for this worker — can't proceed
+                return
+            states = SharedMemoryTransport.read_states(buf, batch_size)
+        else:
+            batch_size = None
+            states = fourth  # ndarray
+
+        net = nets.get(network_id, net_a)
+
+        # ── Batch request (ndim == 4 or batch_size > 1): process immediately ──
+        is_batch = (batch_size is not None and batch_size > 1) or \
+                   (batch_size is None and states.ndim == 4)
+
+        if is_batch:
+            self._process_single_batch(
+                net, device, worker_id, request_id, states
+            )
+            return
+
+        # ── Single request: extract state and collect more for timer batching ──
+        state = states[0] if is_shm else states  # (NUM_PLANES, 8, 8)
+        batch = [(worker_id, request_id, network_id, state)]
+        deadline = time.monotonic() + self.max_wait_ms / 1000.0
+
+        while len(batch) < self.max_batch:
+            remaining = max(0.0, deadline - time.monotonic())
+            if remaining <= 0:
+                break  # timer expired
+            try:
+                req2 = self.request_queue.get(timeout=min(remaining, 0.001))
+                if req2 is None:
+                    # Shutdown — fire what we have first
+                    break
+
+                w2, rid2, nid2, f2 = req2
+                is_shm2 = isinstance(f2, int)
+
+                if is_shm2:
+                    buf2 = self.shared_buffers.get(w2)
+                    if buf2 is None:
+                        continue
+                    states2 = SharedMemoryTransport.read_states(buf2, f2)
+
+                    if f2 > 1:
+                        # Batch request arrived during our window
+                        if batch:
+                            self._process_batch(nets, device, batch)
+                        self._process_single_batch(
+                            nets.get(nid2, net_a), device, w2, rid2, states2
+                        )
+                        batch = []
+                        break
+                    # Single request — add to accumulation
+                    batch.append((w2, rid2, nid2, states2[0]))
+                else:
+                    # Queue-mode request
+                    if f2.ndim == 4:
+                        # Batch request arrived during our window
+                        if batch:
+                            self._process_batch(nets, device, batch)
+                        self._process_single_batch(
+                            nets.get(nid2, net_a), device, w2, rid2, f2
+                        )
+                        batch = []
+                        break
+                    batch.append((w2, rid2, nid2, f2))
+
+            except queue.Empty:
+                break
+
+        if batch:
+            self._process_batch(nets, device, batch)
 
     # ── Internal helpers ────────────────────────────────────────────────
 
@@ -234,8 +307,9 @@ class GPUInferenceServer:
     def _process_single_batch(self, net, device, worker_id, request_id, states):
         """Process a pre-stacked batch request ``(N, {NUM_PLANES}, 8, 8)`` immediately.
 
-        Sends a single response ``(request_id, policies, values)`` back to
-        the worker, where ``policies.shape == (N, 4672)``.
+        In shared-memory mode, writes results to the worker's shared response
+        buffers and sends only ``(request_id, batch_size)`` through the queue.
+        In queue mode, sends ``(request_id, policies, values)`` through the queue.
         """
         states_t = torch.from_numpy(states).float().to(device)
 
@@ -244,6 +318,21 @@ class GPUInferenceServer:
             policies = F.softmax(policy_logits, dim=1).cpu().numpy()
             values = values.squeeze(-1).cpu().numpy()
 
+        n = len(policies)
+
+        # ── Shared-memory response path ──
+        if self.shared_buffers is not None and worker_id in self.shared_buffers:
+            buf = self.shared_buffers[worker_id]
+            SharedMemoryTransport.write_policies_values(buf, policies, values)
+            try:
+                self.response_queues[worker_id].put_nowait(
+                    (request_id, n)
+                )
+            except Exception:
+                pass  # queue full or closed — worker likely dead
+            return
+
+        # ── Queue response path ──
         try:
             self.response_queues[worker_id].put_nowait(
                 (request_id, policies, values)
@@ -261,6 +350,10 @@ class GPUInferenceServer:
         Requests are **grouped by ``network_id``** so each group is processed
         with the correct network.  This allows timer-batched single requests
         from different networks (e.g. gating eval) to be handled correctly.
+
+        In shared-memory mode, each worker's results are written to their
+        shared response buffer and only ``(request_id, 1)`` is sent through
+        the queue.  In queue mode, ``(request_id, policy, value)`` is sent.
         """
         # Group by network_id, preserving insertion order
         groups = {}
@@ -286,6 +379,25 @@ class GPUInferenceServer:
 
             # Distribute results to per-worker response queues
             for i, (worker_id, request_id, _, _) in enumerate(group):
+                # ── Shared-memory response path ──
+                if (self.shared_buffers is not None
+                        and worker_id in self.shared_buffers):
+                    buf = self.shared_buffers[worker_id]
+                    # Write single result (batch_size=1) to shared memory
+                    SharedMemoryTransport.write_policies_values(
+                        buf,
+                        policies[i:i+1],  # (1, 4672)
+                        values[i:i+1],    # (1,)
+                    )
+                    try:
+                        self.response_queues[worker_id].put_nowait(
+                            (request_id, 1)
+                        )
+                    except Exception:
+                        pass
+                    continue
+
+                # ── Queue response path ──
                 try:
                     self.response_queues[worker_id].put_nowait(
                         (request_id, policies[i], float(values[i]))
