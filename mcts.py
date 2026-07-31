@@ -635,14 +635,30 @@ class MCTS:
     def _get_terminal_value(self, node):
         """Return the terminal value of a node.
 
-        **NEW**: if the node is at the maximum game length, adjudicate
-        according to `adjudicate_material` and the associated parameters.
-        Otherwise, use the normal chess result.
+        Three cases:
+          1. The game is ACTUALLY over (checkmate, stalemate,
+             insufficient material) — use board.result().
+          2. The game reached max_game_length — adjudicate by
+             material (configurable) or return 0.0 (draw).
+          3. The game is claimably drawn (threefold repetition,
+             fifty-move rule) — return 0.0.
         """
         if node._terminal_value_cached is not None:
             return node._terminal_value_cached
 
-        # ---- NEW: handle max_length termination ----
+        # ── Case 1: actually over (checkmate, stalemate, etc.) ──
+        result = node.board.result()
+        if result != "*":
+            if result == "1-0":
+                val = 1.0 if node.board.turn == chess.WHITE else -1.0
+            elif result == "0-1":
+                val = -1.0 if node.board.turn == chess.WHITE else 1.0
+            else:
+                val = 0.0
+            node._terminal_value_cached = val
+            return val
+
+        # ── Case 2: hit max game length (adjudicate) ──
         if node.board.ply() >= self.max_game_length:
             if self.adjudicate_material:
                 val = adjudicate_by_material(
@@ -652,20 +668,15 @@ class MCTS:
                     scaling=self.adjudicate_scaling
                 )
             else:
-                val = 0.0   # draw
+                val = 0.0
             node._terminal_value_cached = val
             return val
 
-        # Otherwise, normal chess outcome
-        result = node.board.result()
-        if result == "1-0":
-            val = 1.0 if node.board.turn == chess.WHITE else -1.0
-        elif result == "0-1":
-            val = -1.0 if node.board.turn == chess.WHITE else 1.0
-        else:
-            val = 0.0
-        node._terminal_value_cached = val
-        return val
+        # ── Case 3: claimable draws (repetition, 50-move) ──
+        # board.result() (no claim_draw) returns "*" for these,
+        # so they fall through to here.  0.0 is the correct value.
+        node._terminal_value_cached = 0.0
+        return 0.0
 
     def _backpropagate(self, node: MCTSNode, value: float):
         """Backpropagate value up the tree, flipping sign each ply."""
