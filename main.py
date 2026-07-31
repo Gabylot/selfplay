@@ -154,6 +154,16 @@ def run_training(config, gui_enabled=False, num_workers=None):
         if 'ref_elo'  in ckpt: evaluator.ref_elo  = ckpt['ref_elo']
         print(f"[INFO] Resumed step={step} game={game_id}")
 
+    # Load best network from disk (if available) so it survives restarts.
+    # If no best.pt exists, copy the latest checkpoint into best_network.
+    best_pt_path = output_dir / "best.pt"
+    if best_pt_path.exists():
+        print(f"[INFO] Loading best network: {best_pt_path}")
+        load_checkpoint(str(best_pt_path), best_network)
+    else:
+        best_network.load_state_dict(network.state_dict())
+        print(f"[INFO] No best.pt found — best_network initialised from latest checkpoint")
+
     # Create TensorBoard logger now that we know the resumed step.
     # purge_step tells TensorBoard to discard any events at or beyond
     # this step from previous event files, so new logs continue
@@ -525,7 +535,8 @@ def run_training(config, gui_enabled=False, num_workers=None):
                     promoted = wr > config.evaluation.gate_win_threshold
                     if promoted:
                         best_network.load_state_dict(network.state_dict())
-                        print(f"  [GATE] PROMOTED  win_rate={wr:.1%}")
+                        save_checkpoint(best_network, None, str(output_dir / "best.pt"), step=step)
+                        print(f"  [GATE] PROMOTED  win_rate={wr:.1%}  best.pt saved")
                     else:
                         print(f"  [GATE] not promoted  win_rate={wr:.1%}")
                     k = config.evaluation.elo_k_factor
