@@ -200,14 +200,22 @@ class MCTS:
 
         Args:
             root: The current root node (already searched)
-            move: The move that was selected
+            move: The move that was selected (can be ``chess.Move`` or ``FastMove``)
 
         Returns:
             The promoted child as a new root, or None if the child
-            wasn't found (shouldn't happen in normal flow).
+            wasn't found.
         """
+        # Compare by raw attributes to handle both FastMove and Move objects.
+        move_from = move.from_square
+        move_to = move.to_square
+        move_promo = move.promotion
+
         for action_idx, child in root.children.items():
-            if child.move == move:
+            child_move = child.move
+            if (child_move.from_square == move_from and
+                child_move.to_square == move_to and
+                child_move.promotion == move_promo):
                 # Detach from parent
                 child.parent = None
 
@@ -285,9 +293,10 @@ class MCTS:
 
         if self.batch_size > 1:
             # Batched mode: collect leaves, evaluate in batch, backprop
-            while sims_done < self.num_simulations:
+            target_new_sims = max(0, self.num_simulations - root.N)
+            while sims_done < target_new_sims:
                 # Determine batch size for this iteration
-                bs = min(self.batch_size, self.num_simulations - sims_done)
+                bs = min(self.batch_size, target_new_sims - sims_done)
 
                 # Collect leaf nodes via selection with virtual loss.
                 leaf_depth_pairs = self._collect_batch(root, bs)
@@ -316,8 +325,9 @@ class MCTS:
                 sims_done += len(leaf_nodes)
         else:
             # Sequential mode (original behavior, no virtual loss overhead)
-            sims_done = self.num_simulations
-            for _ in range(self.num_simulations):
+            remaining = max(0, self.num_simulations - root.N)
+            sims_done = remaining
+            for _ in range(remaining):
                 node = root
                 depth = 0
 
@@ -521,19 +531,15 @@ class MCTS:
     def _expand_node(self, node: MCTSNode) -> float:
         """Expand a node using the network. Returns the value estimate.
 
-        If the node is a terminal position, returns the game result
-        without querying the network.  Terminal state is cached on the
-        node to avoid redundant ``is_game_over()`` calls.
-
-        **NEW** now also checks for `max_game_length`.
+        Terminal state is cached on the node to avoid redundant
+        ``is_game_over()`` calls.
         """
-        # Check for terminal position -- cache result on node
         if node._game_over_cached is None:
             node._game_over_cached = (
                 node.board.is_game_over() or
                 node.board.is_repetition(3) or
                 node.board.is_fifty_moves() or
-                node.board.ply() >= self.max_game_length          # <-- NEW
+                node.board.ply() >= self.max_game_length
             )
         if node._game_over_cached:
             return self._get_terminal_value(node)
@@ -542,58 +548,37 @@ class MCTS:
         state = board_to_tensor(node.board)
         policy, value = self.network.predict(state)
 
-        # Complete expansion using the prediction data
+        # Delegates to the optimized expansion using raw FastMove objects
         return self._expand_node_with_data(node, policy, value)
 
     def _expand_node_with_data(self, node: MCTSNode,
                                 policy: np.ndarray, value: float) -> float:
         """Expand a node using precomputed policy and value.
 
-        Shared by both sequential and batched expansion paths.
-
-        Children are created with **lazy board construction** -- they
-        store only ``(parent, move)`` and materialize the board on
-        first access via the ``MCTSNode.board`` property.
-
-        **Optimization**: Computes policy indices for all legal moves in a
-        single pass, then reuses them for both the legal move mask and
-        child node creation.  This avoids calling ``move_to_policy_index``
-        twice per move (once in ``get_legal_move_mask_from_moves`` and
-        once in the child-creation loop).
-
-        Args:
-            node: Node to expand
-            policy: (4672,) policy probability vector from network
-            value: Scalar value estimate from network
-
-        Returns:
-            value: The value estimate (same as input)
+        Uses the raw FastMove list (``board.legal_moves_raw``) to avoid
+        wrapping every legal move into a ``chess.Move`` object.  This saves
+        ~20 Python object creations per expansion with no loss of information.
         """
-        # Get legal moves (only once)
-        legal_moves = list(node.board.legal_moves)
-        node.legal_moves_cached = legal_moves
+        # ── Legal moves: raw FastMove list from Rust backend ──
+        raw_moves = node.board.legal_moves_raw   # list of FastMove objects
 
-        if not legal_moves:
-            # No legal moves -- shouldn't happen if game_over check above works
+        if not raw_moves:
             return 0.0
 
-        # ---- Single-pass: compute policy indices for all legal moves ----
-        # This avoids calling move_to_policy_index twice per move
-        # (once for the mask, once for child creation).
+        # ── Compute policy indices for every legal move in one pass ──
         move_indices = []
-        for move in legal_moves:
+        for raw_move in raw_moves:
             try:
-                action_idx = move_to_policy_index(move, node.board)
+                action_idx = move_to_policy_index(raw_move, node.board)
                 move_indices.append(action_idx)
             except ValueError as e:
-                # Log the board and the move that failed encoding
                 with open("encoding_failures.log", "a") as f:
                     f.write(f"FEN: {node.board.fen()}\n"
-                            f"Move: {move.uci()}\n"
+                            f"Move: {raw_move.uci()}\n"
                             f"Error: {e}\n\n")
                 move_indices.append(None)
 
-        # Build legal move mask from the precomputed indices
+        # ── Build legal move mask ──
         mask = np.zeros(NUM_ACTIONS, dtype=np.float32)
         for action_idx in move_indices:
             if action_idx is not None:
@@ -601,35 +586,26 @@ class MCTS:
 
         legal_policy = policy * mask
         legal_sum = legal_policy.sum()
-
         if legal_sum > 0:
             legal_policy = legal_policy / legal_sum
         else:
-            # Uniform over legal moves if network gives zero probability to all
             legal_policy = mask / mask.sum()
 
-        # Create child nodes with lazy board construction
-        # (no board.copy() / push() -- done on first access via the property)
-        for move, action_idx in zip(legal_moves, move_indices):
+        # ── Create children, storing the raw FastMove directly ──
+        for raw_move, action_idx in zip(raw_moves, move_indices):
             if action_idx is None:
-                continue  # Skip moves that failed encoding
-
+                continue
             prior = float(legal_policy[action_idx])
 
-            # Lazy child: no board copy! The board will be materialized
-            # on first access via the MCTSNode.board property, which walks
-            # up to parent.board (with its full move history for 3-fold
-            # detection), copies with stack=True, and pushes the move.
-            child = MCTSNode(parent=node, move=move, prior=prior)
+            # FastMove supports .from_square, .to_square, .promotion, .uci(),
+            # so the child node can use it just like a chess.Move.
+            child = MCTSNode(parent=node, move=raw_move, prior=prior)
             node.children[action_idx] = child
 
         if not node.children:
-            print(f"WARNING: No children created for node with {len(legal_moves)} legal moves")
-            # Optional fallback: create children with uniform priors to avoid empty
-            # (but this should not happen in normal operation)
+            print(f"WARNING: No children created for node with {len(raw_moves)} legal moves")
 
         node.is_expanded = True
-
         return float(value)
 
     def _get_terminal_value(self, node):
@@ -748,25 +724,23 @@ class MCTS:
     def _find_checkmate_child(self, root: MCTSNode) -> Optional[chess.Move]:
         """Check if any root child delivers checkmate.
 
-        A child whose board is in checkmate means the move leading to it
-        wins the game immediately. This should always be played.
-
-        Args:
-            root: The root node after search
-
-        Returns:
-            The checkmate move if found, None otherwise.
+        Returns the move that gives mate, or None.  The returned move is
+        always a ``chess.Move`` (wrapped if necessary) to keep the public
+        API consistent.
         """
-        # Return cached result if available (prevets second child scan)
         if root._checkmate_child_cached:
             return root._checkmate_child_move
 
         for child in root.children.values():
             if child.N > 0 and child.board.is_checkmate():
                 root._checkmate_child_cached = True
-                root._checkmate_child_move = child.move
-                return child.move
-        # No checkmate found - cache the negative results as well
+                # child.move may be a FastMove; wrap it to chess.Move
+                move = child.move
+                if not isinstance(move, chess.Move):
+                    move = chess.Move._wrap(move)
+                root._checkmate_child_move = move
+                return move
+
         root._checkmate_child_cached = True
         root._checkmate_child_move = None
         return None

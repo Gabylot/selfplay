@@ -37,6 +37,7 @@ Move Encoding (8x8x73 = 4672 action space):
 """
 
 import numpy as np
+from wrapt import lru_cache
 import chess
 from typing import Optional
 
@@ -137,38 +138,37 @@ def _underpromotion_plane(piece_type, dir_idx):
     return 64 + piece_idx * 3 + dir_idx
 
 
-def _encode_single_position(board: chess.Board, plane_offset: int,
-                            tensor: np.ndarray):
-    """Encode a single board position into the tensor at the given plane offset.
+def _encode_single_position(board, plane_offset, tensor):
+    """Encode a single board position into ``tensor`` at ``plane_offset``.
 
-    Encodes 17 planes: 12 piece planes + side-to-move + 4 castling planes.
-
-    Args:
-        board: The board position to encode
-        plane_offset: Starting plane index in the tensor (0, 17, 34, ...)
-        tensor: (NUM_PLANES, 8, 8) array to write into
+    Uses the Rust ``FastBoard.piece_map()`` to iterate only over occupied
+    squares, and extracts ``piece_type`` / ``color`` from the raw
+    ``FastPiece`` objects – no Python ``Piece`` creation.
     """
-    # Piece positions — use piece_map() to iterate only occupied squares
-    # (~32) instead of all 64 squares.
-    for sq, piece in board.piece_map().items():
-        rank = chess.square_rank(sq)  # 0-7
-        file = chess.square_file(sq)  # 0-7
-        plane = plane_offset + PIECE_PLANE[(piece.piece_type, piece.color)]
-        tensor[plane, rank, file] = 1.0
+    pm = board._b.piece_map()  # dict[int, FastPiece]  (square → raw piece)
 
-    # Side to move
+    for sq, p in pm.items():
+        pt = p.piece_type        # 1..6 (PAWN..KING)
+        color = p.color          # True = WHITE, False = BLACK
+        row = sq >> 3
+        col = sq & 7
+        if color == chess.WHITE:
+            tensor[plane_offset + pt - 1, row, col] = 1.0
+        else:
+            tensor[plane_offset + 6 + pt - 1, row, col] = 1.0
+
+    # Side-to-move plane (plane 12 of the history block)
     if board.turn == chess.WHITE:
-        tensor[plane_offset + PLANE_SIDE_TO_MOVE, :, :] = 1.0
+        tensor[plane_offset + 12, :, :] = 1.0
+    else:
+        tensor[plane_offset + 12, :, :] = 0.0
 
-    # Castling rights
-    if board.has_kingside_castling_rights(chess.WHITE):
-        tensor[plane_offset + PLANE_CASTLING_WK, :, :] = 1.0
-    if board.has_queenside_castling_rights(chess.WHITE):
-        tensor[plane_offset + PLANE_CASTLING_WQ, :, :] = 1.0
-    if board.has_kingside_castling_rights(chess.BLACK):
-        tensor[plane_offset + PLANE_CASTLING_BK, :, :] = 1.0
-    if board.has_queenside_castling_rights(chess.BLACK):
-        tensor[plane_offset + PLANE_CASTLING_BQ, :, :] = 1.0
+    # Castling-rights planes (13–16)
+    co = plane_offset + 13
+    tensor[co,     :, :] = 1.0 if board.has_kingside_castling_rights(chess.WHITE) else 0.0
+    tensor[co + 1, :, :] = 1.0 if board.has_queenside_castling_rights(chess.WHITE) else 0.0
+    tensor[co + 2, :, :] = 1.0 if board.has_kingside_castling_rights(chess.BLACK) else 0.0
+    tensor[co + 3, :, :] = 1.0 if board.has_queenside_castling_rights(chess.BLACK) else 0.0
 
 
 def board_to_tensor(board: chess.Board,
@@ -242,7 +242,7 @@ def rank_file_to_square(rank: int, file: int) -> int:
     """Convert (rank, file) to chess square index. rank 0 = rank 1."""
     return chess.square(file, rank)
 
-
+@lru_cache(maxsize=4096)
 def move_to_policy_index(move: chess.Move, board: chess.Board) -> int:
     """Convert a chess.Move to a flat policy index (0-4671).
 
