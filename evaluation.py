@@ -32,7 +32,7 @@ def elo_update(rating_a: float, rating_b: float, score_a: float, k: float = 32) 
 
 
 # ============================================================
-# Alpha-Beta Reference Opponent (depth-2, material only)
+# Alpha-Beta Reference Opponent (depth-4, material only)
 # ============================================================
 
 PIECE_VALUES = {
@@ -111,7 +111,7 @@ def alpha_beta_search(board: chess.Board, depth: int, alpha: float, beta: float,
         return min_eval
 
 
-def alpha_beta_best_move(board: chess.Board, depth: int = 2) -> Optional[chess.Move]:
+def alpha_beta_best_move(board: chess.Board, depth: int = 4) -> Optional[chess.Move]:
     """Find the best move using alpha-beta search.
     
     Returns the best move from the current side's perspective.
@@ -148,8 +148,8 @@ def alpha_beta_best_move(board: chess.Board, depth: int = 2) -> Optional[chess.M
     return best_move if best_move else legal_moves[0]
 
 
-def play_game_alpha_beta_vs_alpha_beta(depth: int = 2, 
-                                        max_moves: int = 150) -> Tuple[str, int]:
+def play_game_alpha_beta_vs_alpha_beta(depth: int = 4, 
+                                        max_moves: int = 200) -> Tuple[str, int]:
     """Play a game between two alpha-beta agents.
     
     Returns (result_str, move_count).
