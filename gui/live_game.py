@@ -86,8 +86,13 @@ class LiveGameState:
             self._moves.append(move_uci)
             self._fens.append(board_fen)
             self._move_number = move_number
-            if mcts_stats is not None:
-                self._mcts_stats.append(mcts_stats)
+            # Always append so mcts_stats_per_move stays index-aligned with
+            # moves/fens.  Entries may be None (e.g. alpha-beta moves in
+            # reference games have no MCTS statistics).  The frontend already
+            # handles None entries gracefully (shows "No data" / no inline
+            # stat), so dropping them here is what caused stats to silently
+            # disappear for the rest of the game.
+            self._mcts_stats.append(mcts_stats)
         self._emit()
 
     def game_over(self, result: str, termination: str):
