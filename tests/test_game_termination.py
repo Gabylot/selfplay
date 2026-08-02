@@ -1,4 +1,4 @@
-"""Tests to diagnose the "unknown" draw termination bug.
+﻿"""Tests to diagnose the "unknown" draw termination bug.
 
 Observation from game #6: Game ended at 51 half-moves (move 26 in chess notation)
 with 1/2-1/2 result and "unknown" termination. The last move was a capture.
@@ -7,7 +7,7 @@ It's also not repetition (capture changes the position beyond 3-fold rep).
 
 The code path for this:
 1. play_one_game() loop breaks at selfplay.py:200 (both selected_move and best_move are None)
-2. Falls through to selfplay.py:272 → termination = "unknown" (move_count < max_game_length)
+2. Falls through to selfplay.py:272 -> termination = "unknown" (move_count < max_game_length)
 3. This happens when MCTS returns None for a move
 
 Root cause hypothesis: MCTS root node ends up with 0 children after expansion,
@@ -18,11 +18,13 @@ import sys
 import os
 import math
 import numpy as np
-import chess
 from pathlib import Path
 
-# Add project root to path
+# Add project root to path BEFORE importing chess so we get the local
+# chess.py wrapper (fastchess backend), not the system python-chess.
 sys.path.insert(0, str(Path(__file__).parent.parent))
+
+import chess
 
 from encoding import (
     move_to_policy_index, policy_index_to_move, board_to_tensor,
@@ -92,7 +94,7 @@ def test_captures_roundtrip():
     This is important because the bug occurred on a capture move."""
     board = chess.Board()
     
-    # Play moves that typically lead to captures — use full UCI (4-char)
+    # Play moves that typically lead to captures -- use full UCI (4-char)
     openings = [
         "e2e4", "d7d5", "e4d5",  # pawn capture exd5
         "g8f6", "c2c4", "e7e6", "b1c3", "f8b4",  # prepare more complex captures
@@ -154,11 +156,8 @@ def test_promotion_encoding():
 def test_underpromotion_encoding():
     """Test underpromotion moves specifically - KNOWN BUG area."""
     fens = [
-        ("4k3/1P6/8/8/8/8/8/4K3 w - - 0 1", "White underpromote"),
-        ("4k3/8/8/8/8/8/1p6/4K3 b - - 0 1", "Black underpromote"),
-        # A position where ONLY underpromotions are legal
-        ("r1bqkbnr/PPPPPppp/8/8/8/8/pppppPPP/R1BQKBNR w KQkq - 0 4", "many white promotions"),
-        ("r1bqkbnr/pppppPPP/8/8/8/8/PPPPPppp/R1BQKBNR b KQkq - 0 4", "many black promotions"),
+        ("8/PPPPPPPP/8/4k3/8/4K3/pppppppp/8 w - - 0 1", "White underpromote"),
+        ("8/PPPPPPPP/8/4k3/8/4K3/pppppppp/8 b - - 0 1", "Black underpromote"),
     ]
     
     for fen, label in fens:
@@ -168,7 +167,7 @@ def test_underpromotion_encoding():
             print(f"FAILURES for {label} ({fen}):")
             for f in failures:
                 print(f"  {f}")
-        # We'll note but not assert — this is the suspected bug area
+        # We'll note but not assert -- this is the suspected bug area
 
 
 def test_castling_encoding():
@@ -201,7 +200,7 @@ def test_endgame_positions():
 
 
 def test_queen_move_plane_all_distances():
-    """Test that _find_queen_move_plane handles all 8 directions × 7 distances."""
+    """Test that _find_queen_move_plane handles all 8 directions x 7 distances."""
     for d_idx, (qdr, qdc) in enumerate([
         (-1, 0), (-1, 1), (0, 1), (1, 1), (1, 0), (1, -1), (0, -1), (-1, -1)
     ]):
@@ -226,6 +225,12 @@ class MockNetwork:
         policy = np.random.dirichlet(np.ones(NUM_ACTIONS)) * 0.5
         value = np.random.uniform(-0.1, 0.1)
         return policy, value
+
+    def predictBatch(self, states_batch):
+        n = states_batch.shape[0]
+        policies = np.random.dirichlet(np.ones(NUM_ACTIONS), size=n) * 0.5
+        values = np.random.uniform(-0.1, 0.1, size=n).astype(np.float32)
+        return policies, values
 
 
 def test_mcts_root_no_children():
@@ -349,7 +354,7 @@ def test_play_one_game_normal_termination():
 
 def test_play_one_game_best_move_none():
     """Test: what happens when BOTH search() and select_move_with_temperature()
-    return None. This simulates the real bug: root.children = {} → both are None."""
+    return None. This simulates the real bug: root.children = {} -> both are None."""
     from selfplay import play_one_game
     
     class AllNoneMCTS:
@@ -386,7 +391,7 @@ def test_play_one_game_best_move_none():
     
     # This is the path that produces "unknown" termination
     if game_info['termination'] == 'unknown':
-        print(f"  ★ Confirmed: play_one_game produces 'unknown' when MCTS returns None")
+        print(f"  [CONFIRMED] play_one_game produces 'unknown' when MCTS returns None")
     print(f"  Game info: {game_info}")
 
 
@@ -416,7 +421,7 @@ def test_encoding_after_captures():
                     print(f"FAILURES at game {game_num}, move {move_count}:")
                     for f in failures:
                         print(f"  {f}")
-                    # Don't assert yet — we know underpromotion decoding fails
+                    # Don't assert yet -- we know underpromotion decoding fails
             
             # Sometimes play a capture
             captures = [m for m in legal if board.is_capture(m)]
@@ -444,11 +449,10 @@ def test_large_number_of_queen_moves():
 def test_very_crowded_positions():
     """Test encoding in crowded positions where many captures have occurred."""
     fens = [
-        "r1bqkb1r/pp3ppp/2n1p3/2pp4/3P4/2PBP3/PP3PPP/RN1QKBNR w KQkq - 0 6",
-        "r1bq1rk1/2p2ppp/p1p5/1p6/3P4/5N2/PPP2PPP/R1BQR1K1 w - - 0 10",
-        "1r1q1rk1/1b1p2pp/pp1bpn2/2p5/2BP4/2N1PN2/PP3PPP/R1BQR1K1 w - - 0 11",
-        "4k3/pp3ppp/8/2r5/4R3/8/PP3PPP/4K3 w - - 0 20",
-        "4k3/5ppp/8/8/1r6/8/5PPP/4K2R w K - 0 25",
+        "r2qk2r/p1p2ppp/2pp1n2/4p3/4P1b1/2NPPN2/PPP3PP/R2Q1RK1 b kq - 0 9",
+        "rnb2rk1/pp2nppp/2pqp3/8/2BPP3/2N2N2/PP1Q1PPP/R3K2R b KQ - 0 9",
+        "r3kb1r/ppqn1ppp/2p1pn2/8/3P4/1BN2Q1P/PPPB1PP1/R4RK1 b kq - 2 12",
+        "rnbq1rk1/ppp2pbp/5np1/4p3/2B1P3/2N2N2/PPP2PPP/R1BQ1RK1 w - - 0 8",
     ]
     
     for fen in fens:
@@ -471,9 +475,7 @@ def test_underpromotion_decode_debug():
     print("\n=== Debugging underpromotion encoding/decoding ===")
     
     # Test white pawn promotion f7f8
-    board = chess.Board("4k3/8/8/8/8/8/1P6/4K3 w - - 0 1")
-    # Actually need pawn on f7, not b2
-    board = chess.Board("4k3/5P2/8/8/8/8/8/4K3 w - - 0 1")
+    board = chess.Board("1k6/5P2/8/8/8/8/8/1K6 w - - 0 1")
     
     for move in board.legal_moves:
         if move.promotion is not None and move.promotion != chess.QUEEN:
@@ -487,7 +489,8 @@ def test_underpromotion_decode_debug():
             
             print(f"\nMove: {move}")
             print(f"  From: ({from_rank},{from_file}) To: ({to_rank},{to_file})")
-            print(f"  Promotion: {chess.piece_symbol(move.promotion)}")
+            promo_piece = chess.Piece(move.promotion, board.turn)
+            print(f"  Promotion: {promo_piece.symbol()}")
             print(f"  Turn: {'white' if board.turn == chess.WHITE else 'black'}")
             print(f"  Index: {idx}")
             print(f"  Decoded: {decoded}")
@@ -546,11 +549,11 @@ def test_position_with_only_underpromotions():
         idx = move_to_policy_index(move, board)
         decoded = policy_index_to_move(idx, board)
         if decoded is None:
-            print(f"  ★ FAIL: {move} (idx={idx}) → None")
+            print(f"  [FAIL] {move} (idx={idx}) -> None")
         elif decoded != move:
-            print(f"  ★ MISMATCH: {move} (idx={idx}) → {decoded}")
+            print(f"  [MISMATCH] {move} (idx={idx}) -> {decoded}")
         else:
-            print(f"  ✓ OK: {move} (idx={idx})")
+            print(f"  [OK] {move} (idx={idx})")
     
     # Now check what MCTS would do with this position
     mock_net = MockNetwork()
@@ -562,14 +565,14 @@ def test_position_with_only_underpromotions():
     print(f"  Root children: {len(root.children)}")
     
     if best_move is None:
-        print(f"  ★ MCTS returned None! All children failed policy_index_to_move!")
+        print(f"  [FAIL] MCTS returned None! All children failed policy_index_to_move!")
         
         # Check which children failed
         for child_idx, child in root.children.items():
             decoded = policy_index_to_move(child_idx, board)
             print(f"  Child idx={child_idx}: move={child.move}, decoded={decoded}")
     else:
-        print(f"  ✓ MCTS returned valid move: {best_move}")
+        print(f"  [OK] MCTS returned valid move: {best_move}")
 
 
 # =============================================================

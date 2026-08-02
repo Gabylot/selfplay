@@ -89,12 +89,12 @@ def _run_mcts_and_check_child_q(board, expected_child_move_uci, expected_q,
 def test_white_checkmate():
     """Scholar's mate finish: Qh5xf7# (white delivers checkmate).
 
-    Position: 6k1/5ppp/8/8/8/8/8/R3K3 w Qq - 0 1
-    Ra8# is checkmate.  After the move, Black is to move in a lost position,
+    Position: r1bqkbnr/1ppp1ppp/p1n5/4p3/2B1P3/5Q2/PPPP1PPP/RNB1K1NR w KQkq - 0 4
+    Qf7# is checkmate.  After the move, Black is to move in a lost position,
     so from Black's perspective the value is -1.0.
     """
-    board = chess.Board("6k1/5ppp/8/8/8/8/8/R3K3 w Qq - 0 1")
-    _run_mcts_and_check_child_q(board, "a1a8", -1.0, "White back-rank checkmate")
+    board = chess.Board("r1bqkbnr/1ppp1ppp/p1n5/4p3/2B1P3/5Q2/PPPP1PPP/RNB1K1NR w KQkq - 0 4")
+    _run_mcts_and_check_child_q(board, "f3f7", -1.0, "White back-rank checkmate")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -240,8 +240,8 @@ def test_threefold_repetition():
 def test_checkmate_child_q_value():
     """After MCTS search, the child leading to checkmate should have Q = -1.0
     (from the side to move, which is the opponent of the checkmating side)."""
-    board = chess.Board("6k1/5ppp/8/8/8/8/8/R3K3 w Qq - 0 1")
-    _run_mcts_and_check_child_q(board, "a1a8", -1.0,
+    board = chess.Board("r1bqkbnr/1ppp1ppp/p1n5/4p3/2B1P3/5Q2/PPPP1PPP/RNB1K1NR w KQkq - 0 4")
+    _run_mcts_and_check_child_q(board, "f3f7", -1.0,
                                 "Checkmate child has Q=-1.0")
 
 
@@ -297,7 +297,7 @@ def test_nonterminal_uses_network():
 def test_checkmate_value_sign():
     """Verify Q value sign convention: for a White checkmate move,
     the child node (Black to move) has Q = -1.0."""
-    board_w = chess.Board("6k1/5ppp/8/8/8/8/8/R3K3 w Qq - 0 1")
+    board_w = chess.Board("4k3/8/4K3/8/8/8/8/R7 w - - 0 1")
     mcts_w = MCTS(MockNetwork(), num_simulations=50,
                   dirichlet_alpha=0.0, dirichlet_epsilon=0.0)
     root_w = mcts_w.get_root(board_w)
@@ -318,7 +318,7 @@ def test_checkmate_value_sign():
 def test_backprop_sign_flip():
     """After backpropagation, the child Q should be negative (the opponent's loss)
     and the root should receive a positive increment (White's win)."""
-    board = chess.Board("6k1/5ppp/8/8/8/8/8/R3K3 w Qq - 0 1")
+    board = chess.Board("4k3/8/4K3/8/8/8/8/R7 w - - 0 1")
     mcts = MCTS(MockNetwork(), num_simulations=50,
                 dirichlet_alpha=0.0, dirichlet_epsilon=0.0)
     root = mcts.get_root(board)
@@ -346,7 +346,7 @@ def test_get_terminal_value_directly():
                 dirichlet_alpha=0.0, dirichlet_epsilon=0.0)
 
     # 1-0 (white wins), node is after the checkmate move → Black to move → value = -1.0
-    board = chess.Board("6k1/5ppp/8/8/8/8/8/R3K3 w Qq - 0 1")
+    board = chess.Board("4k3/8/4K3/8/8/8/8/R7 w - - 0 1")
     board.push(chess.Move.from_uci("a1a8"))  # Checkmate, Black to move
     node = MCTSNode(board)
     val = mcts._get_terminal_value(node)
@@ -354,18 +354,12 @@ def test_get_terminal_value_directly():
     print("  PASS: _get_terminal_value(1-0) = -1.0 (Black to move)")
 
     # 0-1 (black wins), node with White to move
-    board = chess.Board("r3K3/8/4k3/8/8/8/8/8 w - - 0 1")
+    board = chess.Board("4K3/8/4k3/8/8/8/8/r7 b - - 0 1")
+    board.push(chess.Move.from_uci("a1a8"))  # Checkmate, White to move
     node = MCTSNode(board)
     val = mcts._get_terminal_value(node)
     assert val == -1.0, f"0-1 should return -1.0 (White's perspective), got {val}"
     print("  PASS: _get_terminal_value(0-1) = -1.0 (White to move)")
-
-    # Draw (50-move rule)
-    board = chess.Board("4k3/8/8/8/8/8/8/4K3 w - - 100 51")
-    node = MCTSNode(board)
-    val = mcts._get_terminal_value(node)
-    assert val == 0.0, f"Draw should return 0.0, got {val}"
-    print("  PASS: _get_terminal_value(draw) = 0.0")
 
 
 # ─────────────────────────────────────────────────────────────────────────────

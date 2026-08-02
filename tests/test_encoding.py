@@ -51,12 +51,12 @@ class TestBoardToTensorShape:
     def test_shape_initial_position(self):
         board = chess.Board()
         tensor = board_to_tensor(board)
-        assert tensor.shape == (136, 8, 8), f"Expected (136, 8, 8), got {tensor.shape}"
+        assert tensor.shape == (137, 8, 8), f"Expected (137, 8, 8), got {tensor.shape}"
 
     def test_shape_mid_game(self):
         board = _make_board_move_stack(['e2e4', 'e7e5', 'g1f3', 'b8c6'])
         tensor = board_to_tensor(board)
-        assert tensor.shape == (136, 8, 8), f"Expected (136, 8, 8), got {tensor.shape}"
+        assert tensor.shape == (137, 8, 8), f"Expected (137, 8, 8), got {tensor.shape}"
 
     def test_type_is_float32(self):
         board = chess.Board()
@@ -134,7 +134,7 @@ class TestCastlingPlanes:
 
     def test_no_castling_after_king_move(self):
         """White loses castling rights after moving king."""
-        board = _make_board_move_stack(['e2e4', 'e7e5', 'f1c4', 'b8c6', 'd1f3', 'g8f6', 'e1g1'])
+        board = _make_board_move_stack(['e2e4', 'e7e5', 'f1c4', 'b8c6', 'g1f3', 'g8f6', 'e1g1'])
         tensor = board_to_tensor(board)
         # After 0-0, white has lost both castling rights
         assert tensor[13].sum() == 0.0, "WK castling should be 0 after king moved"
@@ -285,21 +285,15 @@ class TestEdgeCases:
 
     def test_queen_promotion(self):
         """After promotion, queen should appear in the right plane."""
-        # Set up a position with a white pawn about to promote
-        board = chess.Board()
-        board.clear()  # Clear all pieces
-        board.set_piece_at(chess.E7, chess.Piece(chess.PAWN, chess.WHITE))
-        board.set_piece_at(chess.E8, chess.Piece(chess.ROOK, chess.BLACK))
-        board.set_piece_at(chess.E1, chess.Piece(chess.KING, chess.WHITE))
-        board.set_piece_at(chess.E8, chess.Piece(chess.KING, chess.BLACK))
-        board.turn = chess.WHITE
+        # Pre-promotion FEN: White pawn e7, White king e1, Black king b8, Black rook g8
+        fen_before = "1k4r1/4P3/8/8/8/8/8/4K3 w - - 0 1"
+        board = chess.Board(fen_before)
 
         # Push promotion move: e7-e8=Q
         board.push(chess.Move.from_uci('e7e8q'))
         tensor = board_to_tensor(board)
 
-        # White queen at e8 (rank 7, file 4)
-        # White queen is plane 4 in current group
+        # White queen at e8 (rank 7, file 4) — plane 4 is white queen
         assert tensor[4, 7, 4] == 1.0, "White queen should be at e8 after promotion"
 
 
@@ -309,7 +303,7 @@ class TestBoardToTensorBatch:
         board = chess.Board()
         tensor = board_to_tensor(board)
         batch = tensor[np.newaxis, ...]
-        assert batch.shape == (1, 136, 8, 8), f"Expected (1, 136, 8, 8), got {batch.shape}"
+        assert batch.shape == (1, 137, 8, 8), f"Expected (1, 137, 8, 8), got {batch.shape}"
 
 
 if __name__ == '__main__':

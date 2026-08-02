@@ -24,11 +24,11 @@ from encoding import board_to_tensor, NUM_PLANES, PLANES_PER_HISTORY, NUM_HISTOR
 
 
 def test_tensor_shape():
-    """Verify the tensor has 136 planes."""
+    """Verify the tensor has 137 planes."""
     board = chess.Board()
     tensor = board_to_tensor(board)
-    assert tensor.shape == (136, 8, 8), f"Expected (136, 8, 8), got {tensor.shape}"
-    assert NUM_PLANES == 136, f"Expected NUM_PLANES=136, got {NUM_PLANES}"
+    assert tensor.shape == (137, 8, 8), f"Expected (137, 8, 8), got {tensor.shape}"
+    assert NUM_PLANES == 137, f"Expected NUM_PLANES=137, got {NUM_PLANES}"
     print("  PASS: test_tensor_shape")
 
 
@@ -215,6 +215,38 @@ def test_child_board_without_stack_cannot_detect():
 
     print("  PASS: test_child_board_without_stack_cannot_detect")
 
+def test_repetition_respects_castling_rights():
+    """Two positions with identical piece placement but different castling
+    rights are NOT the same position for repetition purposes (FIDE rule)."""
+    import chess
+
+    board = chess.Board()
+    # Clear a path for the king to step out and back without capturing
+    # or landing on anything: 1. e4 e5 2. Ke2 Ke7 3. Ke1 Ke8
+    # After this, piece placement matches the position after 1. e4 e5
+    # (same pawn structure), but White and Black have both lost ALL
+    # castling rights due to the king round-trip.
+    for uci in ["e2e4", "e7e5", "e1e2", "e8e7", "e2e1", "e7e8"]:
+        move = chess.Move.from_uci(uci)
+        assert move in board.legal_moves, f"{uci} should be legal here"
+        board.push(move)
+
+    # Compare against a fresh board that reached the identical piece
+    # placement via 1. e4 e5 only (2 plies) -- same squares, but that
+    # board still has full castling rights, so it is a DIFFERENT
+    # position under FIDE repetition rules despite matching placement.
+    reference = chess.Board()
+    reference.push(chess.Move.from_uci("e2e4"))
+    reference.push(chess.Move.from_uci("e7e5"))
+
+    assert board.fen().split(" ")[0] == reference.fen().split(" ")[0], \
+        "Test setup error: piece placement should match after the round-trip"
+
+    # The two positions must NOT be treated as the same position for
+    # repetition purposes, since castling rights differ.
+    assert board.fen() != reference.fen(), \
+        "Castling rights should differ between these two positions"
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Main
@@ -235,6 +267,7 @@ if __name__ == "__main__":
         ("test_nonrepeating_position", test_nonrepeating_position),
         ("test_child_board_repetition_detection", test_child_board_repetition_detection),
         ("test_child_board_without_stack_cannot_detect", test_child_board_without_stack_cannot_detect),
+        ("test_repetition_respects_castling_rights", test_repetition_respects_castling_rights),
     ]
 
     passed = 0

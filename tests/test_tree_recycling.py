@@ -132,10 +132,23 @@ def test_search_on_recycled_root():
     recycled = mcts.recycle_tree(root, best_move1)
 
     # Second move on recycled root
+    N_before_second_search = recycled.N
     visit_policy2, best_move2, stats2 = mcts.search(recycled)
     assert best_move2 is not None
     assert visit_policy2.sum() > 0, "visit policy should be non-empty"
-    assert stats2['num_simulations'] == 10
+
+    # Under fixed-budget recycling, search() only runs enough NEW
+    # simulations to top the root up to num_simulations total.
+    expected_new_sims = max(0, mcts.num_simulations - N_before_second_search)
+    assert stats2['num_simulations'] == expected_new_sims, (
+        f"Expected {expected_new_sims} new sims (root already had "
+        f"{N_before_second_search}/{mcts.num_simulations}), got {stats2['num_simulations']}"
+    )
+    # And the root should now be topped up to the full budget
+    assert recycled.N == mcts.num_simulations, (
+        f"root.N should reach num_simulations ({mcts.num_simulations}) after search, "
+        f"got {recycled.N}"
+    )
 
     print("  PASS: test_search_on_recycled_root")
 
