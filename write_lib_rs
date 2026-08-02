@@ -1,0 +1,406 @@
+import os
+
+content = r'''use pyo3::prelude::*;
+use pyo3::exceptions::PyValueError;
+use shakmaty::{Chess, Position, Move as ShMove, MoveList, Square, Color as ShColor, Role, CastlingMode, Outcome, EnPassantMode, fen::Fen, uci::UciMove};
+use std::collections::HashMap;
+
+pub const WHITE: bool = true;
+pub const BLACK: bool = false;
+pub const PAWN: u8 = 1;
+pub const KNIGHT: u8 = 2;
+pub const BISHOP: u8 = 3;
+pub const ROOK: u8 = 4;
+pub const QUEEN: u8 = 5;
+pub const KING: u8 = 6;
+
+fn role_to_piece_type(role: Role) -> u8 {
+    match role {
+        Role::Pawn => PAWN, Role::Knight => KNIGHT, Role::Bishop => BISHOP,
+        Role::Rook => ROOK, Role::Queen => QUEEN, Role::King => KING,
+    }
+}
+
+fn piece_type_to_role(pt: u8) -> Role {
+    match pt {
+        PAWN => Role::Pawn, KNIGHT => Role::Knight, BISHOP => Role::Bishop,
+        ROOK => Role::Rook, QUEEN => Role::Queen, KING => Role::King,
+        _ => Role::Pawn,
+    }
+}
+
+fn shcolor_to_bool(c: ShColor) -> bool { c == ShColor::White }
+fn bool_to_shcolor(b: bool) -> ShColor { if b { ShColor::White } else { ShColor::Black } }
+
+#[pyclass]
+#[derive(Clone, Debug)]
+pub struct FastMove {
+    pub from_square: u8,
+    pub to_square: u8,
+    pub promotion: Option<u8>,
+    pub shmove: ShMove,
+}
+
+impl FastMove {
+    fn from_shmove(m: ShMove) -> Self {
+        let from = m.from().map(|s| s.to_u8()).unwrap_or(0);
+        let to = match m {
+            ShMove::Castle { king, rook } => {
+                let side = if king < rook { 6u32 } else { 2u32 };
+                Square::from_coords(shakmaty::File::new(side), king.rank()).to_u8()
+            }
+            _ => m.to().to_u8(),
+        };
+        let promo = m.promotion().map(role_to_piece_type);
+        FastMove { from_square: from, to_square: to, promotion: promo, shmove: m }
+    }
+}
+
+#[pymethods]
+impl FastMove {
+    #[new]
+    #[pyo3(signature = (from_square, to_square, promotion=None))]
+    fn new(from_square: u8, to_square: u8, promotion: Option<u8>) -> PyResult<Self> {
+        let from_sq = Square::new(from_square as u32);
+        let to_sq = Square::new(to_square as u32);
+        let promo_role = promotion.map(piece_type_to_role);
+        let shmove = ShMove::Normal {
+            role: Role::Pawn, from: from_sq, capture: None, to: to_sq, promotion: promo_role,
+        };
+        Ok(FastMove { from_square, to_square, promotion, shmove })
+    }
+
+    #[getter]
+    fn from_square(&self) -> u8 { self.from_square }
+    #[getter]
+    fn to_square(&self) -> u8 { self.to_square }
+    #[getter]
+    fn promotion(&self) -> Option<u8> { self.promotion }
+
+    fn uci(&self) -> String {
+        let from_file = (self.from_square & 7) as u8;
+        let from_rank = (self.from_square >> 3) as u8;
+        let to_file = (self.to_square & 7) as u8;
+        let to_rank = (self.to_square >> 3) as u8;
+        let mut s = String::with_capacity(5);
+        s.push((b'a' + from_file) as char);
+        s.push((b'1' + from_rank) as char);
+        s.push((b'a' + to_file) as char);
+        s.push((b'1' + to_rank) as char);
+        if let Some(promo) = self.promotion {
+            s.push(match promo {
+                KNIGHT => 'n', BISHOP => 'b', ROOK => 'r', QUEEN => 'q', _ => 'q',
+            });
+        }
+        s
+    }
+
+    fn __str__(&self) -> String { self.uci() }
+    fn __repr__(&self) -> String { format!("Move.from_uci('{}')", self.uci()) }
+    fn __eq__(&self, other: &FastMove) -> bool {
+        self.from_square == other.from_square && self.to_square == other.to_square
+            && self.promotion == other.promotion
+    }
+    fn __hash__(&self) -> u64 {
+        let mut h: u64 = self.from_square as u64;
+        h = h * 64 + self.to_square as u64;
+        h = h * 7 + self.promotion.unwrap_or(0) as u64;
+        h
+    }
+}
+
+#[pyclass]
+#[derive(Clone, Debug)]
+pub struct FastPiece {
+    pub piece_type: u8,
+    pub color: bool,
+}
+
+#[pymethods]
+impl FastPiece {
+    #[getter]
+    fn piece_type(&self) -> u8 { self.piece_type }
+    #[getter]
+    fn color(&self) -> bool { self.color }
+
+    fn symbol(&self) -> String {
+        let c = match self.piece_type {
+            PAWN => 'p', KNIGHT => 'n', BISHOP => 'b', ROOK => 'r', QUEEN => 'q', KING => 'k', _ => '?',
+        };
+        if self.color { c.to_ascii_uppercase().to_string() } else { c.to_string() }
+    }
+
+    fn __str__(&self) -> String { self.symbol() }
+    fn __repr__(&self) -> String { format!("Piece.from_symbol('{}')", self.symbol()) }
+    fn __eq__(&self, other: &FastPiece) -> bool {
+        self.piece_type == other.piece_type && self.color == other.color
+    }
+}
+
+#[pyclass]
+pub struct FastBoard {
+    pos: Chess,
+    history: Vec<ShMove>,
+}
+
+impl FastBoard {
+    fn resolve_move(&self, from_sq: Square, to_sq: Square, promo: Option<Role>) -> Option<ShMove> {
+        let legal = self.pos.legal_moves();
+        for m in &legal {
+            if let ShMove::Castle { king, rook } = m {
+                let side = if king < rook { 6u32 } else { 2u32 };
+                let king_to = Square::from_coords(shakmaty::File::new(side), king.rank());
+                if king == from_sq && king_to == to_sq && promo.is_none() {
+                    return Some(*m);
+                }
+                continue;
+            }
+            let m_from = m.from();
+            let m_to = m.to();
+            let m_promo = m.promotion();
+            if m_from == Some(from_sq) && m_to == to_sq && m_promo == promo {
+                return Some(*m);
+            }
+        }
+        None
+    }
+
+    fn count_repetitions(&self) -> u32 {
+        let current_hash = self.pos.zobrist_hash::<u64>(EnPassantMode::Legal);
+        let mut count: u32 = 1;
+        let mut temp_pos = Chess::default();
+        for &m in &self.history {
+            temp_pos.play_unchecked(m);
+            if temp_pos.zobrist_hash::<u64>(EnPassantMode::Legal) == current_hash {
+                count += 1;
+            }
+        }
+        count
+    }
+}
+
+#[pymethods]
+impl FastBoard {
+    #[new]
+    #[pyo3(signature = (fen=None))]
+    fn new(fen: Option<&str>) -> PyResult<Self> {
+        let pos = if let Some(fen_str) = fen {
+            let fen: Fen = fen_str.parse()
+                .map_err(|e: String| PyValueError::new_err(format!("Invalid FEN: {}", e)))?;
+            fen.into_position(CastlingMode::Standard)
+                .map_err(|e| PyValueError::new_err(format!("Invalid position: {}", e)))?
+        } else {
+            Chess::default()
+        };
+        Ok(FastBoard { pos, history: Vec::new() })
+    }
+
+    #[pyo3(signature = (stack=true))]
+    fn copy(&self, stack: bool) -> FastBoard {
+        if stack {
+            FastBoard { pos: self.pos.clone(), history: self.history.clone() }
+        } else {
+            FastBoard { pos: self.pos.clone(), history: Vec::new() }
+        }
+    }
+
+    fn __copy__(&self) -> FastBoard { self.copy(true) }
+    fn __deepcopy__(&self, _memo: &PyAny) -> FastBoard { self.copy(true) }
+
+    fn push(&mut self, m: &FastMove) -> PyResult<()> {
+        let from_sq = Square::new(m.from_square as u32);
+        let to_sq = Square::new(m.to_square as u32);
+        let promo = m.promotion.map(piece_type_to_role);
+        let resolved = self.resolve_move(from_sq, to_sq, promo);
+        let shmove = if let Some(rm) = resolved {
+            rm
+        } else {
+            let uci_str = m.uci();
+            let uci: UciMove = uci_str.parse()
+                .map_err(|_| PyValueError::new_err(format!("Illegal move: {}", uci_str)))?;
+            uci.to_move(&self.pos)
+                .map_err(|_| PyValueError::new_err(format!("Illegal move: {}", uci_str)))?
+        };
+        self.history.push(shmove);
+        self.pos.play_unchecked(shmove);
+        Ok(())
+    }
+
+    fn pop(&mut self) -> PyResult<FastMove> {
+        let last_move = self.history.pop()
+            .ok_or_else(|| PyValueError::new_err("No moves to pop"))?;
+        let mut new_pos = Chess::default();
+        for &m in &self.history {
+            new_pos.play_unchecked(m);
+        }
+        self.pos = new_pos;
+        Ok(FastMove::from_shmove(last_move))
+    }
+
+    #[getter]
+    fn turn(&self) -> bool { shcolor_to_bool(self.pos.turn()) }
+    #[getter]
+    fn fullmove_number(&self) -> u32 { self.pos.fullmoves().get() }
+    #[getter]
+    fn halfmove_clock(&self) -> u32 { self.pos.halfmoves() }
+    #[getter]
+    fn ply(&self) -> usize { self.history.len() }
+
+    fn fen(&self) -> String {
+        Fen::from_position(&self.pos, EnPassantMode::Legal).to_string()
+    }
+
+    fn piece_at(&self, square: u8) -> Option<FastPiece> {
+        let sq = Square::new(square as u32);
+        self.pos.board().piece_at(sq).map(|p| FastPiece {
+            piece_type: role_to_piece_type(p.role),
+            color: shcolor_to_bool(p.color),
+        })
+    }
+
+    fn piece_map(&self) -> HashMap<u8, FastPiece> {
+        let mut map = HashMap::new();
+        for sq in shakmaty::Square::ALL {
+            if let Some(piece) = self.pos.board().piece_at(sq) {
+                map.insert(sq.to_u8(), FastPiece {
+                    piece_type: role_to_piece_type(piece.role),
+                    color: shcolor_to_bool(piece.color),
+                });
+            }
+        }
+        map
+    }
+
+    #[getter]
+    fn legal_moves(&self) -> Vec<FastMove> {
+        self.pos.legal_moves().iter().map(|m| FastMove::from_shmove(*m)).collect()
+    }
+
+    #[pyo3(signature = (claim_draw=false))]
+    fn is_game_over(&self, claim_draw: bool) -> bool {
+        let _ = claim_draw;
+        self.pos.is_game_over()
+    }
+
+    fn is_checkmate(&self) -> bool { self.pos.is_checkmate() }
+    fn is_stalemate(&self) -> bool { self.pos.is_stalemate() }
+    fn is_insufficient_material(&self) -> bool { self.pos.is_insufficient_material() }
+    fn is_check(&self) -> bool { self.pos.is_check() }
+    fn is_fifty_moves(&self) -> bool { self.pos.halfmoves() >= 100 }
+    fn is_seventyfive_moves(&self) -> bool { self.pos.halfmoves() >= 150 }
+    fn is_fivefold_repetition(&self) -> bool { self.count_repetitions() >= 5 }
+    fn is_repetition(&self, n: u32) -> bool { self.count_repetitions() >= n }
+    fn can_claim_threefold_repetition(&self) -> bool { self.count_repetitions() >= 3 }
+    fn can_claim_fifty_moves(&self) -> bool { self.pos.halfmoves() >= 100 }
+
+    #[pyo3(signature = (claim_draw=false))]
+    fn result(&self, claim_draw: bool) -> String {
+        let _ = claim_draw;
+        match self.pos.outcome() {
+            Outcome::Known(known) => known.as_str().to_string(),
+            Outcome::Unknown => "*".to_string(),
+        }
+    }
+
+    fn has_kingside_castling_rights(&self, color: bool) -> bool {
+        self.pos.castles().has(bool_to_shcolor(color), shakmaty::CastlingSide::KingSide)
+    }
+    fn has_queenside_castling_rights(&self, color: bool) -> bool {
+        self.pos.castles().has(bool_to_shcolor(color), shakmaty::CastlingSide::QueenSide)
+    }
+
+    #[getter]
+    fn move_stack(&self) -> Vec<String> {
+        self.history.iter().map(|m| UciMove::from_standard(*m).to_string()).collect()
+    }
+
+    fn __str__(&self) -> String {
+        let mut s = String::with_capacity(128);
+        for rank in (0..8u32).rev() {
+            for file in 0..8u32 {
+                let sq = Square::from_coords(shakmaty::File::new(file), shakmaty::Rank::new(rank));
+                if let Some(piece) = self.pos.board().piece_at(sq) {
+                    let c = match piece.role {
+                        Role::Pawn => 'p', Role::Knight => 'n', Role::Bishop => 'b',
+                        Role::Rook => 'r', Role::Queen => 'q', Role::King => 'k',
+                    };
+                    s.push(if piece.color == ShColor::White { c.to_ascii_uppercase() } else { c });
+                } else { s.push('.'); }
+                if file < 7 { s.push(' '); }
+            }
+            s.push('\n');
+        }
+        s
+    }
+
+    fn __repr__(&self) -> String { format!("FastBoard('{}')", self.fen()) }
+
+    fn is_attacked_by(&self, color: bool, square: u8) -> bool {
+        let sq = Square::new(square as u32);
+        let occupied = self.pos.board().occupied();
+        !self.pos.board().attacks_to(sq, bool_to_shcolor(color), occupied).is_empty()
+    }
+
+    fn ep_square(&self) -> Option<u8> {
+        self.pos.maybe_ep_square().map(|s| s.to_u8())
+    }
+}
+
+#[pyfunction]
+fn square_rank(square: u8) -> u8 { (square >> 3) & 7 }
+#[pyfunction]
+fn square_file(square: u8) -> u8 { square & 7 }
+#[pyfunction]
+fn square(file: u8, rank: u8) -> u8 { rank * 8 + file }
+
+#[pyfunction]
+fn parse_uci(uci: &str) -> PyResult<FastMove> {
+    if uci.len() < 4 { return Err(PyValueError::new_err("Invalid UCI: too short")); }
+    let from_sq = Square::from_ascii(uci[0..2].as_bytes())
+        .map_err(|_| PyValueError::new_err("Invalid UCI"))?;
+    let to_sq = Square::from_ascii(uci[2..4].as_bytes())
+        .map_err(|_| PyValueError::new_err("Invalid UCI"))?;
+    let promo = if uci.len() == 5 {
+        Some(match uci.as_bytes()[4] {
+            b'n' => KNIGHT, b'b' => BISHOP, b'r' => ROOK, b'q' => QUEEN,
+            _ => return Err(PyValueError::new_err("Invalid promotion")),
+        })
+    } else { None };
+    let shmove = ShMove::Normal {
+        role: Role::Pawn, from: from_sq, capture: None, to: to_sq,
+        promotion: promo.map(piece_type_to_role),
+    };
+    Ok(FastMove { from_square: from_sq.to_u8(), to_square: to_sq.to_u8(), promotion, shmove })
+}
+
+#[pyfunction]
+fn move_from_uci(uci: &str) -> PyResult<FastMove> { parse_uci(uci) }
+
+#[pymodule]
+fn fastchess(_py: Python, m: &PyModule) -> PyResult<()> {
+    m.add_class::<FastBoard>()?;
+    m.add_class::<FastMove>()?;
+    m.add_class::<FastPiece>()?;
+    m.add("WHITE", WHITE)?;
+    m.add("BLACK", BLACK)?;
+    m.add("PAWN", PAWN)?;
+    m.add("KNIGHT", KNIGHT)?;
+    m.add("BISHOP", BISHOP)?;
+    m.add("ROOK", ROOK)?;
+    m.add("QUEEN", QUEEN)?;
+    m.add("KING", KING)?;
+    let squares: Vec<u8> = (0..64).collect();
+    m.add("SQUARES", squares)?;
+    m.add_function(wrap_pyfunction!(square_rank, m)?)?;
+    m.add_function(wrap_pyfunction!(square_file, m)?)?;
+    m.add_function(wrap_pyfunction!(square, m)?)?;
+    m.add_function(wrap_pyfunction!(parse_uci, m)?)?;
+    m.add_function(wrap_pyfunction!(move_from_uci, m)?)?;
+    Ok(())
+}
+'''
+
+path = r'f:\python\selfplay\fastchess\src\lib.rs'
+with open(path, 'w', encoding='utf-8') as f:
+    f.write(content)
+print(f"Written {len(content)} bytes to {path}")
