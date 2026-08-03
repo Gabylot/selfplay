@@ -1,14 +1,13 @@
-"""Tests for the 136-plane AlphaZero board encoding.
+"""Tests for the 119-plane AlphaZero board encoding.
 
 Verifies:
-1. Correct tensor shape (136, 8, 8)
-2. Correct plane assignments for piece positions
-3. Side-to-move plane encoding
-4. Castling rights encoding
-5. History planes: positions from previous plies appear correctly
-6. History planes: positions before game start are empty
-7. Repetition detection: identical positions across history produce matching plane patterns
-8. All positions from a played game have correct history
+1. Correct tensor shape (119, 8, 8)
+2. Correct plane assignments for piece positions (P1/P2, player-oriented)
+3. Board rotation when Black is to move (180-degree flip)
+4. Player-relative castling planes
+5. Per-timestep repetition planes
+6. History planes: positions from previous plies appear correctly
+7. History planes: positions before game start are empty
 """
 
 import sys
@@ -20,7 +19,8 @@ import chess
 from encoding import (
     board_to_tensor, NUM_PLANES, PLANES_PER_HISTORY, NUM_HISTORY_STEPS,
     PIECE_PLANE, PLANE_SIDE_TO_MOVE,
-    PLANE_CASTLING_WK, PLANE_CASTLING_WQ, PLANE_CASTLING_BK, PLANE_CASTLING_BQ,
+    PLANE_CASTLING_P1_K, PLANE_CASTLING_P1_Q, PLANE_CASTLING_P2_K, PLANE_CASTLING_P2_Q,
+    PLANE_REPETITION_P1, PLANE_REPETITION_P2,
 )
 
 
@@ -37,7 +37,10 @@ def _make_board_move_stack(moves: list) -> chess.Board:
 
 
 def piece_planes(piece_type, color):
-    """Return the plane index within a 17-plane group for a given piece."""
+    """Return the plane index within a 14-plane group for a given piece.
+
+    Planes 0-5 = P1 (current player) pieces, 6-11 = P2 (opponent) pieces.
+    """
     return PIECE_PLANE[(piece_type, color)]
 
 
@@ -46,17 +49,17 @@ def piece_planes(piece_type, color):
 # ---------------------------------------------------------------------------
 
 class TestBoardToTensorShape:
-    """The tensor must have shape (136, 8, 8)."""
+    """The tensor must have shape (119, 8, 8)."""
 
     def test_shape_initial_position(self):
         board = chess.Board()
         tensor = board_to_tensor(board)
-        assert tensor.shape == (137, 8, 8), f"Expected (137, 8, 8), got {tensor.shape}"
+        assert tensor.shape == (119, 8, 8), f"Expected (119, 8, 8), got {tensor.shape}"
 
     def test_shape_mid_game(self):
         board = _make_board_move_stack(['e2e4', 'e7e5', 'g1f3', 'b8c6'])
         tensor = board_to_tensor(board)
-        assert tensor.shape == (137, 8, 8), f"Expected (137, 8, 8), got {tensor.shape}"
+        assert tensor.shape == (119, 8, 8), f"Expected (119, 8, 8), got {tensor.shape}"
 
     def test_type_is_float32(self):
         board = chess.Board()
@@ -65,28 +68,31 @@ class TestBoardToTensorShape:
 
 
 class TestPiecePlanes:
-    """Piece positions should appear in the correct planes (planes 0-5 white, 6-11 black)."""
+    """Piece positions should appear in the correct planes (planes 0-5 P1, 6-11 P2)."""
 
-    def test_white_pawn_at_e2(self):
+    def test_white_to_move_no_flip(self):
+        """White to move: no rotation, P1=White, P2=Black."""
         board = chess.Board()
         tensor = board_to_tensor(board)
-        # e2 = rank 1, file 4
-        # White pawn is plane 0 in the first 17-plane group (current position)
-        assert tensor[0, 1, 4] == 1.0, "White pawn at e2 should be in plane 0, position (1,4)"
+        # e2 = rank 1, file 4. White pawn is P1-pawn plane 0.
+        assert tensor[0, 1, 4] == 1.0, "White pawn at e2 should be in P1-pawn plane 0, position (1,4)"
+        # e7 = rank 6, file 4. Black pawn is P2-pawn plane 6.
+        assert tensor[6, 6, 4] == 1.0, "Black pawn at e7 should be in P2-pawn plane 6, position (6,4)"
+        # e1 = rank 0, file 4. White king is P1-king plane 5.
+        assert tensor[5, 0, 4] == 1.0, "White king at e1 should be in P1-king plane 5"
 
-    def test_black_pawn_at_e7(self):
-        board = chess.Board()
+    def test_black_to_move_rotated(self):
+        """Black to move: board rotated 180 degrees, P1=Black, P2=White."""
+        board = _make_board_move_stack(['e2e4'])
         tensor = board_to_tensor(board)
-        # e7 = rank 6, file 4
-        # Black pawn is plane 6 in the first 17-plane group
-        assert tensor[6, 6, 4] == 1.0, "Black pawn at e7 should be in plane 6, position (6,4)"
-
-    def test_white_king_at_e1(self):
-        board = chess.Board()
-        tensor = board_to_tensor(board)
-        # e1 = rank 0, file 4
-        # White king is plane 5
-        assert tensor[5, 0, 4] == 1.0, "White king at e1 should be in plane 5"
+        # Black to move. Black's e7 pawn (abs rank 6, file 4) rotates to
+        # (7-6, 7-4) = (1, 3), and is a P1 piece -> P1-pawn plane 0.
+        assert tensor[0, 1, 3] == 1.0, "Black e7 pawn should be at rotated (1,3) in P1-pawn plane 0"
+        # White's e4 pawn (abs rank 3, file 4) rotates to (7-3, 7-4) = (4, 3),
+        # P2 piece -> P2-pawn plane 6.
+        assert tensor[6, 4, 3] == 1.0, "White e4 pawn should be at rotated (4,3) in P2-pawn plane 6"
+        # Black king e8 (abs rank 7, file 4) rotates to (0, 3), P1-king plane 5.
+        assert tensor[5, 0, 3] == 1.0, "Black king e8 should be at rotated (0,3) in P1-king plane 5"
 
     def test_piece_positions_sum(self):
         """Total 1s in piece planes should be 32 (16 per side)."""
@@ -106,46 +112,86 @@ class TestPiecePlanes:
 
 
 class TestSideToMove:
-    """Side-to-move plane should be 1.0 for white, 0.0 for black."""
+    """Side-to-move (colour) plane should be 1.0 for white, 0.0 for black."""
 
     def test_white_to_move(self):
         board = chess.Board()
         tensor = board_to_tensor(board)
-        # White to move -> plane 12 in first group should be all 1s
-        assert tensor[12].all() == 1.0, "White to move: plane 12 should be all 1s"
+        # White to move -> colour plane 112 should be all 1s
+        assert tensor[PLANE_SIDE_TO_MOVE].all() == 1.0, "White to move: colour plane should be all 1s"
 
     def test_black_to_move(self):
         board = _make_board_move_stack(['e2e4'])
         tensor = board_to_tensor(board)
-        # Black to move -> plane 12 in first group should be all 0s
-        assert tensor[12].sum() == 0.0, "Black to move: plane 12 should be all 0s"
+        # Black to move -> colour plane 112 should be all 0s
+        assert tensor[PLANE_SIDE_TO_MOVE].sum() == 0.0, "Black to move: colour plane should be all 0s"
 
 
 class TestCastlingPlanes:
-    """Castling rights should be encoded in planes 13-16."""
+    """Castling rights should be player-relative (P1 = current player)."""
 
     def test_initial_position_all_castling(self):
         board = chess.Board()
         tensor = board_to_tensor(board)
-        assert tensor[13].all() == 1.0, "WK castling should be 1s initially"
-        assert tensor[14].all() == 1.0, "WQ castling should be 1s initially"
-        assert tensor[15].all() == 1.0, "BK castling should be 1s initially"
-        assert tensor[16].all() == 1.0, "BQ castling should be 1s initially"
+        # White to move: P1 = White, P2 = Black. All four rights available.
+        assert tensor[PLANE_CASTLING_P1_K].all() == 1.0, "P1 kingside castling should be 1s initially"
+        assert tensor[PLANE_CASTLING_P1_Q].all() == 1.0, "P1 queenside castling should be 1s initially"
+        assert tensor[PLANE_CASTLING_P2_K].all() == 1.0, "P2 kingside castling should be 1s initially"
+        assert tensor[PLANE_CASTLING_P2_Q].all() == 1.0, "P2 queenside castling should be 1s initially"
+
+    def test_black_to_move_black_rights_in_p1(self):
+        """With Black to move, Black's castling rights go into the P1 planes."""
+        # Position where Black still has castling rights and is to move.
+        board = _make_board_move_stack(['e2e4', 'e7e5', 'g1f3'])
+        tensor = board_to_tensor(board)
+        # Black to move: P1 = Black. Black still has both castling rights.
+        assert tensor[PLANE_CASTLING_P1_K].all() == 1.0, "P1 (Black) kingside should be available"
+        assert tensor[PLANE_CASTLING_P1_Q].all() == 1.0, "P1 (Black) queenside should be available"
+        # White (P2) still has both rights too.
+        assert tensor[PLANE_CASTLING_P2_K].all() == 1.0, "P2 (White) kingside should be available"
+        assert tensor[PLANE_CASTLING_P2_Q].all() == 1.0, "P2 (White) queenside should be available"
 
     def test_no_castling_after_king_move(self):
         """White loses castling rights after moving king."""
         board = _make_board_move_stack(['e2e4', 'e7e5', 'f1c4', 'b8c6', 'g1f3', 'g8f6', 'e1g1'])
         tensor = board_to_tensor(board)
-        # After 0-0, white has lost both castling rights
-        assert tensor[13].sum() == 0.0, "WK castling should be 0 after king moved"
-        assert tensor[14].sum() == 0.0, "WQ castling should be 0 after king moved"
-        # Black should still have castling rights
-        assert tensor[15].all() == 1.0, "BK castling should still be available"
-        assert tensor[16].all() == 1.0, "BQ castling should still be available"
+        # After 0-0, it's Black to move, so P1 = Black (still has rights)
+        # and P2 = White (who has lost both castling rights).
+        assert tensor[PLANE_CASTLING_P1_K].all() == 1.0, "P1 (Black) kingside should be available"
+        assert tensor[PLANE_CASTLING_P1_Q].all() == 1.0, "P1 (Black) queenside should be available"
+        assert tensor[PLANE_CASTLING_P2_K].sum() == 0.0, "P2 (White) kingside should be 0 after king moved"
+        assert tensor[PLANE_CASTLING_P2_Q].sum() == 0.0, "P2 (White) queenside should be 0 after king moved"
+
+
+class TestRepetitionPlanes:
+    """Per-timestep repetition planes (12 = >=2 occurrences, 13 = >=3)."""
+
+    def test_no_repetition(self):
+        board = chess.Board()
+        tensor = board_to_tensor(board)
+        assert tensor[PLANE_REPETITION_P1].sum() == 0.0, "No repetition: plane 12 should be 0"
+        assert tensor[PLANE_REPETITION_P2].sum() == 0.0, "No repetition: plane 13 should be 0"
+
+    def test_twofold_repetition(self):
+        # 1. Nf3 Nf6 2. Ng1 Ng8 -> back to start (2nd occurrence)
+        board = _make_board_move_stack(['g1f3', 'g8f6', 'f3g1', 'f6g8'])
+        assert board.is_repetition(2), "Should detect 2-fold repetition"
+        tensor = board_to_tensor(board)
+        assert tensor[PLANE_REPETITION_P1].all() == 1.0, "2-fold: plane 12 should be 1"
+        assert tensor[PLANE_REPETITION_P2].sum() == 0.0, "2-fold: plane 13 should be 0"
+
+    def test_threefold_repetition(self):
+        # 3 cycles of Nf3/Nf6/Ng1/Ng8 -> 3rd occurrence of start
+        board = _make_board_move_stack(
+            ['g1f3', 'g8f6', 'f3g1', 'f6g8', 'g1f3', 'g8f6', 'f3g1', 'f6g8'])
+        assert board.is_repetition(3), "Should detect 3-fold repetition"
+        tensor = board_to_tensor(board)
+        assert tensor[PLANE_REPETITION_P1].all() == 1.0, "3-fold: plane 12 should be 1"
+        assert tensor[PLANE_REPETITION_P2].all() == 1.0, "3-fold: plane 13 should be 1"
 
 
 class TestHistoryPlanes:
-    """The previous 7 positions should be encoded in planes 17-135."""
+    """The previous 7 positions should be encoded in planes 14-111."""
 
     def test_history_has_correct_positions(self):
         """After 4 plies, the history should show the correct positions."""
@@ -153,30 +199,32 @@ class TestHistoryPlanes:
         board = _make_board_move_stack(moves)
         tensor = board_to_tensor(board)
 
-        # After 4 plies (even number), it's white's turn again
-        # Current position (plane group 0, planes 0-16):
-        assert tensor[12].sum() == 64.0, "Position after 4 plies: white to move"
+        # After 4 plies (even number), it's white's turn again.
+        # Current position (group 0, planes 0-13): white to move, no flip.
+        # White knight at f3 (rank 2, file 5) -> P1-knight plane 1.
+        assert tensor[1, 2, 5] == 1.0, "White knight should be at f3 in current position"
 
-        # Position 1 ply ago (plane group 1, planes 17-33):
-        # After g1f3, before b8c6 -> black to move (odd plies = black)
-        assert tensor[17 + 12].sum() == 0.0, "1 ply ago: black should be to move"
+        # Position 1 ply ago (group 1, planes 14-27): black to move -> rotated.
+        # After g1f3, before b8c6. Black knight b8 (abs rank 7, file 1) rotates
+        # to (0, 6), P1-knight plane 1.
+        assert tensor[14 + 1, 0, 6] == 1.0, "Black knight should be at rotated (0,6) 1 ply ago"
 
-        # Position 2 plies ago (plane group 2, planes 34-50):
-        # After e7e5, before g1f3 -> white to move (even plies = white)
-        assert tensor[34 + 12].sum() == 64.0, "2 plies ago: white should be to move"
+        # Position 2 plies ago (group 2, planes 28-41): white to move -> no flip.
+        # After e7e5, before g1f3. White knight g1 (rank 0, file 6) -> P1-knight plane 1.
+        assert tensor[28 + 1, 0, 6] == 1.0, "White knight should be at g1 2 plies ago"
 
-        # Position 3 plies ago (plane group 3, planes 51-67):
-        # After e2e4, before e7e5 -> black to move (odd plies = black)
-        assert tensor[51 + 12].sum() == 0.0, "3 plies ago: black should be to move"
+        # Position 3 plies ago (group 3, planes 42-55): black to move -> rotated.
+        # After e2e4, before e7e5. Black knight b8 (abs rank 7, file 1) rotates
+        # to (0, 6), P1-knight plane 1.
+        assert tensor[42 + 1, 0, 6] == 1.0, "Black knight should be at rotated (0,6) 3 plies ago"
 
-        # Position 4 plies ago (plane group 4, planes 68-84):
-        # Before e2e4 -> initial position, white to move
-        assert tensor[68 + 12].sum() == 64.0, "4 plies ago: initial position, white to move"
+        # Position 4 plies ago (group 4, planes 56-69): initial position, white to move.
+        # White knight g1 (rank 0, file 6) -> P1-knight plane 1.
+        assert tensor[56 + 1, 0, 6] == 1.0, "White knight should be at g1 4 plies ago"
 
-        # Positions 5-7 (plane groups 5-7, planes 85-135):
-        # Before game start -> empty board
+        # Positions 5-7 (groups 5-7, planes 70-111): before game start -> empty.
         for i in range(5, 8):
-            offset = i * 17
+            offset = i * PLANES_PER_HISTORY
             assert tensor[offset:offset+12].sum() == 0.0, \
                 f"Position {i} plies ago (before game): should be empty board"
 
@@ -186,50 +234,51 @@ class TestHistoryPlanes:
         board = _make_board_move_stack(moves)
         tensor = board_to_tensor(board)
 
-        # Current: white knight at f3 (rank 2, file 5). Knight plane = 1 (within group)
-        # White knight plane in group 0 (current): plane 1
-        assert tensor[1, 2, 5] == 1.0, "White knight should be at f3 in current position"
+        # Current: black to move, rotated. White knight at f3 (abs rank 2, file 5)
+        # rotates to (7-2, 7-5) = (5, 2). White is P2 -> P2-knight plane 7.
+        assert tensor[7, 5, 2] == 1.0, "White knight should be at rotated (5,2) in P2-knight plane 7"
 
-        # 1 ply ago: knight at g1 (rank 0, file 6). Group 1 offset = 17.
-        assert tensor[17 + 1, 0, 6] == 1.0, "White knight should be at g1 1 ply ago"
+        # 1 ply ago: white to move, no flip. Knight at g1 (rank 0, file 6).
+        # P1-knight plane 1.
+        assert tensor[14 + 1, 0, 6] == 1.0, "White knight should be at g1 1 ply ago"
 
-        # 2 plies ago: knight at g1 as well (initial). Group 2 offset = 34.
-        assert tensor[34 + 1, 0, 6] == 1.0, "White knight should be at g1 2 plies ago"
+        # 2 plies ago: black to move, rotated. Knight at g1 (abs rank 0, file 6)
+        # rotates to (7, 1). White is P2 -> P2-knight plane 7.
+        assert tensor[28 + 7, 7, 1] == 1.0, "White knight should be at rotated (7,1) 2 plies ago"
 
     def test_history_repetition_detection(self):
         """When a position repeats, the history planes should show identical patterns."""
         # Create a simple 3-fold repetition: 1.e4 e5 2.Nf3 Nc6 3.Ng1 Nb8 4.Nf3 Nc6
-        # After move 8 (ply 8), the position matches move 4 (ply 4):
-        #   Ply 8: r1bqkbnr/pppp1ppp/2n5/4p3/4P3/5N2/PPPP1PPP/RNBQKB1R w
-        #   Ply 4: r1bqkbnr/pppp1ppp/2n5/4p3/4P3/5N2/PPPP1PPP/RNBQKB1R w
         moves = ['e2e4', 'e7e5', 'g1f3', 'b8c6', 'f3g1', 'c6b8', 'g1f3', 'b8c6']
         board = _make_board_move_stack(moves)
         tensor = board_to_tensor(board)
 
         # Current position (group 0) should match position 4 plies ago (group 4)
-        # Both have e4, e5, Nf3, Nc6 on the board
-        current_group = tensor[0:17]
-        four_plies_ago_group = tensor[4 * 17: 4 * 17 + 17]
+        # Both have e4, e5, Nf3, Nc6 on the board, same side to move.
+        # Compare only the 12 piece planes -- the repetition planes differ
+        # (current is the 2nd occurrence, 4 plies ago is the 1st).
+        current_group = tensor[0:12]
+        four_plies_ago_group = tensor[4 * PLANES_PER_HISTORY: 4 * PLANES_PER_HISTORY + 12]
 
         assert np.array_equal(current_group, four_plies_ago_group), \
             "Current position should match position 4 plies ago (repetition)"
 
     def test_each_plane_group_has_32_pieces(self):
-        """Each 17-plane group representing a valid position should have 32 pieces."""
+        """Each 14-plane group representing a valid position should have 32 pieces."""
         moves = ['e2e4', 'd7d5', 'g1f3', 'g8f6']
         board = _make_board_move_stack(moves)
         tensor = board_to_tensor(board)
 
         # Group 0 (current) through group 4 (before first move): all have 32 pieces
         for i in range(5):
-            offset = i * 17
+            offset = i * PLANES_PER_HISTORY
             piece_sum = tensor[offset:offset+12].sum()
             assert piece_sum == 32.0, \
                 f"Group {i} ({i} plies ago) should have 32 pieces, got {piece_sum}"
 
         # Groups 5-7: before game start -> empty board (0 pieces)
         for i in range(5, 8):
-            offset = i * 17
+            offset = i * PLANES_PER_HISTORY
             piece_sum = tensor[offset:offset+12].sum()
             assert piece_sum == 0.0, \
                 f"Group {i} (before game) should have 0 pieces, got {piece_sum}"
@@ -247,11 +296,11 @@ class TestEdgeCases:
         # Groups 2-7: before game start -> empty
 
         # Initial position (group 1): has pieces
-        assert tensor[17:29].sum() > 0, "Initial position should have pieces"
+        assert tensor[PLANES_PER_HISTORY:PLANES_PER_HISTORY+12].sum() > 0, "Initial position should have pieces"
 
         # Before game start (groups 2-7): empty
         for i in range(2, 8):
-            offset = i * 17
+            offset = i * PLANES_PER_HISTORY
             assert tensor[offset:offset+12].sum() == 0.0, \
                 f"Group {i} should be empty (before game start)"
 
@@ -260,13 +309,13 @@ class TestEdgeCases:
         board = _make_board_move_stack(['a2a4', 'a7a5', 'h2h4', 'h7h5', 'a1a3', 'a8a6', 'a3b3'])
         tensor = board_to_tensor(board)
 
-        # White lost queenside castling (a-rook moved) but keeps kingside (h-rook untouched)
-        assert tensor[13].all() == 1.0, "WK should remain after a-rook moves"
-        assert tensor[14].sum() == 0.0, "WQ should be lost after a-rook moves"
+        # White to move: P1 = White. White lost queenside (a-rook moved) but keeps kingside.
+        assert tensor[PLANE_CASTLING_P1_K].all() == 1.0, "P1 kingside should remain after a-rook moves"
+        assert tensor[PLANE_CASTLING_P1_Q].sum() == 0.0, "P1 queenside should be lost after a-rook moves"
 
-        # Black lost queenside castling (a-rook moved) but keeps kingside (h-rook untouched)
-        assert tensor[15].all() == 1.0, "BK should remain"
-        assert tensor[16].sum() == 0.0, "BQ should be lost after a-rook moves"
+        # Black (P2) lost queenside but keeps kingside.
+        assert tensor[PLANE_CASTLING_P2_K].all() == 1.0, "P2 kingside should remain"
+        assert tensor[PLANE_CASTLING_P2_Q].sum() == 0.0, "P2 queenside should be lost after a-rook moves"
 
     def test_captured_pieces_disappear(self):
         """A captured piece should not appear in the current position."""
@@ -275,13 +324,13 @@ class TestEdgeCases:
         board = _make_board_move_stack(moves)
         tensor = board_to_tensor(board)
 
-        # Black pawn at d5 should be gone (captured)
-        # d5 = rank 4, file 3. Black pawn plane = 6 (within current group)
-        assert tensor[6, 4, 3] == 0.0, "Black pawn at d5 should have been captured"
+        # After 3 plies it's Black to move, so the board is rotated.
+        # White pawn at d5 (abs rank 4, file 3) rotates to (7-4, 7-3) = (3, 4).
+        # White is P2 -> P2-pawn plane 6.
+        assert tensor[6, 3, 4] == 1.0, "White pawn should be at rotated (3,4) in P2-pawn plane 6"
 
-        # White pawn at d5 should exist (white pawn plane 0)
-        # d5 = rank 4, file 3
-        assert tensor[0, 4, 3] == 1.0, "White pawn should be at d5"
+        # Black pawn at d5 should be gone (captured). P1-pawn plane 0 at (3,4).
+        assert tensor[0, 3, 4] == 0.0, "Black pawn at d5 should have been captured"
 
     def test_queen_promotion(self):
         """After promotion, queen should appear in the right plane."""
@@ -293,8 +342,10 @@ class TestEdgeCases:
         board.push(chess.Move.from_uci('e7e8q'))
         tensor = board_to_tensor(board)
 
-        # White queen at e8 (rank 7, file 4) — plane 4 is white queen
-        assert tensor[4, 7, 4] == 1.0, "White queen should be at e8 after promotion"
+        # After promotion it's Black to move, so the board is rotated.
+        # White queen at e8 (abs rank 7, file 4) rotates to (0, 3).
+        # White is P2 -> P2-queen plane 10.
+        assert tensor[10, 0, 3] == 1.0, "White queen should be at rotated (0,3) in P2-queen plane 10"
 
 
 class TestBoardToTensorBatch:
@@ -303,7 +354,7 @@ class TestBoardToTensorBatch:
         board = chess.Board()
         tensor = board_to_tensor(board)
         batch = tensor[np.newaxis, ...]
-        assert batch.shape == (1, 137, 8, 8), f"Expected (1, 137, 8, 8), got {batch.shape}"
+        assert batch.shape == (1, 119, 8, 8), f"Expected (1, 119, 8, 8), got {batch.shape}"
 
 
 if __name__ == '__main__':

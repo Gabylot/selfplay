@@ -220,9 +220,9 @@ class TestAggregationQueueMode:
         nets = {0: net_a, 1: MockNetwork(1)}
 
         # Single request (ndim==3) from worker 0
-        states = make_states(1, 0.5)  # (1, 137, 8, 8) but ndim will be 4
-        # Actually for single request, send (137, 8, 8) -- ndim==3
-        single_state = states[0]  # (137, 8, 8)
+        states = make_states(1, 0.5)  # (1, NUM_PLANES, 8, 8) but ndim will be 4
+        # Actually for single request, send (NUM_PLANES, 8, 8) -- ndim==3
+        single_state = states[0]  # (NUM_PLANES, 8, 8)
         req = (0, 42, 0, single_state)
         # Queue is empty -- no other requests
 
@@ -255,7 +255,7 @@ class TestAggregationQueueMode:
         request_queue.put((1, 201, 0, batch_states))
 
         # Worker 0: single request, fill=0.1
-        single_state = make_states(1, 0.1)[0]  # (137, 8, 8)
+        single_state = make_states(1, 0.1)[0]  # (NUM_PLANES, 8, 8)
         first_req = (0, 200, 0, single_state)
 
         server._handle_request(first_req, nets, device, net_a)

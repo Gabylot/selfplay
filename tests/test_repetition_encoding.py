@@ -1,12 +1,12 @@
-"""Tests for repetition detection in the 136-plane AlphaZero board encoding.
+"""Tests for repetition detection in the 119-plane AlphaZero board encoding.
 
-With the 136-plane encoding (8 history positions × 17 planes each), repetition
-is detected by comparing the current position's 17-plane group with previous
+With the 119-plane encoding (8 history positions × 14 planes each), repetition
+is detected by comparing the current position's 14-plane group with previous
 groups. If the current position matches a position from 2 or 4 plies ago, the
 network can learn that this is a repetition.
 
 Key tests:
-1. Tensor shape is (136, 8, 8)
+1. Tensor shape is (119, 8, 8)
 2. A position repeated once has its current group matching a history group
 3. A position repeated twice has its current group matching two history groups
 4. Non-repeating positions have no matching history groups
@@ -24,11 +24,11 @@ from encoding import board_to_tensor, NUM_PLANES, PLANES_PER_HISTORY, NUM_HISTOR
 
 
 def test_tensor_shape():
-    """Verify the tensor has 137 planes."""
+    """Verify the tensor has 119 planes."""
     board = chess.Board()
     tensor = board_to_tensor(board)
-    assert tensor.shape == (137, 8, 8), f"Expected (137, 8, 8), got {tensor.shape}"
-    assert NUM_PLANES == 137, f"Expected NUM_PLANES=137, got {NUM_PLANES}"
+    assert tensor.shape == (119, 8, 8), f"Expected (119, 8, 8), got {tensor.shape}"
+    assert NUM_PLANES == 119, f"Expected NUM_PLANES=119, got {NUM_PLANES}"
     print("  PASS: test_tensor_shape")
 
 
@@ -37,13 +37,13 @@ def test_fresh_position_no_repetition():
     board = chess.Board()
     tensor = board_to_tensor(board)
 
-    # Get the current position's 17-plane group
-    current_group = tensor[0:17]
+    # Get the current position's 14-plane group
+    current_group = tensor[0:PLANES_PER_HISTORY]
 
     # Check groups 1-7 (previous positions): none should match
     for i in range(1, 8):
-        offset = i * 17
-        hist_group = tensor[offset:offset + 17]
+        offset = i * PLANES_PER_HISTORY
+        hist_group = tensor[offset:offset + PLANES_PER_HISTORY]
         assert not np.array_equal(current_group, hist_group), \
             f"Group {i} should not match current group on fresh board"
 
@@ -52,7 +52,7 @@ def test_fresh_position_no_repetition():
 
 def test_position_seen_twice():
     """After returning to the starting position once, the current group should
-    match a previous group (2 plies ago)."""
+    match a previous group (4 plies ago)."""
     board = chess.Board()
 
     # Play moves that return to the starting position:
@@ -74,8 +74,10 @@ def test_position_seen_twice():
     # Group 3 = ply 1 = after Nf3
     # Group 4 = ply 0 = original start position
     # So group 0 and group 4 should match.
-    current_group = tensor[0:17]
-    group_4 = tensor[4 * 17: 4 * 17 + 17]
+    # Compare only the 12 piece planes -- the repetition planes differ
+    # (current is the 2nd occurrence, 4 plies ago is the 1st).
+    current_group = tensor[0:12]
+    group_4 = tensor[4 * PLANES_PER_HISTORY: 4 * PLANES_PER_HISTORY + 12]
     assert np.array_equal(current_group, group_4), \
         "Current position should match position 4 plies ago (repetition)"
 
@@ -103,12 +105,15 @@ def test_position_three_times():
 
     tensor = board_to_tensor(board)
 
-    current_group = tensor[0:17]
+    current_group = tensor[0:PLANES_PER_HISTORY]
 
     # After 8 plies, we're at start position again.
     # Group 4 (4 plies ago) should also be the start position.
     # Group 0 and group 4 should match.
-    group_4 = tensor[4 * 17: 4 * 17 + 17]
+    # Compare only the 12 piece planes -- the repetition planes differ
+    # (current is the 3rd occurrence, 4 plies ago is the 2nd).
+    current_group = tensor[0:12]
+    group_4 = tensor[4 * PLANES_PER_HISTORY: 4 * PLANES_PER_HISTORY + 12]
     assert np.array_equal(current_group, group_4), \
         "Current position should match position 4 plies ago (3rd repetition)"
 
@@ -127,13 +132,13 @@ def test_nonrepeating_position():
         board.push(chess.Move.from_uci(uci))
 
     tensor = board_to_tensor(board)
-    current_group = tensor[0:17]
+    current_group = tensor[0:PLANES_PER_HISTORY]
 
     # No history group should match the current position
     matches = 0
     for i in range(1, 8):
-        offset = i * 17
-        hist_group = tensor[offset:offset + 17]
+        offset = i * PLANES_PER_HISTORY
+        hist_group = tensor[offset:offset + PLANES_PER_HISTORY]
         if np.array_equal(current_group, hist_group):
             matches += 1
 
@@ -175,8 +180,8 @@ def test_child_board_repetition_detection():
 
     # The tensor from the child board should also show the repetition
     child_tensor = board_to_tensor(child_board)
-    current_group = child_tensor[0:17]
-    group_4 = child_tensor[4 * 17: 4 * 17 + 17]
+    current_group = child_tensor[0:12]
+    group_4 = child_tensor[4 * PLANES_PER_HISTORY: 4 * PLANES_PER_HISTORY + 12]
     assert np.array_equal(current_group, group_4), \
         "Child board tensor should show repetition in history planes"
 
@@ -256,7 +261,7 @@ if __name__ == "__main__":
     import traceback
 
     print("=" * 60)
-    print("  Repetition Detection Tests (136-plane encoding)")
+    print("  Repetition Detection Tests (119-plane encoding)")
     print("=" * 60 + "\n")
 
     tests = [
