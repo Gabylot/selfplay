@@ -1,35 +1,68 @@
 """Board state and move encoding for the AlphaZero chess engine.
 
-Board Representation (136 planes = 8 history positions × 17 planes each):
-    For each of the last 8 positions (current = t, t-1, ..., t-7):
-        Planes 0-5:   White P, N, B, R, Q, K
-        Planes 6-11:  Black P, N, B, R, Q, K
-        Plane 12:     Side to move (1.0 if white to move)
-        Plane 13:     Castling rights (WK)
-        Plane 14:     Castling rights (WQ)
-        Plane 15:     Castling rights (BK)
-        Plane 16:     Castling rights (BQ)
+Board Representation — matches the AlphaZero paper's M*T + L structure
+(Silver et al. 2018, Table S1, Chess column):
 
-    Total: 8 × 17 + 1 = 137 planes.
+    N x N x (M*T + L), where:
+      M = 14   per-timestep planes:
+                 - 6 planes:  player's (P1) pieces, one per piece type
+                 - 6 planes:  opponent's (P2) pieces, one per piece type
+                 - 2 planes:  repetition count for that position
+                              (plane 12: occurred >= 2 times;
+                               plane 13: occurred >= 3 times)
+      T = 8    history steps (t, t-1, ..., t-7), zero-filled before game start
+      L = 7    constant-valued planes, added ONCE (not repeated per timestep):
+                 - player's colour (side to move)                    (1 plane)
+                 - P1 castling rights: kingside, queenside           (2 planes)
+                 - P2 castling rights: kingside, queenside           (2 planes)
+                 - no-progress count (halfmove clock)                (1 plane)
+                 - total move count                                  (1 plane)
 
-    This follows the AlphaZero approach: the network sees the actual board
-    states of recent history, allowing it to detect threefold-repetition
-    by comparing piece configurations across time steps.
+    Total planes = 14*8 + 7 = 119.
+
+    The board is oriented to the perspective of the CURRENT player (P1):
+      - When White is to move, the board is in the absolute frame
+        (row 0 = rank 8, col 0 = file a).
+      - When Black is to move, the board is rotated 180 degrees
+        (row 0 = rank 1, col 0 = file h), so the current player's home
+        rank is always at row 0 and P1's pawns always advance toward
+        increasing row.
+      - Piece planes represent "player's pieces" (P1) vs "opponent's
+        pieces" (P2) rather than white/black.
+      - Castling planes are player-relative (P1 = current player's
+        rights, P2 = opponent's rights).
+      - The colour plane holds P1's absolute colour (1.0 if White is to
+        move, else 0.0) — this is the paper's "player's colour".
+
+    NOTE: the policy / action output is NOT player-relative.  Per the
+    AlphaZero chess paper, the 8x8x73 policy uses ABSOLUTE compass
+    directions (N = toward rank 8 for both players).  The network maps a
+    player-oriented input to absolute-direction move outputs.  This is
+    the opposite of Shogi, where the action space is also player-relative.
+
+    NOTE: this is a BREAKING change to the input representation.  Any
+    existing checkpoints and replay-buffer data were trained on the old
+    104-plane absolute white/black encoding and are INCOMPATIBLE — they
+    must be discarded (start a fresh run with checkpoints/ and
+    replay_buffer.npz removed or backed up).
+
+    Note on repetition planes: computed per-timestep by walking
+    board.is_repetition(n) upward (n=2,3) and setting the corresponding
+    binary plane.  This matches the paper's two per-timestep repetition
+    planes (>=2 and >=3 occurrences).
+
+    Note on no-progress-count plane: board.halfmove_clock, normalized by
+    NO_PROGRESS_NORM (100 half-moves = the 50-move-rule threshold).
+
+    Note on the move-count plane: normalized by MOVE_COUNT_NORM.
 
     Note: En passant is NOT encoded as a separate plane — it is implicitly
     determined by the board state (the en-passant square is a property of
     the position, and the network can infer it from the piece positions
-    and the last move in the history).
+    and the last move in the history).  The paper's Table S1 doesn't list
+    it either.
 
-    Note on the move-count plane: the fullmove number is a cheap, monotonic
-    signal for game phase/progress that the history planes don't otherwise
-    expose (a repeated position looks identical regardless of how deep into
-    the game it occurs). It's stored as a single full-board plane (constant
-    value across all 64 squares, like side-to-move), normalized by dividing
-    by ``MOVE_COUNT_NORM`` so it stays in a small, bounded-ish range instead
-    of growing unboundedly over very long games.
-
-Move Encoding (8x8x73 = 4672 action space):
+Move Encoding (8x8x73 = 4672 action space) — unchanged, matches Table S2:
     Planes 0-55:  Queen-like moves (8 directions × 7 distances)
     Planes 56-63: Knight moves (8 offsets)
     Planes 64-72: Underpromotions (3 pieces × 3 horizontal offsets)
@@ -41,7 +74,8 @@ from wrapt import lru_cache
 import chess
 from typing import Optional
 
-# Piece type to plane index mapping (within a single 17-plane group)
+# Piece type to plane index mapping (within a single 14-plane history group)
+# Planes 0-5 = P1 (current player) pieces, 6-11 = P2 (opponent) pieces.
 PIECE_PLANE = {
     (chess.PAWN, chess.WHITE): 0,
     (chess.KNIGHT, chess.WHITE): 1,
@@ -57,41 +91,49 @@ PIECE_PLANE = {
     (chess.KING, chess.BLACK): 11,
 }
 
-# Planes within each 17-plane group:
-#   0-5:   White pieces
-#   6-11:  Black pieces
-#   12:    Side to move
-#   13-16: Castling rights (WK, WQ, BK, BQ)
-
-PLANE_SIDE_TO_MOVE = 12
-PLANE_CASTLING_WK = 13
-PLANE_CASTLING_WQ = 14
-PLANE_CASTLING_BK = 15
-PLANE_CASTLING_BQ = 16
-
-PLANES_PER_HISTORY = 17
+# ── Per-timestep planes: M = 14 (6 P1 pieces + 6 P2 pieces + 2 repetition) ──
+PLANES_PER_HISTORY = 14
 NUM_HISTORY_STEPS = 8
-NUM_HISTORY_PLANES = PLANES_PER_HISTORY * NUM_HISTORY_STEPS  # 136
+NUM_HISTORY_PLANES = PLANES_PER_HISTORY * NUM_HISTORY_STEPS  # 112
 
-# Move-count plane: one extra global plane appended after all history
-# planes, holding the (normalized) fullmove number broadcast across the
-# whole 8x8 board — the same broadcasting pattern used for side-to-move
-# and castling-rights planes.
-PLANE_MOVE_COUNT = NUM_HISTORY_PLANES  # index 136
-NUM_EXTRA_PLANES = 1
-NUM_PLANES = NUM_HISTORY_PLANES + NUM_EXTRA_PLANES  # 137
+# Within a history group:
+#   planes 0-5   = P1 pieces (PAWN..KING)
+#   planes 6-11  = P2 pieces (PAWN..KING)
+#   plane 12     = P1 repetition (position occurred >= 2 times)
+#   plane 13     = P2 repetition (position occurred >= 3 times)
+PLANE_REPETITION_P1 = 12
+PLANE_REPETITION_P2 = 13
 
-# Normalization divisor for the move-count plane. Typical games run well
-# under 100 full moves; dividing by this keeps the plane in a small,
-# roughly [0, ~1.5] range for games up to ~150 full moves (300 half-moves,
-# matching the default max_game_length in half-moves) without hard-clipping
-# longer games.
+# ── L = 7 constant-valued planes, appended ONCE after all history planes ──
+PLANE_SIDE_TO_MOVE = NUM_HISTORY_PLANES        # 112  (P1's absolute colour)
+PLANE_CASTLING_P1_K = NUM_HISTORY_PLANES + 1   # 113
+PLANE_CASTLING_P1_Q = NUM_HISTORY_PLANES + 2   # 114
+PLANE_CASTLING_P2_K = NUM_HISTORY_PLANES + 3   # 115
+PLANE_CASTLING_P2_Q = NUM_HISTORY_PLANES + 4   # 116
+PLANE_NO_PROGRESS_COUNT = NUM_HISTORY_PLANES + 5  # 117
+PLANE_MOVE_COUNT = NUM_HISTORY_PLANES + 6      # 118
+
+# Backward-compat aliases (P1 = current player, P2 = opponent).
+PLANE_CASTLING_WK = PLANE_CASTLING_P1_K
+PLANE_CASTLING_WQ = PLANE_CASTLING_P1_Q
+PLANE_CASTLING_BK = PLANE_CASTLING_P2_K
+PLANE_CASTLING_BQ = PLANE_CASTLING_P2_Q
+
+NUM_EXTRA_PLANES = 7
+NUM_PLANES = NUM_HISTORY_PLANES + NUM_EXTRA_PLANES  # 119
+
+# Normalization divisors for the constant-valued planes.
 MOVE_COUNT_NORM = 100.0
+# No-progress = halfmove clock; 100 half-moves triggers the 50-move rule.
+NO_PROGRESS_NORM = 100.0
 
 NUM_ACTIONS = 8 * 8 * 73  # 4672
 
 # Queen move directions: (dr, dc)
 # row 0 = rank 8 (top), col 0 = file a (left)
+# NOTE: these are ABSOLUTE directions (N = toward rank 8), used for the
+# policy output.  The input board is player-oriented, but the action
+# space is absolute per the AlphaZero chess paper.
 QUEEN_DIRECTIONS = [
     (-1, 0),   # 0: N  (toward rank 8)
     (-1, +1),  # 1: NE
@@ -138,66 +180,99 @@ def _underpromotion_plane(piece_type, dir_idx):
     return 64 + piece_idx * 3 + dir_idx
 
 
+def _rotate_square(sq: int) -> int:
+    """Rotate a square 180 degrees (player-oriented frame).
+
+    ``(rank, file) -> (7 - rank, 7 - file)``.  Used when Black is to move
+    so the current player's home rank is always at array row 0.
+    """
+    return 63 - sq
+
+
 def _encode_single_position(board, plane_offset, tensor):
-    """Encode a single board position into ``tensor`` at ``plane_offset``.
+    """Encode a single board position's PIECE + REPETITION planes into
+    ``tensor`` at ``plane_offset``.  Side-to-move / castling are written
+    once as global L-planes by ``board_to_tensor``.
+
+    The position is oriented to the perspective of the current player
+    (``board.turn``): when Black is to move the board is rotated 180
+    degrees, and piece planes represent P1 (current player) vs P2
+    (opponent) rather than white/black.
 
     Uses the Rust ``FastBoard.piece_map()`` to iterate only over occupied
     squares, and extracts ``piece_type`` / ``color`` from the raw
     ``FastPiece`` objects – no Python ``Piece`` creation.
     """
+    p1_color = board.turn
+    rotate = (p1_color == chess.BLACK)
+
     pm = board._b.piece_map()  # dict[int, FastPiece]  (square → raw piece)
 
     for sq, p in pm.items():
         pt = p.piece_type        # 1..6 (PAWN..KING)
         color = p.color          # True = WHITE, False = BLACK
+        if rotate:
+            sq = _rotate_square(sq)
         row = sq >> 3
         col = sq & 7
-        if color == chess.WHITE:
+        if color == p1_color:
             tensor[plane_offset + pt - 1, row, col] = 1.0
         else:
             tensor[plane_offset + 6 + pt - 1, row, col] = 1.0
 
-    # Side-to-move plane (plane 12 of the history block)
-    if board.turn == chess.WHITE:
-        tensor[plane_offset + 12, :, :] = 1.0
-    else:
-        tensor[plane_offset + 12, :, :] = 0.0
+    # Repetition planes (per-timestep, from this position's own history).
+    if board.is_repetition(2):
+        tensor[plane_offset + PLANE_REPETITION_P1, :, :] = 1.0
+    if board.is_repetition(3):
+        tensor[plane_offset + PLANE_REPETITION_P2, :, :] = 1.0
 
-    # Castling-rights planes (13–16)
-    co = plane_offset + 13
-    tensor[co,     :, :] = 1.0 if board.has_kingside_castling_rights(chess.WHITE) else 0.0
-    tensor[co + 1, :, :] = 1.0 if board.has_queenside_castling_rights(chess.WHITE) else 0.0
-    tensor[co + 2, :, :] = 1.0 if board.has_kingside_castling_rights(chess.BLACK) else 0.0
-    tensor[co + 3, :, :] = 1.0 if board.has_queenside_castling_rights(chess.BLACK) else 0.0
+
+def _encode_global_planes(board: chess.Board, tensor: np.ndarray):
+    """Write the L=7 constant-valued planes (once, not per-timestep)."""
+    # Player's colour (P1's absolute colour): 1.0 if White to move.
+    tensor[PLANE_SIDE_TO_MOVE, :, :] = 1.0 if board.turn == chess.WHITE else 0.0
+
+    # Castling rights, player-relative: P1 = current player, P2 = opponent.
+    p1 = board.turn
+    p2 = not board.turn
+    tensor[PLANE_CASTLING_P1_K, :, :] = 1.0 if board.has_kingside_castling_rights(p1) else 0.0
+    tensor[PLANE_CASTLING_P1_Q, :, :] = 1.0 if board.has_queenside_castling_rights(p1) else 0.0
+    tensor[PLANE_CASTLING_P2_K, :, :] = 1.0 if board.has_kingside_castling_rights(p2) else 0.0
+    tensor[PLANE_CASTLING_P2_Q, :, :] = 1.0 if board.has_queenside_castling_rights(p2) else 0.0
+
+    # No-progress count (halfmove clock; 100 half-moves = 50-move rule)
+    tensor[PLANE_NO_PROGRESS_COUNT, :, :] = min(board.halfmove_clock / NO_PROGRESS_NORM, 1.0)
+
+    # Total move count
+    tensor[PLANE_MOVE_COUNT, :, :] = board.fullmove_number / MOVE_COUNT_NORM
 
 
 def board_to_tensor(board: chess.Board,
                     history_length: int = 8) -> np.ndarray:
-    """Encode a chess.Board as a (137, 8, 8) float32 numpy array.
+    """Encode a chess.Board as a (119, 8, 8) float32 numpy array.
 
-    The encoding uses the AlphaZero approach: the last 8 board positions
-    are each encoded as 17 planes (12 piece planes + side-to-move + 4
-    castling planes), for a total of 136 history planes, plus one final
-    global plane holding the normalized fullmove number.
+    Structure: M*T + L, per the AlphaZero paper (Table S1, Chess column):
+      - M=14 planes per history step (6 P1 pieces + 6 P2 pieces + 2
+        repetition), repeated for T=8 history steps (112 planes)
+      - L=7 constant-valued planes appended once: player's colour, 4
+        player-relative castling rights, no-progress count, total move
+        count.
 
-    This allows the network to detect threefold-repetition by comparing
-    piece configurations across time steps, and to condition on game
-    phase/progress via the move-count plane.
+    The board is oriented to the current player's perspective: rotated
+    180 degrees when Black is to move, with P1/P2 piece planes and
+    player-relative castling.
 
     **Optimization**: Instead of creating 8 separate board copies (one per
     history step), we copy the board once and walk backwards by popping
-    moves, encoding each position in-place.  ``_encode_single_position``
-    only reads piece positions / castling rights / side to move, so the
-    move stack is irrelevant for encoding — we just need the board state
-    at each ply.  This eliminates 8 ``board.copy(stack=True)`` calls per
-    tensor (a major hot-path saving).
+    moves, encoding each position's piece planes in-place.  This eliminates
+    8 ``board.copy(stack=True)`` calls per tensor (a major hot-path saving).
 
     Args:
         board: Current board position (must have full move history)
         history_length: Number of historical positions to encode (default 8)
 
     Returns:
-        tensor: (137, 8, 8) float32 numpy array
+        tensor: (119, 8, 8) float32 numpy array
     """
     tensor = np.zeros((NUM_PLANES, 8, 8), dtype=np.float32)
 
@@ -205,31 +280,27 @@ def board_to_tensor(board: chess.Board,
     b = board.copy(stack=True)
     num_moves = len(b.move_stack)
 
-    # Encode positions from most-recent (ply 0) backwards.
+    # Encode piece planes from most-recent (ply 0) backwards.
     for ply in range(history_length):
         plane_offset = ply * PLANES_PER_HISTORY
 
         if ply <= num_moves:
-            # Encode the current state of `b` (which is ply `ply` ago)
             _encode_single_position(b, plane_offset, tensor)
-            # Pop one move to go back another ply (if available)
             if ply < num_moves and ply + 1 < history_length:
                 b.pop()
         else:
             # Before the game started: fill with an empty board.
-            # (No pieces, no castling rights, side to move is irrelevant.)
-            # Nothing to do — tensor is already zeroed for these planes.
             pass
 
-    # Move-count plane: normalized fullmove number of the *current* position
-    # (not affected by the history walk above, which only reads `b`).
-    tensor[PLANE_MOVE_COUNT, :, :] = board.fullmove_number / MOVE_COUNT_NORM
+    # Global L-planes, computed once from the *current* position (not
+    # affected by the history walk above, which only reads `b`).
+    _encode_global_planes(board, tensor)
 
     return tensor
 
 
 def board_to_tensor_batch(board: chess.Board) -> np.ndarray:
-    """Encode board as batch tensor (1, 137, 8, 8)."""
+    """Encode board as batch tensor (1, 119, 8, 8)."""
     return board_to_tensor(board)[np.newaxis, ...]
 
 
@@ -248,6 +319,10 @@ def move_to_policy_index(move: chess.Move, board: chess.Board) -> int:
 
     The policy space is organized as 8*8*73, where for each source square
     (in rank-file order, rank 0 first), there are 73 possible move planes.
+
+    NOTE: the policy uses ABSOLUTE compass directions (N = toward rank 8
+    for both players), per the AlphaZero chess paper.  The input board is
+    player-oriented, but the action space is absolute.
     """
     from_rank = chess.square_rank(move.from_square)
     from_file = chess.square_file(move.from_square)

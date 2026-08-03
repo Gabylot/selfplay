@@ -38,18 +38,18 @@ class AlphaZeroNet(nn.Module):
     """Dual-head ResNet for chess position evaluation.
     
     Architecture:
-        Input conv (136 -> num_filters)
+        Input conv (119 -> num_filters)
         N residual blocks (num_filters -> num_filters)
-        Policy head: Conv 1x1 -> FC -> 4672 logits
-        Value head: Conv 1x1 -> FC -> 1 (tanh)
+        Policy head: Conv 1x1 -> BN -> ReLU -> Conv 1x1 (73 filters) -> 4672 logits
+        Value head: Conv 1x1 (1 filter) -> BN -> ReLU -> FC -> tanh -> 1
     """
     
     def __init__(self, 
-                 num_residual_blocks: int = 4,
+                 num_residual_blocks: int = 8,
                  num_filters: int = 64,
                  num_policy_channels: int = 32,
-                 num_value_channels: int = 16,
-                 value_fc_size: int = 256):
+                 num_value_channels: int = 1,
+                 value_fc_size: int = 128):
         super().__init__()
         
         self.num_residual_blocks = num_residual_blocks
@@ -64,15 +64,21 @@ class AlphaZeroNet(nn.Module):
             ResBlock(num_filters) for _ in range(num_residual_blocks)
         ])
         
-        # Policy head
+        # Policy head — matches the AlphaZero paper: an additional rectified
+        # BN-conv layer, then a final 1x1 convolution producing one logit
+        # per (square, move-plane) = 73 x 8 x 8 = 4672 logits.
         self.policy_conv = nn.Conv2d(num_filters, num_policy_channels, kernel_size=1, bias=False)
         self.policy_bn = nn.BatchNorm2d(num_policy_channels)
-        self.policy_fc = nn.Linear(num_policy_channels * 8 * 8, NUM_ACTIONS)
-        
-        # Value head
-        self.value_conv = nn.Conv2d(num_filters, num_value_channels, kernel_size=1, bias=False)
-        self.value_bn = nn.BatchNorm2d(num_value_channels)
-        self.value_fc1 = nn.Linear(num_value_channels * 8 * 8, value_fc_size)
+        self.policy_logits_conv = nn.Conv2d(num_policy_channels, 73, kernel_size=1, bias=False)
+
+        # Value head — matches the AlphaZero paper: a batch-normalized 1x1
+        # convolution of 1 filter, then a rectified FC layer of size
+        # value_fc_size, then a tanh-linear layer of size 1.
+        # NOTE: num_value_channels is accepted for API compatibility only;
+        # the value head uses a single 1x1 filter per the paper.
+        self.value_conv = nn.Conv2d(num_filters, 1, kernel_size=1, bias=False)
+        self.value_bn = nn.BatchNorm2d(1)
+        self.value_fc1 = nn.Linear(8 * 8, value_fc_size)
         self.value_fc2 = nn.Linear(value_fc_size, 1)
         
         # Initialize weights
@@ -95,7 +101,7 @@ class AlphaZeroNet(nn.Module):
         """Forward pass.
         
         Args:
-            x: Input tensor of shape (batch, 136, 8, 8)
+            x: Input tensor of shape (batch, 119, 8, 8)
         
         Returns:
             policy_logits: (batch, 4672) raw logits for move probabilities
@@ -108,12 +114,17 @@ class AlphaZeroNet(nn.Module):
         for block in self.res_blocks:
             x = block(x)
         
-        # Policy head
+        # Policy head: rectified BN-conv, then a final 1x1 convolution over
+        # 73 move planes per square.  Rearranged from (B, 73, 8, 8) to the
+        # canonical (B, 4672) ordering — source square-major, then plane,
+        # i.e. flat index = square * 73 + plane — matching
+        # move_to_policy_index() in encoding.py.
         policy = F.relu(self.policy_bn(self.policy_conv(x)))
-        policy = policy.view(policy.size(0), -1)
-        policy_logits = self.policy_fc(policy)
-        
-        # Value head
+        policy_logits = self.policy_logits_conv(policy)
+        policy_logits = policy_logits.permute(0, 2, 3, 1)  # (B, 8, 8, 73)
+        policy_logits = policy_logits.reshape(policy_logits.size(0), -1)  # (B, 4672)
+
+        # Value head: 1-filter 1x1 conv, rectified FC, tanh-linear.
         value = F.relu(self.value_bn(self.value_conv(x)))
         value = value.view(value.size(0), -1)
         value = F.relu(self.value_fc1(value))
@@ -125,7 +136,7 @@ class AlphaZeroNet(nn.Module):
         """Predict policy and value for a single board state.
         
         Args:
-            state: (136, 8, 8) numpy array
+            state: (119, 8, 8) numpy array
         
         Returns:
             policy: (4672,) numpy array of probabilities
@@ -146,7 +157,7 @@ class AlphaZeroNet(nn.Module):
         """Predict policy and value for a batch of board states.
         
         Args:
-            states: (batch, 136, 8, 8) numpy array
+            states: (batch, 119, 8, 8) numpy array
         
         Returns:
             policies: (batch, 4672) numpy array of probabilities
