@@ -51,15 +51,15 @@ training:
 
 # --- Evaluation ---
 evaluation:
-  eval_interval: 20000           # Run eval every N self-play games
-  gate_games: 20              # Games for network-vs-network gating
+  eval_interval: 1000         # Run eval every N self-play games
+  gate_games: 50              # Games for network-vs-network gating
   gate_win_threshold: 0.55    # Win rate needed to promote
-  ref_opponent_games: 20      # Games vs alpha-beta reference
+  ref_opponent_games: 50      # Games vs alpha-beta reference
   elo_k_factor: 32            # Elo K-factor
 
 # --- Alpha-Beta Reference Opponent ---
 alpha_beta:
-  depth: 2
+  depth: 4
   # Piece values for evaluation
   piece_values:
     P: 1
@@ -91,9 +91,9 @@ inference:
   use_gpu: true              # true = centralized GPU inference server, false = CPU per-worker
   use_shared_memory: true    # true = shared-memory IPC (zero-copy), false = queue-based pickle
   state_dtype: "float16"     # dtype for shared-memory buffers: "float16" (halves size) or "float32"
-  max_batch: 16               # Max samples per GPU forward pass
+  max_batch: 256               # Max samples per GPU forward pass (aggregated across workers)
   max_wait_ms: 2.0            # Max ms to wait before firing a partial batch
-  prewarm_batch_sizes: [1, 8, 16]  # Batch sizes to pre-warm
+  prewarm_batch_sizes: [1, 8, 16, 32, 64, 128, 256]  # Batch sizes to pre-warm
 
 # --- Main ---
 main:

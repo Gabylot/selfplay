@@ -89,9 +89,9 @@ def load_config(path: Optional[str] = None) -> dict:
             "use_gpu": False,
             "use_shared_memory": True,
             "state_dtype": "float16",
-            "max_batch": 64,
-            "max_wait_ms": 3.0,
-            "prewarm_batch_sizes": [1, 8, 16, 32, 64, 128],
+            "max_batch": 256,
+            "max_wait_ms": 2.0,
+            "prewarm_batch_sizes": [1, 8, 16, 32, 64, 128, 256],
         },
         "main": {
             "run_name": "default",

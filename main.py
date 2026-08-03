@@ -687,12 +687,13 @@ def _print_benchmark_report(timers, total_wall, games, total_moves, total_sims,
                 for name, t in s_labels]
         _fmt_table(rows, "GPU server time breakdown (% of server run)")
         print(f"  {'Server total run time':<30} {srv_total:>10.3f}s")
-        print(f"\n  Batch requests: {gpu_stats.get('batch_requests', 0)}    "
-              f"Single (timer-aggregated): {gpu_stats.get('single_requests', 0)}    "
-              f"Aggregated batches fired: {gpu_stats.get('aggregated_batches', 0)}")
+        print(f"\n  Total requests: {gpu_stats.get('total_requests', 0)}    "
+              f"Forward passes: {gpu_stats.get('aggregated_batches', 0)}    "
+              f"Aggregation cycles: {gpu_stats.get('aggregation_cycles', 0)}")
         print(f"  Samples processed: {gpu_stats.get('samples_processed', 0)}    "
               f"Avg batch size: "
-              f"{gpu_stats.get('samples_processed', 0) / max(1, gpu_stats.get('batch_requests', 0) + gpu_stats.get('aggregated_batches', 0)):.1f}")
+              f"{gpu_stats.get('samples_processed', 0) / max(1, gpu_stats.get('aggregated_batches', 0)):.1f}")
+        print(f"  Aggregation wait time: {gpu_stats.get('aggregation_wait_time', 0):.3f}s")
 
     # ── Worker CPU phase breakdown ──
     if worker_phases:
