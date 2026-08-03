@@ -915,7 +915,7 @@ def run_sanity_check(config):
                       'checkpoint_interval':5,'num_batches_per_step':2},
           'evaluation':{'eval_interval':2,'gate_games':4,'ref_opponent_games':4},
           'buffer':{'max_size':1000}}
-    lc = get_config(config_path=None, overrides=ov)
+    lc = get_config(path=None, overrides=ov)
     dev = torch.device("cpu")
     net = create_model_from_config(lc)
     board = chess.Board()

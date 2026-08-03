@@ -399,12 +399,19 @@ class GPUInferenceServer:
             net = nets.get(nid, net_a)
 
             # ── Read/collect states from all requests in this group ──
-            states_list = []
+            # Pre-allocate mega-batch and copy directly (avoids
+            # intermediate list + np.concatenate overhead).
+            total_in_group = sum(it['batch_size'] for it in group)
+            mega_states = np.empty(
+                (total_in_group, NUM_PLANES, 8, 8), dtype=np.float32
+            )
+            offset = 0
             for item in group:
+                bs = item['batch_size']
                 if item['is_shm']:
                     t0 = time.perf_counter()
                     states = SharedMemoryTransport.read_states(
-                        item['buf'], item['batch_size']
+                        item['buf'], bs
                     )
                     self.stats['shm_read_time'] += time.perf_counter() - t0
                 else:
@@ -412,13 +419,8 @@ class GPUInferenceServer:
                     # Ensure 4D (single requests come as 3D)
                     if states.ndim == 3:
                         states = states[np.newaxis, ...]
-                states_list.append(states)
-
-            # ── Concatenate into mega-batch ──
-            if len(states_list) == 1:
-                mega_states = states_list[0]
-            else:
-                mega_states = np.concatenate(states_list, axis=0)
+                mega_states[offset:offset + bs] = states
+                offset += bs
 
             # ── Forward pass ──
             t0 = time.perf_counter()

@@ -92,20 +92,21 @@ class WorkerSharedBuffers:
         value_elems = max_batch
 
         # mp.Array typecode: 'f' = float32, 'd' = float64, 'h' = float16
+        # States can be float16 (binary board planes -- no precision loss).
+        # Policies MUST be float32 -- the GPU outputs float32 and converting
+        # to float16 during np.copyto is a major CPU bottleneck (~200 MB/s
+        # vs >1 GB/s for same-type memcpy).
         if self.state_dtype == np.float16:
             state_tc = 'h'
-            policy_tc = 'h'
         elif self.state_dtype == np.float32:
             state_tc = 'f'
-            policy_tc = 'f'
         else:
             # Fall back to float32 for unsupported dtypes
             state_tc = 'f'
-            policy_tc = 'f'
             self.state_dtype = np.float32
 
         self.request_states = mp.Array(state_tc, state_elems, lock=False)
-        self.response_policies = mp.Array(policy_tc, policy_elems, lock=False)
+        self.response_policies = mp.Array('f', policy_elems, lock=False)  # always float32
         self.response_values = mp.Array('f', value_elems, lock=False)
 
     # ── Numpy views (created per-process, not shared) ────────────────
@@ -123,10 +124,14 @@ class WorkerSharedBuffers:
 
     def response_policies_np(self, batch_size: int) -> np.ndarray:
         """Return a numpy view of the first *batch_size* rows of the
-        policy buffer, shaped ``(batch_size, NUM_ACTIONS)``."""
+        policy buffer, shaped ``(batch_size, NUM_ACTIONS)``.
+
+        Always float32 -- the GPU outputs float32 and the buffer is
+        always float32 regardless of state_dtype.
+        """
         flat = np.frombuffer(
             _get_raw_array(self.response_policies),
-            dtype=self.state_dtype,
+            dtype=np.float32,
         )
         return flat[:batch_size * NUM_ACTIONS].reshape(
             batch_size, NUM_ACTIONS
@@ -212,17 +217,27 @@ class SharedMemoryTransport:
     def read_states(buf: WorkerSharedBuffers, batch_size: int) -> np.ndarray:
         """Read states from the request shared buffer.
 
-        Returns a float32 array (the dtype the network expects) — the
-        conversion from float16 happens here on the server side.
+        Returns a float32 array (the dtype the network expects).  When
+        the buffer is already float32, this is a fast same-type copy.
+        When the buffer is float16, a conversion is required (slower).
         """
         view = buf.request_states_np(batch_size)
+        if buf.state_dtype == np.float32:
+            # Same dtype -- return a copy (safe, worker won't overwrite
+            # until we respond, but copy avoids any aliasing issues)
+            return view.copy()
+        # float16 -> float32 conversion (CPU-bound)
         return view.astype(np.float32)
 
     @staticmethod
     def read_policies(buf: WorkerSharedBuffers, batch_size: int) -> np.ndarray:
-        """Read policies from the response shared buffer as float32."""
+        """Read policies from the response shared buffer as float32.
+
+        Returns a copy so the caller owns the data before the server
+        overwrites the shared buffer on the next request.
+        """
         view = buf.response_policies_np(batch_size)
-        return view.astype(np.float32)
+        return view.copy()
 
     @staticmethod
     def read_values(buf: WorkerSharedBuffers, batch_size: int) -> np.ndarray:
