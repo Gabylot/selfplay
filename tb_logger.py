@@ -18,12 +18,26 @@ Logs as many metrics as possible:
   - Evaluation results (win rate, wins/losses/draws per opponent)
   - Termination reason distribution
   - Full config dump + run summary (text)
+
+Restart handling
+----------------
+Metrics are written on two different x-axes:
+
+  * ``step``   — training / buffer / network / elo / eval / promotion metrics
+  * ``game_id``— per-game metrics (Game/*, Rolling/*, MCTS/*, Termination/*)
+
+A single ``SummaryWriter`` can only carry one ``purge_step``, so on restart
+we use **two** writers in separate subdirectories (``step/`` and ``game/``),
+each purged at its own axis.  Without this, game-keyed events from a stale
+checkpoint would overlap the new run's game ids and TensorBoard would show
+duplicate / restarting game curves.
 """
 
 import json
 import numpy as np
 from collections import deque, defaultdict
 from typing import Optional, Dict, Any
+from pathlib import Path
 
 from torch.utils.tensorboard import SummaryWriter
 
@@ -36,27 +50,40 @@ class TensorBoardLogger:
     """
 
     def __init__(self, log_dir: str, enabled: bool = True,
-                 rolling_window: int = 100, initial_step: int = 0):
+                 rolling_window: int = 100, initial_step: int = 0,
+                 initial_game_id: int = 0):
         """Initialise the TensorBoard logger.
 
         Args:
-            log_dir: Directory for TensorBoard event files.
+            log_dir: Directory for TensorBoard event files.  Two
+                subdirectories are created inside it: ``step/`` for
+                step-keyed metrics and ``game/`` for game-keyed metrics.
             enabled: If False, all logging calls become no-ops.
             rolling_window: Number of recent games to track for
                 rolling-average metrics.
-            initial_step: Step to resume from.  When > 0, the
-                ``SummaryWriter`` is told to purge (discard) any events
-                at or beyond this step from *previous* event files in
-                the same log directory.  This is essential for correct
-                training continuation: without it, TensorBoard sees
-                overlapping step ranges from the old and new event files
-                and the plots appear to restart or jump.
+            initial_step: Step to resume from.  When > 0, the step-keyed
+                ``SummaryWriter`` is told to purge (discard) any events at
+                or beyond this step from *previous* event files in the
+                ``step/`` subdirectory.
+            initial_game_id: Game id to resume from.  When > 0, the
+                game-keyed ``SummaryWriter`` is told to purge any events at
+                or beyond this game id from *previous* event files in the
+                ``game/`` subdirectory.
         """
         self.enabled = enabled
         self.log_dir = log_dir
-        purge = initial_step if initial_step > 0 else None
-        self.writer = SummaryWriter(log_dir, purge_step=purge) if enabled else None
         self.rolling_window = rolling_window
+
+        if enabled:
+            step_dir = str(Path(log_dir) / "step")
+            game_dir = str(Path(log_dir) / "game")
+            purge_step = initial_step if initial_step > 0 else None
+            purge_game = initial_game_id if initial_game_id > 0 else None
+            self.writer = SummaryWriter(step_dir, purge_step=purge_step)
+            self.game_writer = SummaryWriter(game_dir, purge_step=purge_game)
+        else:
+            self.writer = None
+            self.game_writer = None
 
         # Rolling buffers for computed metrics
         self._game_results = deque(maxlen=rolling_window)
@@ -73,21 +100,26 @@ class TensorBoardLogger:
 
     # ── Internal helper ──────────────────────────────────────────────
 
-    def _log(self, fn, *args, **kwargs):
-        """Call a SummaryWriter method only if enabled."""
-        if self.writer is not None:
-            fn(*args, **kwargs)
+    def _log(self, writer, method, *args, **kwargs):
+        """Call a SummaryWriter method only if enabled.
+
+        ``method`` is the method name (e.g. ``"add_scalar"``); it is looked
+        up lazily so that a ``None`` writer never triggers an attribute
+        access on ``None``.
+        """
+        if writer is not None:
+            getattr(writer, method)(*args, **kwargs)
 
     # ── Config / text ────────────────────────────────────────────────
 
     def log_config(self, step: int, config_dict: dict):
         """Log the full configuration as text."""
-        self._log(self.writer.add_text, "Config/full",
+        self._log(self.writer, "add_text", "Config/full",
                   json.dumps(config_dict, indent=2), step)
 
     def log_run_summary(self, step: int, summary: str):
         """Log a human-readable run summary as text."""
-        self._log(self.writer.add_text, "Summary", summary, step)
+        self._log(self.writer, "add_text", "Summary", summary, step)
 
     # ── Training ─────────────────────────────────────────────────────
 
@@ -96,18 +128,18 @@ class TensorBoardLogger:
                           learning_rate: float = None,
                           grad_norm: float = None):
         """Log a training step's losses, learning rate, and gradient norm."""
-        self._log(self.writer.add_scalar, "Loss/policy", policy_loss, step)
-        self._log(self.writer.add_scalar, "Loss/value", value_loss, step)
-        self._log(self.writer.add_scalar, "Loss/total", total_loss, step)
-        self._log(self.writer.add_scalars, "Loss/all",
+        self._log(self.writer, "add_scalar", "Loss/policy", policy_loss, step)
+        self._log(self.writer, "add_scalar", "Loss/value", value_loss, step)
+        self._log(self.writer, "add_scalar", "Loss/total", total_loss, step)
+        self._log(self.writer, "add_scalars", "Loss/all",
                   {"policy": policy_loss, "value": value_loss,
                    "total": total_loss}, step)
 
         if learning_rate is not None:
-            self._log(self.writer.add_scalar, "LearningRate", learning_rate, step)
+            self._log(self.writer, "add_scalar", "LearningRate", learning_rate, step)
 
         if grad_norm is not None:
-            self._log(self.writer.add_scalar, "Gradient/norm", grad_norm, step)
+            self._log(self.writer, "add_scalar", "Gradient/norm", grad_norm, step)
 
         # Track for rolling histograms
         self._policy_losses.append(policy_loss)
@@ -119,15 +151,15 @@ class TensorBoardLogger:
         # Periodic histograms of loss distributions
         if step > 0 and step % 50 == 0:
             if len(self._policy_losses) > 1:
-                self._log(self.writer.add_histogram,
+                self._log(self.writer, "add_histogram",
                           "Histogram/policy_loss",
                           np.array(self._policy_losses), step)
             if len(self._value_losses) > 1:
-                self._log(self.writer.add_histogram,
+                self._log(self.writer, "add_histogram",
                           "Histogram/value_loss",
                           np.array(self._value_losses), step)
             if len(self._grad_norms) > 1:
-                self._log(self.writer.add_histogram,
+                self._log(self.writer, "add_histogram",
                           "Histogram/grad_norm",
                           np.array(self._grad_norms), step)
 
@@ -140,20 +172,20 @@ class TensorBoardLogger:
         """Log a completed self-play game with rich metrics."""
         self._last_game_id = game_id
 
-        # Per-game scalars
-        self._log(self.writer.add_scalar, "Game/result", result, game_id)
-        self._log(self.writer.add_scalar, "Game/length", length, game_id)
-        self._log(self.writer.add_scalar, "Game/avg_mcts_depth",
+        # Per-game scalars (game-keyed writer)
+        self._log(self.game_writer, "add_scalar", "Game/result", result, game_id)
+        self._log(self.game_writer, "add_scalar", "Game/length", length, game_id)
+        self._log(self.game_writer, "add_scalar", "Game/avg_mcts_depth",
                   avg_mcts_depth, game_id)
-        self._log(self.writer.add_scalar, "Game/num_positions",
+        self._log(self.game_writer, "add_scalar", "Game/num_positions",
                   num_positions, game_id)
-        self._log(self.writer.add_scalar, "Game/material_diff",
+        self._log(self.game_writer, "add_scalar", "Game/material_diff",
                   material_diff, game_id)
 
         # Text labels
-        self._log(self.writer.add_text, "Game/result_str",
+        self._log(self.game_writer, "add_text", "Game/result_str",
                   f"{result_str} (step {step})", game_id)
-        self._log(self.writer.add_text, "Game/termination",
+        self._log(self.game_writer, "add_text", "Game/termination",
                   f"{termination} (step {step})", game_id)
 
         # Track for rolling stats
@@ -169,28 +201,28 @@ class TensorBoardLogger:
             draws = sum(1 for r in self._game_results if r == 0)
             total = len(self._game_results)
             rolling_wr = (wins + 0.5 * draws) / total
-            self._log(self.writer.add_scalar,
+            self._log(self.game_writer, "add_scalar",
                       "Rolling/win_rate", rolling_wr, game_id)
-            self._log(self.writer.add_scalar,
+            self._log(self.game_writer, "add_scalar",
                       "Rolling/avg_game_length",
                       float(np.mean(self._game_lengths)), game_id)
-            self._log(self.writer.add_scalars, "Rolling/outcome_counts",
+            self._log(self.game_writer, "add_scalars", "Rolling/outcome_counts",
                       {"wins": wins, "losses": losses, "draws": draws},
                       game_id)
 
         # Periodic histograms
         if game_id > 0 and game_id % 50 == 0:
             if len(self._game_lengths) > 1:
-                self._log(self.writer.add_histogram,
+                self._log(self.game_writer, "add_histogram",
                           "Histogram/game_length",
                           np.array(self._game_lengths), game_id)
             if len(self._material_diffs) > 1:
-                self._log(self.writer.add_histogram,
+                self._log(self.game_writer, "add_histogram",
                           "Histogram/material_diff",
                           np.array(self._material_diffs), game_id)
 
         # Termination reason distribution (as scalars)
-        self._log(self.writer.add_scalars, "Termination/reasons",
+        self._log(self.game_writer, "add_scalars", "Termination/reasons",
                   dict(self._termination_reasons), game_id)
 
     # ── MCTS ─────────────────────────────────────────────────────────
@@ -198,9 +230,9 @@ class TensorBoardLogger:
     def log_mcts_stats(self, game_id: int, step: int,
                        avg_tree_depth: float, avg_sims_per_move: float):
         """Log MCTS search statistics for a game."""
-        self._log(self.writer.add_scalar, "MCTS/avg_tree_depth",
+        self._log(self.game_writer, "add_scalar", "MCTS/avg_tree_depth",
                   avg_tree_depth, game_id)
-        self._log(self.writer.add_scalar, "MCTS/avg_sims_per_move",
+        self._log(self.game_writer, "add_scalar", "MCTS/avg_sims_per_move",
                   avg_sims_per_move, game_id)
 
     # ── Network ──────────────────────────────────────────────────────
@@ -208,9 +240,9 @@ class TensorBoardLogger:
     def log_network_stats(self, step: int, avg_max_policy: float,
                           avg_abs_value: float):
         """Log network confidence trends."""
-        self._log(self.writer.add_scalar, "Network/avg_max_policy",
+        self._log(self.writer, "add_scalar", "Network/avg_max_policy",
                   avg_max_policy, step)
-        self._log(self.writer.add_scalar, "Network/avg_abs_value",
+        self._log(self.writer, "add_scalar", "Network/avg_abs_value",
                   avg_abs_value, step)
 
     # ── Buffer ───────────────────────────────────────────────────────
@@ -219,8 +251,8 @@ class TensorBoardLogger:
                          white_wins: float, black_wins: float,
                          draws: float):
         """Log replay buffer composition."""
-        self._log(self.writer.add_scalar, "Buffer/size", buffer_size, step)
-        self._log(self.writer.add_scalars, "Buffer/outcome_distribution",
+        self._log(self.writer, "add_scalar", "Buffer/size", buffer_size, step)
+        self._log(self.writer, "add_scalars", "Buffer/outcome_distribution",
                   {"white_wins": white_wins, "black_wins": black_wins,
                    "draws": draws}, step)
 
@@ -231,9 +263,9 @@ class TensorBoardLogger:
                 wins: int = 0, losses: int = 0, draws: int = 0):
         """Log an Elo rating update."""
         s = step if step is not None else 0
-        self._log(self.writer.add_scalar, f"Elo/{opponent_type}",
+        self._log(self.writer, "add_scalar", f"Elo/{opponent_type}",
                   elo_rating, s)
-        self._log(self.writer.add_scalars, f"Elo/{opponent_type}_detail",
+        self._log(self.writer, "add_scalars", f"Elo/{opponent_type}_detail",
                   {"elo": elo_rating, "games": games_played,
                    "wins": wins, "losses": losses, "draws": draws}, s)
 
@@ -244,17 +276,17 @@ class TensorBoardLogger:
                               wins: int, losses: int, draws: int,
                               new_elo: float = None, old_elo: float = None):
         """Log a gating/promotion attempt."""
-        self._log(self.writer.add_scalar, "Promotion/win_rate",
+        self._log(self.writer, "add_scalar", "Promotion/win_rate",
                   win_rate, step)
-        self._log(self.writer.add_scalar, "Promotion/promoted",
+        self._log(self.writer, "add_scalar", "Promotion/promoted",
                   int(promoted), step)
-        self._log(self.writer.add_scalars, "Promotion/results",
+        self._log(self.writer, "add_scalars", "Promotion/results",
                   {"wins": wins, "losses": losses, "draws": draws}, step)
         if new_elo is not None:
-            self._log(self.writer.add_scalar, "Promotion/new_elo",
+            self._log(self.writer, "add_scalar", "Promotion/new_elo",
                       new_elo, step)
         if old_elo is not None:
-            self._log(self.writer.add_scalar, "Promotion/old_elo",
+            self._log(self.writer, "add_scalar", "Promotion/old_elo",
                       old_elo, step)
 
     # ── Evaluation ───────────────────────────────────────────────────
@@ -265,15 +297,15 @@ class TensorBoardLogger:
         """Log evaluation match results."""
         if win_rate is None and games_played > 0:
             win_rate = wins / games_played
-        self._log(self.writer.add_scalar,
+        self._log(self.writer, "add_scalar",
                   f"Evaluation/{opponent}_win_rate", win_rate, step)
-        self._log(self.writer.add_scalars, f"Evaluation/{opponent}",
+        self._log(self.writer, "add_scalars", f"Evaluation/{opponent}",
                   {"wins": wins, "losses": losses, "draws": draws}, step)
 
     # ── Cleanup ──────────────────────────────────────────────────────
 
     def close(self):
-        """Close the TensorBoard writer."""
+        """Close the TensorBoard writers."""
         if self.writer is not None:
             # Final summary text
             try:
@@ -303,3 +335,6 @@ class TensorBoardLogger:
                 pass
             self.writer.close()
             self.writer = None
+        if self.game_writer is not None:
+            self.game_writer.close()
+            self.game_writer = None

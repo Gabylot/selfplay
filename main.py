@@ -169,7 +169,8 @@ def run_training(config, gui_enabled=False, num_workers=None):
     # purge_step tells TensorBoard to discard any events at or beyond
     # this step from previous event files, so new logs continue
     # seamlessly from where the last run left off.
-    tb = TensorBoardLogger(tb_log_dir, enabled=tb_enabled, initial_step=step)
+    tb = TensorBoardLogger(tb_log_dir, enabled=tb_enabled, initial_step=step,
+                           initial_game_id=game_id)
     if tb_enabled:
         print(f"[INFO] TensorBoard logging → {tb_log_dir}  (resuming from step {step})")
         print(f"[INFO] Run: tensorboard --logdir {tb_log_dir}")
