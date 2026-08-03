@@ -63,11 +63,12 @@ def evaluate_material(board: chess.Board) -> float:
     return score
 
 
-def alpha_beta_search(board: chess.Board, depth: int, alpha: float, beta: float,
-                       maximizing: bool) -> float:
-    """Minimax with alpha-beta pruning.
-    
+def alpha_beta_search(board: chess.Board, depth: int, alpha: float, beta: float) -> float:
+    """Negamax with alpha-beta pruning.
+
     Returns evaluation from the perspective of the side to move.
+    The score is negated at every recursion level (standard negamax),
+    so callers always maximize on the value returned.
     """
     if depth == 0 or board.is_game_over():
         if board.is_game_over():
@@ -78,73 +79,48 @@ def alpha_beta_search(board: chess.Board, depth: int, alpha: float, beta: float,
                 return -10000.0 if board.turn == chess.WHITE else 10000.0
             else:
                 return 0.0
-        
+
         # Evaluate from side-to-move perspective
         material = evaluate_material(board)
         if board.turn == chess.BLACK:
             material = -material
         return material
-    
+
     legal_moves = list(board.legal_moves)
-    
-    if maximizing:
-        max_eval = -float('inf')
-        for move in legal_moves:
-            board.push(move)
-            eval_score = alpha_beta_search(board, depth - 1, alpha, beta, False)
-            board.pop()
-            max_eval = max(max_eval, eval_score)
-            alpha = max(alpha, eval_score)
-            if beta <= alpha:
-                break
-        return max_eval
-    else:
-        min_eval = float('inf')
-        for move in legal_moves:
-            board.push(move)
-            eval_score = alpha_beta_search(board, depth - 1, alpha, beta, True)
-            board.pop()
-            min_eval = min(min_eval, eval_score)
-            beta = min(beta, eval_score)
-            if beta <= alpha:
-                break
-        return min_eval
+    best = -float('inf')
+    for move in legal_moves:
+        board.push(move)
+        score = -alpha_beta_search(board, depth - 1, -beta, -alpha)
+        board.pop()
+        if score > best:
+            best = score
+        if best > alpha:
+            alpha = best
+        if alpha >= beta:
+            break
+    return best
 
 
 def alpha_beta_best_move(board: chess.Board, depth: int = 4) -> Optional[chess.Move]:
-    """Find the best move using alpha-beta search.
-    
-    Returns the best move from the current side's perspective.
+    """Find the best move using negamax with alpha-beta pruning.
+
+    Returns the best move from the current side's perspective.  The caller
+    should pass an independent copy of the board if it needs to keep its own
+    history stack intact (this function pushes/pops on the shared board).
     """
     legal_moves = list(board.legal_moves)
     if not legal_moves:
         return None
-    
+
     best_move = None
-    is_maximizing = (board.turn == chess.WHITE)
-    
-    if is_maximizing:
-        best_score = -float('inf')
-        for move in legal_moves:
-            board.push(move)
-            score = alpha_beta_search(board, depth - 1, -float('inf'), float('inf'), False)
-            board.pop()
-            # Negate because score is from the new position's perspective
-            score = -score if board.turn == chess.WHITE else score
-            if score > best_score:
-                best_score = score
-                best_move = move
-    else:
-        best_score = float('inf')
-        for move in legal_moves:
-            board.push(move)
-            score = alpha_beta_search(board, depth - 1, -float('inf'), float('inf'), True)
-            board.pop()
-            score = -score if board.turn == chess.BLACK else score
-            if score < best_score:
-                best_score = score
-                best_move = move
-    
+    best_score = -float('inf')
+    for move in legal_moves:
+        board.push(move)
+        score = -alpha_beta_search(board, depth - 1, -float('inf'), -best_score)
+        board.pop()
+        if score > best_score:
+            best_score = score
+            best_move = move
     return best_move if best_move else legal_moves[0]
 
 
