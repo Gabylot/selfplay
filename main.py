@@ -12,6 +12,7 @@ Usage:
     python main.py gui
     python main.py evaluate
     python main.py sanity
+    python main.py benchmark [--workers N] [--benchmark-games N] [--profile-games N]
 """
 
 import argparse, sys, os, time, threading, signal, io
@@ -597,6 +598,304 @@ def run_training(config, gui_enabled=False, num_workers=None):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Benchmark mode
+# ─────────────────────────────────────────────────────────────────────────────
+
+class _BenchTimers:
+    """Accumulated main-process timing categories for the benchmark report."""
+
+    def __init__(self):
+        self.startup       = 0.0
+        self.wait          = 0.0
+        self.recv          = 0.0
+        self.deserialize   = 0.0
+        self.bookkeeping   = 0.0
+        self.respawn       = 0.0
+        self.profile_phase = 0.0
+        self.stop          = 0.0
+
+    def total(self):
+        return (self.startup + self.wait + self.recv + self.deserialize
+                + self.bookkeeping + self.respawn + self.profile_phase + self.stop)
+
+
+def _fmt_table(rows, title):
+    """Print a left-aligned two/three-column table with percentages."""
+    print(f"\n  {title}")
+    print("  " + "-" * (len(title) + 2))
+    name_w = max(len(r[0]) for r in rows)
+    for row in rows:
+        name, tsec, pct = row[0], row[1], row[2]
+        print(f"  {name:<{name_w}}  {tsec:>10.3f}s  {pct:>6.1f}%")
+
+
+def _print_benchmark_report(timers, total_wall, games, total_moves, total_sims,
+                            gpu_stats, worker_phases):
+    print("\n" + "=" * 72)
+    print("  BENCHMARK REPORT")
+    print("=" * 72)
+
+    # ── Overall ──
+    avg_moves = total_moves / games if games > 0 else 0
+    print(f"\n  Games: {games}    Total moves: {total_moves}    "
+          f"Avg moves/game: {avg_moves:.1f}")
+    print(f"  Total simulations: {total_sims}    Sims/sec: "
+          f"{total_sims / total_wall if total_wall > 0 else 0:.1f}")
+    print(f"  Games/sec: {games / total_wall if total_wall > 0 else 0:.3f}")
+    print(f"  Wall time: {total_wall:.2f}s")
+
+    # ── Main-process breakdown ──
+    labels = [
+        ("Startup (net/ckpt/buffer/GPU warmup)", timers.startup),
+        ("Waiting for workers",                  timers.wait),
+        ("Queue receive (psp.collect_one)",      timers.recv),
+        ("Deserializing game_data",              timers.deserialize),
+        ("Bookkeeping",                          timers.bookkeeping),
+        ("Respawning workers",                   timers.respawn),
+        ("Worker CPU profiling",                 timers.profile_phase),
+        ("Shutdown",                             timers.stop),
+    ]
+    accounted = sum(t for _, t in labels)
+    other_pct = 100.0 * max(0.0, total_wall - accounted) / total_wall if total_wall > 0 else 0
+
+    rows = [(name, t, 100.0 * t / total_wall) for name, t in labels]
+    _fmt_table(rows, "Main-process time breakdown (% of wall time)")
+    if other_pct > 0.5:
+        print(f"  {'(unattributed)':<26} {total_wall - accounted:>10.3f}s  {other_pct:>6.1f}%")
+
+    # Estimate worker-side game time (the dominant bucket)
+    worker_time = max(0.0, total_wall - accounted)
+    print(f"\n  -> Estimated worker-side game time: {worker_time:.2f}s "
+          f"({100.0 * worker_time / total_wall:.1f}% of wall)")
+
+    # ── GPU server breakdown ──
+    if gpu_stats:
+        print("\n" + "=" * 72)
+        print("  GPU SERVER BREAKDOWN")
+        print("=" * 72)
+        srv_total = gpu_stats.get('server_total', 0) or 0
+        s_labels = [
+            ("Shader pre-warm",            gpu_stats.get('prewarm_time', 0)),
+            ("Waiting for requests",       gpu_stats.get('wait_time', 0)),
+            ("GPU forward + softmax",      gpu_stats.get('gpu_forward_time', 0)),
+            ("Shared-mem read (states)",   gpu_stats.get('shm_read_time', 0)),
+            ("Shared-mem write (results)", gpu_stats.get('shm_write_time', 0)),
+            ("Weight queue drain",         gpu_stats.get('weight_drain_time', 0)),
+            ("Weight load into net",       gpu_stats.get('weight_load_time', 0)),
+        ]
+        rows = [(name, t, 100.0 * t / srv_total if srv_total > 0 else 0)
+                for name, t in s_labels]
+        _fmt_table(rows, "GPU server time breakdown (% of server run)")
+        print(f"  {'Server total run time':<30} {srv_total:>10.3f}s")
+        print(f"\n  Batch requests: {gpu_stats.get('batch_requests', 0)}    "
+              f"Single (timer-aggregated): {gpu_stats.get('single_requests', 0)}    "
+              f"Aggregated batches fired: {gpu_stats.get('aggregated_batches', 0)}")
+        print(f"  Samples processed: {gpu_stats.get('samples_processed', 0)}    "
+              f"Avg batch size: "
+              f"{gpu_stats.get('samples_processed', 0) / max(1, gpu_stats.get('batch_requests', 0) + gpu_stats.get('aggregated_batches', 0)):.1f}")
+
+    # ── Worker CPU phase breakdown ──
+    if worker_phases:
+        print("\n" + "=" * 72)
+        print("  WORKER CPU PHASE BREAKDOWN (merged across workers)")
+        print("=" * 72)
+        total = sum(v['total_s'] for v in worker_phases.values())
+        rows = sorted(
+            [(p, v['total_s'], 100.0 * v['total_s'] / total if total > 0 else 0,
+              v['calls'], v['mean_ms'])
+             for p, v in worker_phases.items()],
+            key=lambda r: -r[1],
+        )
+        print(f"\n  {'Phase':<25} {'Total(s)':>10} {'%Time':>8} {'Calls':>10} {'Mean(ms)':>10}")
+        print("  " + "-" * 66)
+        for name, tsec, pct, calls, mean_ms in rows:
+            hot = "  *** HOT" if pct > 30 else ""
+            print(f"  {name:<25} {tsec:>10.4f} {pct:>7.1f}% {calls:>10} {mean_ms:>9.3f}{hot}")
+        print("  " + "-" * 66)
+        print(f"  {'TOTAL':<25} {total:>10.4f} {'100.0%':>8}")
+
+    print("\n" + "=" * 72)
+
+
+def _aggregate_worker_phases(summaries):
+    """Merge per-worker profile phase dicts into a single aggregate."""
+    merged = {}
+    for s in summaries:
+        if not s:
+            continue
+        for phase, data in s.get('phases', {}).items():
+            if phase not in merged:
+                merged[phase] = {'calls': 0, 'total_s': 0.0, 'mean_ms': 0.0}
+            merged[phase]['calls'] += data.get('calls', 0)
+            merged[phase]['total_s'] += data.get('total_s', 0.0)
+    for phase, data in merged.items():
+        if data['calls'] > 0:
+            data['mean_ms'] = data['total_s'] / data['calls'] * 1000.0
+    return merged
+
+
+def run_benchmark(config, num_workers=None, num_games=10, profile_games=3):
+    """Replicate the training pipeline (checkpoint load, GPU server, worker
+    pool, self-play games) WITHOUT training or eval, timing every phase.
+
+    Read-only w.r.t. the run's outputs: no stats.db writes, no TensorBoard,
+    no checkpoints written, no replay-buffer writes.  The replay buffer is
+    loaded (to time that I/O) but never modified or saved.
+    """
+    import multiprocessing as _mp
+    if _mp.get_start_method(allow_none=True) is None:
+        try: _mp.set_start_method('spawn')
+        except RuntimeError: pass
+
+    global _shutdown
+    _shutdown = False
+    wall_start = time.perf_counter()
+    timers = _BenchTimers()
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"[INFO] Device: {device}")
+    use_gpu = getattr(config, 'inference', None) and getattr(config.inference, 'use_gpu', False)
+    if use_gpu:
+        print("[INFO] Inference: GPU (DirectML centralized server)")
+
+    if num_workers is None:
+        num_workers = getattr(config.selfplay, 'num_workers', 8)
+    print(f"[INFO] Workers: {num_workers}")
+
+    # ── Startup phase ──
+    t0 = time.perf_counter()
+
+    network = create_model_from_config(config)
+    network.to(device)
+    print(f"[INFO] Network: {sum(p.numel() for p in network.parameters())} params")
+
+    output_dir      = Path(config.main.output_dir) / config.main.run_name
+    checkpoints_dir = output_dir / "checkpoints"
+
+    # Checkpoint load (mirrors run_training)
+    latest_ckpt = checkpoints_dir / "latest.pt"
+    if latest_ckpt.exists():
+        print(f"[INFO] Loading checkpoint: {latest_ckpt}")
+        load_checkpoint(str(latest_ckpt), network)
+    else:
+        print(f"[WARN] No checkpoint found at {latest_ckpt} — using random weights")
+
+    # Replay buffer load (read-only — never written back)
+    buffer_path = checkpoints_dir / "replay_buffer.npz"
+    loaded_buffer = ReplayBuffer.load(str(buffer_path), max_size=config.buffer.max_size)
+    if loaded_buffer is not None:
+        print(f"[INFO] Loaded replay buffer: {len(loaded_buffer)} positions "
+              f"from {loaded_buffer.total_games} games (read-only)")
+    else:
+        print("[INFO] No replay buffer to load (read-only benchmark)")
+
+    # GPU server timing stats queue
+    stats_q = _mp.Queue() if use_gpu else None
+    psp = ParallelSelfPlay(config, num_workers=num_workers, stats_queue=stats_q)
+    psp.start()
+    psp.push_selfplay(network)   # kick off first round
+
+    timers.startup = time.perf_counter() - t0
+    print(f"\n[Benchmark] Startup (network + checkpoint + buffer + GPU warmup): "
+          f"{timers.startup:.2f}s\n")
+
+    # ── Self-play collection phase (no training, no eval, no buffer writes) ──
+    games_done   = 0
+    total_moves  = 0
+    total_sims   = 0
+    worker_live_game_ids = [0] * num_workers  # placeholder for parity with training
+
+    try:
+        while games_done < num_games and not _shutdown:
+            # Waiting for a result
+            t_wait = time.perf_counter()
+            result = psp.collect_one(timeout=300.0)
+            timers.wait += time.perf_counter() - t_wait
+            if result is None:
+                print("[WARN] No result in 5 min — workers may be stuck")
+                continue
+            if result.get('done'):
+                continue
+            if result.get('type') != 'selfplay':
+                continue   # ignore live messages / other result types
+
+            wid = result['worker_id']
+            t_recv = time.perf_counter()
+            raw = result['game_data']
+            game_info = result['game_info']
+            timers.recv += time.perf_counter() - t_recv
+
+            # Deserialise (exactly as run_training does)
+            t_ds = time.perf_counter()
+            game_data = [(np.array(s, dtype=np.float32),
+                          np.array(p, dtype=np.float32),
+                          float(v),
+                          np.array(m, dtype=np.float32)) for s, p, v, m in raw]
+            timers.deserialize += time.perf_counter() - t_ds
+
+            # Bookkeeping (counts + print only — no buffer.add_game, no stats logging)
+            t_bk = time.perf_counter()
+            games_done += 1
+            total_moves += game_info['length']
+            total_sims  += game_info['length'] * config.mcts.num_simulations
+            print(f"  [W{wid}] Game {games_done}/{num_games}: "
+                  f"{game_info['termination']:18s} | {game_info['result_str']} | "
+                  f"{game_info['length']} moves")
+            timers.bookkeeping += time.perf_counter() - t_bk
+
+            # Respawning this worker (weights serialization + task push, as in training)
+            t_rp = time.perf_counter()
+            import torch as _torch, io as _io
+            buf2 = _io.BytesIO()
+            _torch.save(network.state_dict(), buf2)
+            wb = buf2.getvalue()
+            try:
+                psp._task_qs[wid].put_nowait({'type': 'selfplay', 'weights': wb})
+            except Exception:
+                pass
+            timers.respawn += time.perf_counter() - t_rp
+
+        # ── Worker CPU phase profiling (reuses the existing WorkerProfiler) ──
+        if not _shutdown and profile_games > 0:
+            t_pr = time.perf_counter()
+            print(f"\n[Benchmark] Dispatching worker CPU profiling "
+                  f"({profile_games} profiled games per worker)...")
+            psp.dispatch_profile(network, num_games=profile_games)
+            summaries = []
+            expected = num_workers
+            received = 0
+            while received < expected and not _shutdown:
+                r = psp.collect_one(timeout=300.0)
+                if r is None:
+                    print("[WARN] Profile collection timeout")
+                    break
+                if r.get('done'):
+                    continue
+                if r.get('type') == 'profile_done':
+                    summaries.append(r.get('summary'))
+                    received += 1
+                    print(f"  [Worker Profiler] W{r.get('worker_id')} finished "
+                          f"- {received}/{expected} workers done")
+            timers.profile_phase = time.perf_counter() - t_pr
+            worker_phases = _aggregate_worker_phases(summaries)
+        else:
+            worker_phases = None
+
+    finally:
+        t_stop = time.perf_counter()
+        print("\n[INFO] Stopping workers…")
+        psp.stop()
+        timers.stop = time.perf_counter() - t_stop
+
+    # ── Report ──
+    gpu_stats = psp.get_gpu_stats() if use_gpu else None
+    wall_total = time.perf_counter() - wall_start
+    _print_benchmark_report(timers, wall_total, games_done, total_moves,
+                            total_sims, gpu_stats, worker_phases)
+    print("[Benchmark] Done. Read-only — no checkpoints, stats.db, or buffer writes occurred.")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Sanity check
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -643,7 +942,7 @@ def run_sanity_check(config):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("mode", choices=["train","gui","evaluate","sanity"])
+    parser.add_argument("mode", choices=["train","gui","evaluate","sanity","benchmark"])
     parser.add_argument("--gui",      action="store_true")
     parser.add_argument("--config",   type=str, default=None)
     parser.add_argument("--sims",     type=int, default=None)
@@ -651,6 +950,10 @@ def main():
     parser.add_argument("--filters",  type=int, default=None)
     parser.add_argument("--run-name", type=str, default=None)
     parser.add_argument("--workers",  type=int, default=None)
+    parser.add_argument("--benchmark-games", type=int, default=10,
+                        help="Self-play games to collect in benchmark mode (default: 10)")
+    parser.add_argument("--profile-games", type=int, default=3,
+                        help="Profiled games per worker in benchmark mode (default: 3)")
     args = parser.parse_args()
 
     ov = {}
@@ -742,6 +1045,11 @@ def main():
 
         print(f"vs Alpha-Beta: {r['win_rate']:.1%}")
         s.close()
+
+    elif args.mode == "benchmark":
+        run_benchmark(config, num_workers=args.workers,
+                      num_games=args.benchmark_games,
+                      profile_games=args.profile_games)
 
     elif args.mode == "sanity":
         run_sanity_check(config)

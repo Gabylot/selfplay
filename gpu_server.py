@@ -100,7 +100,7 @@ class GPUInferenceServer:
 
     def __init__(self, config, request_queue, response_queues,
                  weight_queue, ready_event, shutdown_event,
-                 shared_buffers=None):
+                 shared_buffers=None, stats_queue=None):
         self.config = config
         self.request_queue = request_queue
         self.response_queues = response_queues
@@ -108,12 +108,29 @@ class GPUInferenceServer:
         self.ready_event = ready_event
         self.shutdown_event = shutdown_event
         self.shared_buffers = shared_buffers  # dict[worker_id → buffers]
+        self.stats_queue = stats_queue        # optional mp.Queue for benchmark timing
 
         inf_cfg = getattr(config, 'inference', None)
         self.max_batch = getattr(inf_cfg, 'max_batch', 64) if inf_cfg else 64
         self.max_wait_ms = getattr(inf_cfg, 'max_wait_ms', 3.0) if inf_cfg else 3.0
         prewarm_sizes = getattr(inf_cfg, 'prewarm_batch_sizes', [1, 8, 16, 32, 64, 128]) if inf_cfg else [1, 8, 16, 32, 64, 128]
         self.prewarm_sizes = prewarm_sizes
+
+        # ── Timing instrumentation (benchmark mode only) ──
+        self.stats = {
+            'prewarm_time': 0.0,
+            'wait_time': 0.0,
+            'gpu_forward_time': 0.0,
+            'shm_read_time': 0.0,
+            'shm_write_time': 0.0,
+            'weight_drain_time': 0.0,
+            'weight_load_time': 0.0,
+            'batch_requests': 0,
+            'single_requests': 0,
+            'aggregated_batches': 0,
+            'samples_processed': 0,
+            'server_total': 0.0,
+        }
 
     # ── Entry point (called in a subprocess) ────────────────────────────
 
@@ -122,6 +139,7 @@ class GPUInferenceServer:
         import torch_directml
 
         device = torch_directml.device()
+        t_start = time.perf_counter()
         print(f"[GPU-Server] DirectML device: {torch_directml.device_name(0)}")
 
         # Build two networks (network_id 0 = primary/latest,
@@ -158,7 +176,9 @@ class GPUInferenceServer:
                         times.append((time.perf_counter() - t) * 1000)
                     print(f"[GPU-Server] {label} bs={bs}: min={min(times):.1f}ms max={max(times):.1f}ms")
 
-        elapsed = (time.perf_counter() - t0) * 1000
+        t_prewarm = time.perf_counter() - t0
+        self.stats['prewarm_time'] = t_prewarm
+        elapsed = t_prewarm * 1000
         print(f"[GPU-Server] Shader pre-warming done in {elapsed:.0f} ms")
         self.ready_event.set()
 
@@ -168,21 +188,27 @@ class GPUInferenceServer:
         # ── Main inference loop ──
         while not self.shutdown_event.is_set():
             # Drain weight queue first (non-blocking)
+            t0 = time.perf_counter()
             self._drain_weight_queue(nets, device)
+            self.stats['weight_drain_time'] += time.perf_counter() - t0
 
             # Get one request (blocking, with timeout to allow weight checks)
             try:
+                t0 = time.perf_counter()
                 req = self.request_queue.get(timeout=0.5)
+                self.stats['wait_time'] += time.perf_counter() - t0
             except queue.Empty:
                 continue
 
             if req is None:
                 # Shutdown sentinel
                 self._send_shutdown_to_workers()
+                self._report_stats(t_start)
                 return
 
             self._handle_request(req, nets, device, net_a)
 
+        self._report_stats(t_start)
         print("[GPU-Server] Shutting down")
 
     def _handle_request(self, req, nets, device, net_a):
@@ -202,7 +228,9 @@ class GPUInferenceServer:
             if buf is None:
                 # No shared buffers for this worker — can't proceed
                 return
+            t0 = time.perf_counter()
             states = SharedMemoryTransport.read_states(buf, batch_size)
+            self.stats['shm_read_time'] += time.perf_counter() - t0
         else:
             batch_size = None
             states = fourth  # ndarray
@@ -214,10 +242,13 @@ class GPUInferenceServer:
                    (batch_size is None and states.ndim == 4)
 
         if is_batch:
+            self.stats['batch_requests'] += 1
             self._process_single_batch(
                 net, device, worker_id, request_id, states
             )
             return
+
+        self.stats['single_requests'] += 1
 
         # ── Single request: extract state and collect more for timer batching ──
         state = states[0] if is_shm else states  # (NUM_PLANES, 8, 8)
@@ -229,7 +260,9 @@ class GPUInferenceServer:
             if remaining <= 0:
                 break  # timer expired
             try:
+                t0 = time.perf_counter()
                 req2 = self.request_queue.get(timeout=min(remaining, 0.001))
+                self.stats['wait_time'] += time.perf_counter() - t0
                 if req2 is None:
                     # Shutdown — fire what we have first
                     break
@@ -241,10 +274,13 @@ class GPUInferenceServer:
                     buf2 = self.shared_buffers.get(w2)
                     if buf2 is None:
                         continue
+                    t0 = time.perf_counter()
                     states2 = SharedMemoryTransport.read_states(buf2, f2)
+                    self.stats['shm_read_time'] += time.perf_counter() - t0
 
                     if f2 > 1:
                         # Batch request arrived during our window
+                        self.stats['batch_requests'] += 1
                         if batch:
                             self._process_batch(nets, device, batch)
                         self._process_single_batch(
@@ -253,11 +289,13 @@ class GPUInferenceServer:
                         batch = []
                         break
                     # Single request — add to accumulation
+                    self.stats['single_requests'] += 1
                     batch.append((w2, rid2, nid2, states2[0]))
                 else:
                     # Queue-mode request
                     if f2.ndim == 4:
                         # Batch request arrived during our window
+                        self.stats['batch_requests'] += 1
                         if batch:
                             self._process_batch(nets, device, batch)
                         self._process_single_batch(
@@ -265,6 +303,7 @@ class GPUInferenceServer:
                         )
                         batch = []
                         break
+                    self.stats['single_requests'] += 1
                     batch.append((w2, rid2, nid2, f2))
 
             except queue.Empty:
@@ -299,10 +338,12 @@ class GPUInferenceServer:
 
         for nid in (0, 1):
             if latest[nid] is not None:
+                t0 = time.perf_counter()
                 buf = io.BytesIO(latest[nid])
                 state_dict = torch.load(buf, map_location='cpu', weights_only=True)
                 nets[nid].load_state_dict(state_dict)
                 nets[nid].eval()
+                self.stats['weight_load_time'] += time.perf_counter() - t0
 
     def _process_single_batch(self, net, device, worker_id, request_id, states):
         """Process a pre-stacked batch request ``(N, {NUM_PLANES}, 8, 8)`` immediately.
@@ -311,19 +352,24 @@ class GPUInferenceServer:
         buffers and sends only ``(request_id, batch_size)`` through the queue.
         In queue mode, sends ``(request_id, policies, values)`` through the queue.
         """
+        t0 = time.perf_counter()
         states_t = torch.from_numpy(states).float().to(device)
 
         with torch.no_grad():
             policy_logits, values = net(states_t)
             policies = F.softmax(policy_logits, dim=1).cpu().numpy()
             values = values.squeeze(-1).cpu().numpy()
+        self.stats['gpu_forward_time'] += time.perf_counter() - t0
 
         n = len(policies)
+        self.stats['samples_processed'] += n
 
         # ── Shared-memory response path ──
         if self.shared_buffers is not None and worker_id in self.shared_buffers:
             buf = self.shared_buffers[worker_id]
+            t0 = time.perf_counter()
             SharedMemoryTransport.write_policies_values(buf, policies, values)
+            self.stats['shm_write_time'] += time.perf_counter() - t0
             try:
                 self.response_queues[worker_id].put_nowait(
                     (request_id, n)
@@ -369,6 +415,7 @@ class GPUInferenceServer:
         for nid in order:
             group = groups[nid]
             net = nets.get(nid, list(nets.values())[0])
+            t0 = time.perf_counter()
             states = np.stack([r[3] for r in group], axis=0)  # (N, {NUM_PLANES}, 8, 8)
             states_t = torch.from_numpy(states).float().to(device)
 
@@ -376,6 +423,9 @@ class GPUInferenceServer:
                 policy_logits, values = net(states_t)
                 policies = F.softmax(policy_logits, dim=1).cpu().numpy()
                 values = values.squeeze(-1).cpu().numpy()
+            self.stats['gpu_forward_time'] += time.perf_counter() - t0
+            self.stats['samples_processed'] += len(group)
+            self.stats['aggregated_batches'] += 1
 
             # Distribute results to per-worker response queues
             for i, (worker_id, request_id, _, _) in enumerate(group):
@@ -384,11 +434,13 @@ class GPUInferenceServer:
                         and worker_id in self.shared_buffers):
                     buf = self.shared_buffers[worker_id]
                     # Write single result (batch_size=1) to shared memory
+                    t0 = time.perf_counter()
                     SharedMemoryTransport.write_policies_values(
                         buf,
                         policies[i:i+1],  # (1, 4672)
                         values[i:i+1],    # (1,)
                     )
+                    self.stats['shm_write_time'] += time.perf_counter() - t0
                     try:
                         self.response_queues[worker_id].put_nowait(
                             (request_id, 1)
@@ -410,5 +462,17 @@ class GPUInferenceServer:
         for wq in self.response_queues.values():
             try:
                 wq.put_nowait(None)
+            except Exception:
+                pass
+
+    def _report_stats(self, t_start):
+        """Send accumulated timing stats to the main process (benchmark mode).
+
+        No-op when ``stats_queue`` is None (normal training/eval runs).
+        """
+        self.stats['server_total'] = time.perf_counter() - t_start
+        if self.stats_queue is not None:
+            try:
+                self.stats_queue.put(self.stats)
             except Exception:
                 pass

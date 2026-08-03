@@ -593,7 +593,7 @@ def _worker_process(worker_id, task_queue, result_queue, config_dict, shutdown_e
 # ─────────────────────────────────────────────────────────────────────────────
 
 class ParallelSelfPlay:
-    def __init__(self, config, num_workers=8):
+    def __init__(self, config, num_workers=8, stats_queue=None):
         self.config = config
         self.num_workers = num_workers
         self._workers = []
@@ -604,6 +604,8 @@ class ParallelSelfPlay:
         self._use_gpu = (getattr(config, 'inference', None)
                          and getattr(config.inference, 'use_gpu', False))
         self._gpu_server_process = None
+        self._stats_queue = stats_queue  # optional mp.Queue for benchmark timing
+        self._gpu_stats = None
 
         # Shared-memory transport for zero-copy IPC
         self._use_shared_memory = False
@@ -678,6 +680,7 @@ class ParallelSelfPlay:
             ready_event=self._gpu_ready,
             shutdown_event=self._gpu_shutdown,
             shared_buffers=shared_bufs,
+            stats_queue=self._stats_queue,
         )
         self._gpu_server_process = mp.Process(target=server.run, daemon=True)
         self._gpu_server_process.start()
@@ -797,4 +800,14 @@ class ParallelSelfPlay:
             self._gpu_server_process.join(timeout=10)
             if self._gpu_server_process.is_alive():
                 self._gpu_server_process.kill()
+            # Drain the server's timing stats (benchmark mode)
+            if self._stats_queue is not None:
+                try:
+                    self._gpu_stats = self._stats_queue.get(timeout=5)
+                except queue.Empty:
+                    self._gpu_stats = None
             self._gpu_server_process = None
+
+    def get_gpu_stats(self):
+        """Return the GPU server timing dict, or None if unavailable."""
+        return self._gpu_stats
