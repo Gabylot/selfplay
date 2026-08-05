@@ -54,7 +54,9 @@ Board Representation — matches the AlphaZero paper's M*T + L structure
     Note on no-progress-count plane: board.halfmove_clock, normalized by
     NO_PROGRESS_NORM (100 half-moves = the 50-move-rule threshold).
 
-    Note on the move-count plane: normalized by MOVE_COUNT_NORM.
+    Note on the move-count plane: normalized by MOVE_COUNT_NORM, which is
+    derived from the config's max_game_length (half-moves) divided by 2
+    (full moves), so the plane reaches ~1.0 at the game-length cap.
 
     Note: En passant is NOT encoded as a separate plane — it is implicitly
     determined by the board state (the en-passant square is a property of
@@ -73,6 +75,8 @@ import numpy as np
 from wrapt import lru_cache
 import chess
 from typing import Optional
+
+from config import get_config
 
 # Piece type to plane index mapping (within a single 14-plane history group)
 # Planes 0-5 = P1 (current player) pieces, 6-11 = P2 (opponent) pieces.
@@ -123,7 +127,10 @@ NUM_EXTRA_PLANES = 7
 NUM_PLANES = NUM_HISTORY_PLANES + NUM_EXTRA_PLANES  # 119
 
 # Normalization divisors for the constant-valued planes.
-MOVE_COUNT_NORM = 100.0
+# Move-count divisor: max_game_length is in half-moves (plies), but
+# board.fullmove_number counts full moves, so divide by 2.  The default
+# max_game_length = 150 half-moves gives a norm of 75 full moves.
+MOVE_COUNT_NORM = get_config().selfplay.max_game_length / 2.0
 # No-progress = halfmove clock; 100 half-moves triggers the 50-move rule.
 NO_PROGRESS_NORM = 100.0
 
