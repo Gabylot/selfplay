@@ -13,8 +13,10 @@ Usage:
     python main.py evaluate
     python main.py sanity
     python main.py benchmark [--workers N] [--benchmark-games N] [--profile-games N]
+    python main.py tournament --model-dir output/default/checkpoints [--system round_robin|swiss]
 """
-
+import sys, os
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import argparse, sys, os, time, threading, signal, io
 from pathlib import Path
 
@@ -939,12 +941,73 @@ def run_sanity_check(config):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Tournament mode
+# ─────────────────────────────────────────────────────────────────────────────
+
+def run_tournament_mode(config, gui_enabled=True, model_dir=None, models=None,
+                        num_workers=1):
+    """Run a tournament between invited model checkpoints.
+
+    Uses the existing worker pipeline (network-vs-network gating eval
+    tasks) to play exactly one game at a time, streaming each game to a
+    dedicated tournament view that shows the live board, MCTS statistics
+    and running standings.
+    """
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"[INFO] Device: {device}")
+    use_gpu = getattr(config, 'inference', None) and getattr(config.inference, 'use_gpu', False)
+    if use_gpu:
+        print("[INFO] Inference: GPU (DirectML centralized server)")
+
+    from tournament import (discover_models, build_schedule, Tournament,
+                            run_tournament, print_standings)
+    from gui.live_game import LiveGameState
+
+    if num_workers is None:
+        num_workers = 1
+    print(f"[INFO] Tournament workers: {num_workers} (one game at a time)")
+
+    model_paths = [m.strip() for m in models.split(',')] if models else None
+    players = discover_models(model_dir=model_dir, model_paths=model_paths)
+    for p in players:
+        print(f"  Invited: {p['name']}  ({p['path']})")
+
+    schedule = build_schedule(config, players)
+    tournament = Tournament(config, players, schedule)
+    print(f"[INFO] System: {tournament.system} — "
+          f"players={len(players)} games={tournament.total_planned}")
+
+    # Dedicated tournament board (separate socket namespace).
+    tournament_live = LiveGameState(max_history=20, worker_id=-2,
+                                    is_eval=True, event_tag='tournament')
+    tournament.live_game = tournament_live  # wired before the GUI thread reads it
+
+    if gui_enabled:
+        from gui.app import start_gui_server
+        threading.Thread(
+            target=start_gui_server,
+            args=(None, config, [], None),
+            kwargs={'tournament': tournament},
+            daemon=True,
+        ).start()
+        print(f"[INFO] Tournament GUI → http://{config.gui.host}:{config.gui.port}/tournament")
+
+    def _cb(t, result):
+        print(f"    => {result}")
+
+    print(f"\n{'='*60}\n  TOURNAMENT START\n{'='*60}\n")
+    run_tournament(config, live_game=tournament_live, tournament=tournament,
+                   num_workers=num_workers, progress_cb=_cb)
+    print_standings(tournament)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Entry point
 # ─────────────────────────────────────────────────────────────────────────────
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("mode", choices=["train","gui","evaluate","sanity","benchmark"])
+    parser.add_argument("mode", choices=["train","gui","evaluate","sanity","benchmark","tournament"])
     parser.add_argument("--gui",      action="store_true")
     parser.add_argument("--config",   type=str, default=None)
     parser.add_argument("--sims",     type=int, default=None)
@@ -956,6 +1019,20 @@ def main():
                         help="Self-play games to collect in benchmark mode (default: 10)")
     parser.add_argument("--profile-games", type=int, default=3,
                         help="Profiled games per worker in benchmark mode (default: 3)")
+    # Tournament args
+    parser.add_argument("--model-dir", type=str, default=None,
+                        help="Directory of checkpoints to invite (scans *.pt)")
+    parser.add_argument("--models", type=str, default=None,
+                        help="Comma-separated invited models as 'name:path' or just 'path'")
+    parser.add_argument("--system", type=str, default=None,
+                        choices=["round_robin", "rr", "swiss", "sw"],
+                        help="Tournament system (default: from config)")
+    parser.add_argument("--games-per-pair", type=int, default=None,
+                        help="Games played per pair (colors alternate)")
+    parser.add_argument("--swiss-rounds", type=int, default=None,
+                        help="Number of Swiss rounds")
+    parser.add_argument("--no-gui", action="store_true",
+                        help="Disable the tournament GUI view")
     args = parser.parse_args()
 
     ov = {}
@@ -963,6 +1040,9 @@ def main():
     if args.blocks:   ov.setdefault('network',{})['num_residual_blocks']=args.blocks
     if args.filters:  ov.setdefault('network',{})['num_filters']=args.filters
     if args.run_name: ov.setdefault('main',{})['run_name']=args.run_name
+    if args.system:          ov.setdefault('tournament',{})['system']=args.system
+    if args.games_per_pair:  ov.setdefault('tournament',{})['games_per_pair']=args.games_per_pair
+    if args.swiss_rounds:    ov.setdefault('tournament',{})['swiss_rounds']=args.swiss_rounds
     config = get_config(path=args.config, overrides=ov if ov else None)
 
     signal.signal(signal.SIGINT,  signal_handler)
@@ -1053,9 +1133,14 @@ def main():
                       num_games=args.benchmark_games,
                       profile_games=args.profile_games)
 
+    elif args.mode == "tournament":
+        run_tournament_mode(config, gui_enabled=not args.no_gui,
+                            model_dir=args.model_dir,
+                            models=args.models,
+                            num_workers=args.workers)
+
     elif args.mode == "sanity":
         run_sanity_check(config)
-
 
 if __name__ == "__main__":
     main()
