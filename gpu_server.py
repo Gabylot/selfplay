@@ -137,11 +137,9 @@ class GPUInferenceServer:
 
     def run(self):
         """Main loop — blocks until shutdown."""
-        import torch_directml
-
-        device = torch_directml.device()
+        device = torch.device("cuda")
         t_start = time.perf_counter()
-        print(f"[GPU-Server] DirectML device: {torch_directml.device_name(0)}")
+        print(f"[GPU-Server] ROCm device: {torch.cuda.get_device_name(0)}")
 
         # Build two networks (network_id 0 = primary/latest,
         # network_id 1 = best/secondary for gating evaluation)
@@ -247,11 +245,18 @@ class GPUInferenceServer:
         # timer resolution issue where get(timeout=0.001) takes ~15ms.
         # get_nowait() returns immediately, so the short-poll pattern
         # (break on empty queue) adds zero latency.
-        deadline = time.monotonic() + self.max_wait_ms / 1000.0
+        #
+        # CRITICAL: use time.perf_counter() for the deadline, NOT
+        # time.monotonic().  On Windows monotonic() uses GetTickCount64
+        # which only advances in ~15.6ms ticks, so a 2ms deadline would
+        # silently stretch to ~15.6ms (exactly the Windows timer issue
+        # documented above, but on the deadline check instead of get()).
+        # perf_counter() uses QueryPerformanceCounter (sub-ms resolution).
+        deadline = time.perf_counter() + self.max_wait_ms / 1000.0
         t_agg_start = time.perf_counter()
 
         while total_samples < self.max_batch:
-            if time.monotonic() >= deadline:
+            if time.perf_counter() >= deadline:
                 break  # timer expired
 
             try:
@@ -274,7 +279,7 @@ class GPUInferenceServer:
                     pending = [item2]
                     total_samples = item2['batch_size']
                     # Reset deadline for the new batch
-                    deadline = time.monotonic() + self.max_wait_ms / 1000.0
+                    deadline = time.perf_counter() + self.max_wait_ms / 1000.0
                 else:
                     pending.append(item2)
                     total_samples += item2['batch_size']
