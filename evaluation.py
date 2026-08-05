@@ -193,6 +193,7 @@ def play_match(network_a: AlphaZeroNet, network_b: AlphaZeroNet,
             dirichlet_epsilon=0.0,
             batch_size=getattr(config.mcts, 'batch_size', 1),
             c_virtual_loss=getattr(config.mcts, 'c_virtual_loss', 0.5),
+            force_mate_in_one=getattr(config.mcts, 'force_mate_in_one', True),
         )
         mcts_b = MCTS(
             network=network_b,
@@ -202,6 +203,7 @@ def play_match(network_a: AlphaZeroNet, network_b: AlphaZeroNet,
             dirichlet_epsilon=0.0,
             batch_size=getattr(config.mcts, 'batch_size', 1),
             c_virtual_loss=getattr(config.mcts, 'c_virtual_loss', 0.5),
+            force_mate_in_one=getattr(config.mcts, 'force_mate_in_one', True),
         )
         
         # Notify live game viewer of new game
@@ -295,6 +297,7 @@ def play_match_vs_alpha_beta(network: AlphaZeroNet, config,
             dirichlet_epsilon=0.0,
             batch_size=getattr(config.mcts, 'batch_size', 1),
             c_virtual_loss=getattr(config.mcts, 'c_virtual_loss', 0.5),
+            force_mate_in_one=getattr(config.mcts, 'force_mate_in_one', True),
         )
         
         while not board.is_game_over() and move_count < config.selfplay.max_game_length:

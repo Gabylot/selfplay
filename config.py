@@ -23,11 +23,11 @@ def load_config(path: Optional[str] = None) -> dict:
     # Ensure all sections exist with defaults
     defaults = {
         "network": {
-            "num_residual_blocks": 4,
+            "num_residual_blocks": 8,
             "num_filters": 64,
-            "num_policy_channels": 32,
-            "num_value_channels": 16,
-            "value_fc_size": 256,
+            "num_policy_channels": 64,
+            "num_value_channels": 1,
+            "value_fc_size": 128,
         },
         "mcts": {
             "num_simulations": 400,
@@ -36,6 +36,7 @@ def load_config(path: Optional[str] = None) -> dict:
             "dirichlet_epsilon": 0.4,
             "batch_size": 8,
             "c_virtual_loss": 0.5,
+            "force_mate_in_one": True,
         },
         "selfplay": {
             "network_source": "latest",
@@ -47,6 +48,20 @@ def load_config(path: Optional[str] = None) -> dict:
             "temperature_threshold": 30,
             "temperature_high": 1.0,
             "temperature_low": 0.1,
+            # Exact forced-mate override for endgame conversion
+            # (see forced_mate.py).  When enabled, self-play move selection
+            # is overridden by a proof search when a forced mate within
+            # force_mate_max_plies exists on a board with
+            # <= force_mate_gate_pieces pieces.
+            "force_mate": False,
+            "force_mate_max_plies": 5,
+            "force_mate_gate_pieces": 8,
+            # Deeper proof search for very sparse positions
+            # (<= force_mate_deep_gate_pieces pieces), where the search tree
+            # is small enough to stay cheap.  Converts longer endgames
+            # (e.g. KR vs K mate-in-4/5) that the shallow limit misses.
+            "force_mate_deep_plies": 9,
+            "force_mate_deep_gate_pieces": 4,
         },
         "buffer": {
             "max_size": 100000,
@@ -85,10 +100,17 @@ def load_config(path: Optional[str] = None) -> dict:
             "port": 5000,
             "refresh_interval": 1.0,
         },
+        "tournament": {
+            "system": "round_robin",
+            "games_per_pair": 2,
+            "swiss_rounds": 3,
+            "elo_k": 32,
+            "initial_elo": 1000,
+        },
         "inference": {
             "use_gpu": False,
             "use_shared_memory": True,
-            "state_dtype": "float16",
+            "state_dtype": "float32",
             "max_batch": 256,
             "max_wait_ms": 2.0,
             "prewarm_batch_sizes": [1, 8, 16, 32, 64, 128, 256],

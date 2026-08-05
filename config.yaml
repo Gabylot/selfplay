@@ -2,10 +2,10 @@
 
 # --- Network Architecture ---
 network:
-  num_residual_blocks: 4
+  num_residual_blocks: 8
   num_filters: 64
   num_policy_channels: 64
-  num_value_channels: 64
+  num_value_channels: 1
   value_fc_size: 128
 
 # --- MCTS ---
@@ -13,14 +13,15 @@ mcts:
   num_simulations: 800       # Per move (tunable: 50-800)
   c_puct: 1.5                # PUCT exploration constant
   dirichlet_alpha: 0.25        # Dirichlet noise alpha
-  dirichlet_epsilon: 0.25     # Weight of noise vs prior
-  batch_size: 32               # Batch size for tree-parallel MCTS (1 = sequential, no virtual loss)
+  dirichlet_epsilon: 0.3     # Weight of noise vs root prior
+  batch_size: 128               # Batch size for tree-parallel MCTS (1 = sequential, no virtual loss)
   c_virtual_loss: 0.5         # Virtual loss penalty for batch MCTS
+  force_mate_in_one: false     # Force a one-hot policy for a root checkmate move (mate-in-1)
 
 # --- Self-Play ---
 selfplay:
   network_source: latest      # "latest" (always use newest network) or "gated_best"
-  max_game_length: 200        # Max half-moves before adjudication
+  max_game_length: 300        # Max half-moves before adjudication
   adjudicate_material: false   # When max length hit, judge by material instead of draw
   # Material values for adjudication
   piece_values:
@@ -34,10 +35,22 @@ selfplay:
   temperature_low: 0.1
   adjudicate_graded: false     # use tanh grading instead of flat ±1
   adjudicate_scaling: 7.0     # queen = ~0.76, rook = ~0.51, pawn = ~0.11
+  # Exact forced-mate override for endgame conversion.
+  # When true, self-play move selection is overridden by a proof search
+  # when a forced mate within force_mate_max_plies exists on a board
+  # with <= force_mate_gate_pieces pieces.
+  force_mate: false
+  force_mate_max_plies: 5
+  force_mate_gate_pieces: 8
+  # Deeper proof search for very sparse positions (<= 4 pieces), where the
+  # search tree is small enough to stay cheap.  Converts longer endgames
+  # (e.g. KR vs K mate-in-4/5) that the shallow 5-ply limit misses.
+  force_mate_deep_plies: 9
+  force_mate_deep_gate_pieces: 4
 
 # --- Replay Buffer ---
 buffer:
-  max_size: 100000            # Max positions in replay buffer
+  max_size: 50000            # Max positions in replay buffer
 
 # --- Training ---
 training:
@@ -51,7 +64,7 @@ training:
 
 # --- Evaluation ---
 evaluation:
-  eval_interval: 1000         # Run eval every N self-play games
+  eval_interval: 2000         # Run eval every N self-play games
   gate_games: 50              # Games for network-vs-network gating
   gate_win_threshold: 0.55    # Win rate needed to promote
   ref_opponent_games: 50      # Games vs alpha-beta reference
@@ -86,14 +99,22 @@ gui:
   port: 5000
   refresh_interval: 1.0       # Seconds between live updates
 
+# --- Tournament ---
+tournament:
+  system: round_robin          # "round_robin" or "swiss"
+  games_per_pair: 2            # Games played per pair (colors alternate)
+  swiss_rounds: 3              # Number of rounds when system = swiss
+  elo_k: 32                    # K-factor for tournament Elo tracking
+  initial_elo: 1000            # Starting Elo for every invited model
+
 # --- Inference ---
 inference:
   use_gpu: true              # true = centralized GPU inference server, false = CPU per-worker
   use_shared_memory: true    # true = shared-memory IPC (zero-copy), false = queue-based pickle
-  state_dtype: "float16"     # dtype for shared-memory buffers: "float16" (halves size) or "float32"
-  max_batch: 256               # Max samples per GPU forward pass (aggregated across workers)
+  state_dtype: "float32"     # dtype for shared-memory buffers: "float32" (fast, no conversion) or "float16" (halves size)
+  max_batch: 512             # Max samples per GPU forward pass (aggregated across workers)
   max_wait_ms: 2.0            # Max ms to wait before firing a partial batch
-  prewarm_batch_sizes: [1, 8, 16, 32, 64, 128, 256]  # Batch sizes to pre-warm
+  prewarm_batch_sizes: [1, 8, 16, 32, 64, 128, 256, 512]  # Batch sizes to pre-warm
 
 # --- Main ---
 main:
