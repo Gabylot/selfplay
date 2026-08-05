@@ -14,6 +14,7 @@ _stats = None
 _config = None
 _worker_live_games = []
 _eval_live_game = None
+_tournament = None  # tournament.Tournament instance (GUI state provider)
 
 
 @app.route('/chess_pieces/<path:fn>')
@@ -22,6 +23,19 @@ def chess_piece(fn):
 
 @app.route('/')
 def index(): return render_template('index.html')
+
+@app.route('/tournament')
+def tournament(): return render_template('tournament.html')
+
+@app.route('/api/tournament/standings')
+def api_tournament_standings():
+    if _tournament is None: return jsonify({'error':'no tournament'}),503
+    return jsonify(_tournament.standings())
+
+@app.route('/api/tournament/status')
+def api_tournament_status():
+    if _tournament is None: return jsonify({'error':'no tournament'}),503
+    return jsonify(_tournament.status())
 
 @app.route('/api/summary')
 def api_summary():
@@ -124,18 +138,40 @@ def on_request_replay_eval_game(data):
         game = _eval_live_game.get_game_by_id(data.get('game_id'))
         if game: socketio.emit('replay_eval_game', game)
 
+# ── Tournament ──────────────────────────────────────────────────────────────
 
-def start_gui_server(stats=None, config=None, worker_live_games=None, eval_live_game=None):
-    global _stats, _config, _worker_live_games, _eval_live_game
+@socketio.on('request_tournament_live_state')
+def on_request_tournament_live_state():
+    if _tournament and _tournament.live_game:
+        socketio.emit('tournament_live_game_update', _tournament.live_game.get_state())
+
+@socketio.on('request_tournament_game_history')
+def on_request_tournament_game_history():
+    if _tournament and _tournament.live_game:
+        socketio.emit('tournament_game_history', _tournament.live_game.get_game_history())
+
+@socketio.on('request_replay_tournament_game')
+def on_request_replay_tournament_game(data):
+    if _tournament and _tournament.live_game:
+        game = _tournament.live_game.get_game_by_id(data.get('game_id'))
+        if game: socketio.emit('replay_tournament_game', game)
+
+
+def start_gui_server(stats=None, config=None, worker_live_games=None, eval_live_game=None,
+                     tournament=None):
+    global _stats, _config, _worker_live_games, _eval_live_game, _tournament
     _stats             = stats
     _config            = config
     _worker_live_games = worker_live_games or []
     _eval_live_game    = eval_live_game
+    _tournament        = tournament
 
     for wlg in _worker_live_games:
         wlg.set_socketio(socketio)
     if _eval_live_game:
         _eval_live_game.set_socketio(socketio)
+    if _tournament and _tournament.live_game:
+        _tournament.live_game.set_socketio(socketio)
 
     host = config.gui.host if config else "127.0.0.1"
     port = config.gui.port if config else 5000

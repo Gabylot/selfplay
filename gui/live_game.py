@@ -24,18 +24,23 @@ class LiveGameState:
     _MIN_EMIT_INTERVAL = 0.1  # 100ms
 
     def __init__(self, socketio=None, max_history: int = 20,
-                 worker_id: int = -1, is_eval: bool = False):
+                 worker_id: int = -1, is_eval: bool = False,
+                 event_tag: str = None):
         """
         Args:
             socketio:   Flask-SocketIO instance for push events.
             max_history: Max completed games to keep for replay.
             worker_id:  Index of the worker this state belongs to (-1 = unset).
             is_eval:    If True, emits eval-specific events instead of worker events.
+            event_tag:  Optional tag that namespaces eval-style emit events
+                        (e.g. 'tournament' → 'tournament_live_game_update').
+                        Defaults to 'eval' for backward compatibility.
         """
         self._lock       = threading.Lock()
         self._socketio   = socketio
         self._worker_id  = worker_id
         self._is_eval    = is_eval
+        self._event_tag  = event_tag or 'eval'
 
         # Current game state
         self._game_id:    int          = 0
@@ -223,10 +228,11 @@ class LiveGameState:
     def _do_emit(self):
         """Actual emit logic — sends the appropriate Socket.IO event(s)."""
         if self._is_eval:
-            # Eval board — single full-state event
+            # Dedicated eval-style board — single full-state event, namespaced
+            # by event_tag so multiple boards (eval, tournament) don't collide.
             with self._lock:
                 state = self._full_state()
-            self._socketio.emit('eval_live_game_update', state)
+            self._socketio.emit(f'{self._event_tag}_live_game_update', state)
         else:
             # Self-play / eval-in-grid workers
             # 1. Compact tile update (always, for the grid)

@@ -1,0 +1,239 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>AlphaZero — Tournament</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/chess.js/0.10.3/chess.min.js"></script>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@chrisoakman/chessboardjs@1.0.0/dist/chessboard-1.0.0.min.css"/>
+<script src="https://code.jquery.com/jquery-3.7.1.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@chrisoakman/chessboardjs@1.0.0/dist/chessboard-1.0.0.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.7.4/socket.io.min.js"></script>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:'Segoe UI',Arial,sans-serif;background:#111827;color:#d1d5db}
+.hdr{background:#0f172a;padding:12px 20px;border-bottom:1px solid #1e3a5f;display:flex;align-items:center;gap:12px}
+.hdr h1{font-size:17px;color:#f1f5f9;letter-spacing:.3px}
+.hdr .sub{font-size:11px;color:#475569;margin-left:auto}
+.conn{font-size:11px;background:#0a1020;padding:3px 10px;border-radius:4px}
+.wrap{max-width:1400px;margin:0 auto;padding:14px}
+.card{background:#1e293b;border:1px solid #1e3a5f;border-radius:8px;padding:14px;margin-bottom:14px}
+.card h2{font-size:11px;color:#64748b;text-transform:uppercase;letter-spacing:1.2px;margin-bottom:10px}
+.seclbl{font-size:9px;color:#374151;text-transform:uppercase;letter-spacing:1px;margin-bottom:3px}
+.badge{display:inline-block;padding:2px 7px;border-radius:9px;font-size:9px;font-weight:700;text-transform:uppercase}
+.badge.running{background:#14532d;color:#86efac}.badge.finished{background:#450a0a;color:#fca5a5}.badge.idle{background:#1e293b;color:#475569}
+.mlist{background:#080e1a;border-radius:5px;padding:7px;max-height:300px;overflow-y:auto;font-family:'Courier New',monospace;font-size:11px;line-height:1.7;scrollbar-width:thin;scrollbar-color:#1e3a5f transparent}
+.mpair{display:flex;gap:3px}.mnum{color:#ffffff;min-width:26px;text-align:right;margin-right:3px}
+.mv{padding:1px 3px;border-radius:3px;cursor:pointer}.mv:hover{background:#1e3a5f}
+.mv.wm{color:#cbd5e1}.mv.bm{color:#60a5fa}.mv.cur{background:#ef4444;color:#fff}
+.minl{font-size:9px;color:#374151;margin-left:2px}.mv.cur .minl{color:#fecaca}
+.mbox{background:#080e1a;border-radius:5px;padding:7px;font-size:11px;max-height:300px;overflow-y:auto;scrollbar-width:thin;scrollbar-color:#1e3a5f transparent}
+.mbox table{width:100%;border-collapse:collapse}
+.mbox th{font-size:9px;color:#ef4444;padding:2px 5px;text-align:right;border-bottom:1px solid #1e3a5f}.mbox th:first-child{text-align:left}
+.mbox td{padding:2px 5px;text-align:right;color:#64748b}.mbox td:first-child{text-align:left;color:#d1d5db}
+.mbox tr.sel td{color:#22c55e;font-weight:700}
+.vinner{display:grid;grid-template-columns:auto 1fr;gap:14px;align-items:start}
+@media(max-width:860px){.vinner{grid-template-columns:1fr}}
+.bwrap{background:#0f172a;border-radius:7px;padding:10px}
+.ctrl{display:flex;gap:5px;flex-wrap:wrap;align-items:center;margin-bottom:8px}
+.ctrl button{background:#1e3a5f;color:#cbd5e1;border:1px solid #2d4f7c;border-radius:4px;padding:4px 10px;cursor:pointer;font-size:11px}
+.ctrl button:hover{background:#2d4f7c}
+table.dt{width:100%;border-collapse:collapse;font-size:12px}
+table.dt th{color:#ef4444;font-size:9px;text-transform:uppercase;letter-spacing:.5px;padding:4px 7px;text-align:left;border-bottom:1px solid #1e3a5f}
+table.dt td{padding:5px 7px;border-bottom:1px solid #0f172a;color:#cbd5e1}
+table.dt tr:hover td{background:#0f172a}
+.strip{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:14px}
+.sbox{background:#1e293b;border:1px solid #1e3a5f;border-radius:6px;padding:8px 12px;flex:1;min-width:120px;text-align:center}
+.sbox .l{font-size:9px;color:#475569;text-transform:uppercase;letter-spacing:1px}
+.sbox .v{font-size:18px;font-weight:700;margin-top:2px}
+.green{color:#22c55e}.amber{color:#f59e0b}.sky{color:#38bdf8}.purple{color:#a78bfa}.red{color:#ef4444}.muted{color:#6b7280}
+.now{border:1px solid #22c55e;box-shadow:0 0 0 1px #22c55e}
+</style>
+</head>
+<body>
+<div class="hdr">
+  <h1>AlphaZero — Tournament</h1>
+  <div class="conn"><span id="cdot" style="color:#ef4444">●</span> <span id="ctxt" style="margin-left:3px">Connecting…</span></div>
+  <div class="sub">system <b id="hsys">—</b> · phase <b id="hphase">—</b></div>
+</div>
+<div class="wrap">
+
+<div class="strip">
+  <div class="sbox"><div class="l">System</div><div class="v sky" id="ssys">—</div></div>
+  <div class="sbox"><div class="l">Phase</div><div class="v amber" id="sphase">—</div></div>
+  <div class="sbox"><div class="l">Game</div><div class="v green" id="sgame">0</div></div>
+  <div class="sbox"><div class="l">Round</div><div class="v purple" id="sround">—</div></div>
+  <div class="sbox"><div class="l">Players</div><div class="v muted" id="splayers">0</div></div>
+</div>
+
+<div class="card">
+  <h2>Live Match <span id="minfo" style="color:#f87171;font-size:10px;font-weight:normal;margin-left:8px"></span></h2>
+  <div class="vinner">
+    <div class="bwrap"><div id="tboard" style="width:340px"></div></div>
+    <div>
+      <div class="ctrl">
+        <span style="font-size:11px;color:#475569">Move <b id="tmov">0</b></span>
+        <span class="badge idle" id="tbadge">IDLE</span>
+        <button id="tpbtn" class="active" onclick="tPause()">⏸ Pause</button>
+        <button onclick="tBack()">◀ Back</button>
+        <button onclick="tFwd()">▶ Fwd</button>
+        <button onclick="tStart()">⏮ Start</button>
+        <button onclick="tEnd()">⏭ End</button>
+        <button id="tlbtn" onclick="tLive()" style="display:none">🔴 Live</button>
+      </div>
+      <div id="tres" style="font-size:12px;color:#475569;display:none;margin-bottom:8px"></div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:7px">
+        <div><div class="seclbl">Move List</div><div class="mlist" id="tml"></div></div>
+        <div><div class="seclbl">MCTS Candidates (N W Q P)</div><div class="mbox" id="tmcts"><div style="color:#1f2937;text-align:center;padding:8px">No data</div></div></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="card">
+  <h2>Standings</h2>
+  <table class="dt"><thead><tr><th>Rank</th><th>Model</th><th>Games</th><th>W</th><th>L</th><th>D</th><th>Pts</th><th>Win %</th><th>Elo</th></tr></thead>
+  <tbody id="stbl"><tr><td colspan="9" style="text-align:center;color:#1f2937">No standings yet</td></tr></tbody></table>
+</div>
+
+</div>
+
+<script>
+let tboard=null, tSt={moves:[],fens:[],mcts:[],status:'idle',idx:-1};
+let tPaused=false,tIv=null,tReplaying=false,tReplayData=null,tMovesUpTo=-1,tLastGid=0;
+
+function initTBoard(){tboard=Chessboard('tboard',{position:'start',showNotation:true,pieceTheme:'/chess_pieces/{piece}.png'});}
+
+function applyT(data){
+  if(!data)return;
+  const nm=data.moves||[],nf=data.fens||[],nc=data.mcts_stats_per_move||[];
+  if(!tReplaying){
+    if(data.game_id&&data.game_id!==tLastGid){
+      tLastGid=data.game_id;
+      tSt={moves:[],fens:[],mcts:[],status:data.status||'idle',idx:-1};
+      tMovesUpTo=-1; tboard&&tboard.position('start',false);
+    }
+    tSt.status=data.status||'idle';
+    while(tMovesUpTo<nm.length-1){tMovesUpTo++;tSt.moves.push(nm[tMovesUpTo]);tSt.fens.push(nf[tMovesUpTo]);if(tMovesUpTo<nc.length)tSt.mcts.push(nc[tMovesUpTo]);}
+    if(!tPaused)tSt.idx=tSt.fens.length-1;
+  }
+  renderT(data);
+}
+
+function renderT(data){
+  const src=tReplaying?tReplayData:data;
+  const badge=document.getElementById('tbadge');
+  if(badge){badge.className=`badge ${tSt.status}`;badge.textContent=tSt.status.toUpperCase();}
+  document.getElementById('tmov').textContent=tSt.idx+1;
+  if(src&&src.match_info)document.getElementById('minfo').textContent=src.match_info;
+  if(tboard){
+    if(tSt.idx>=0&&tSt.idx<tSt.fens.length)tboard.position(tSt.fens[tSt.idx],false);
+    else tboard.position('start',false);
+  }
+  renderML(tSt,'tml',i=>{tSt.idx=i;renderT(null);});
+  renderMCTS(tSt,'tmcts');
+  const rEl=document.getElementById('tres');
+  if(rEl&&src&&src.result){
+    const c=src.result==='1-0'?'#3b82f6':src.result==='0-1'?'#ef4444':'#475569';
+    rEl.innerHTML=`<span style="color:${c};font-weight:700">${src.result}</span> — ${src.termination||''}`;
+    rEl.style.display='block';
+  } else if(rEl)rEl.style.display='none';
+}
+
+function tPause(){tPaused=!tPaused;const b=document.getElementById('pbtn');if(tPaused){b.textContent='▶ Play';b.classList.remove('active');tStop();}else{b.textContent='⏸ Pause';b.classList.add('active');tPlay();}}
+function tPlay(){tStop();tIv=setInterval(()=>{if(tSt.idx<tSt.fens.length-1){tSt.idx++;renderT(null);}else tStop();},500);}
+function tStop(){if(tIv){clearInterval(tIv);tIv=null;}}
+function tBack(){if(tSt.idx>0){tSt.idx--;renderT(null);}}
+function tFwd(){if(tSt.idx<tSt.fens.length-1){tSt.idx++;renderT(null);}}
+function tStart(){tSt.idx=-1;tboard&&tboard.position('start',true);renderML(tSt,'tml',i=>{tSt.idx=i;renderT(null);});renderMCTS(tSt,'tmcts');}
+function tEnd(){if(tSt.fens.length){tSt.idx=tSt.fens.length-1;renderT(null);}}
+function tLive(){tReplaying=false;tReplayData=null;document.getElementById('tlbtn').style.display='none';socket.emit('request_tournament_live_state');}
+
+function renderML(st,elId,onClick){
+  const el=document.getElementById(elId); if(!el)return;
+  let h='';
+  for(let i=0;i<st.moves.length;i+=2){
+    const mn=Math.floor(i/2)+1, wm=st.moves[i], bm=i+1<st.moves.length?st.moves[i+1]:null;
+    h+=`<div class="mpair"><span class="mnum">${mn}.</span><span class="mv wm${i===st.idx?' cur':''}" onclick="(${onClick.toString()})(${i})">${wm}<span class="minl">${inl(st,i)}</span></span>`;
+    if(bm)h+=`<span class="mv bm${i+1===st.idx?' cur':''}" onclick="(${onClick.toString()})(${i+1})">${bm}<span class="minl">${inl(st,i+1)}</span></span>`;
+    h+='</div>';
+  }
+  el.innerHTML=h;
+  const cur=el.querySelector('.mv.cur');
+  if(cur)el.scrollTop=cur.offsetTop-el.clientHeight/2+cur.offsetHeight/2;
+}
+function inl(st,i){
+  if(!st.mcts||i>=st.mcts.length)return'';
+  const ms=st.mcts[i]; if(!ms||!ms.selected_move)return'';
+  const c=(ms.candidates||[]).find(x=>x.move===ms.selected_move);
+  if(!c)return''; return` (N:${c.N} Q:${(-c.Q).toFixed(2)})`;
+}
+function renderMCTS(st,elId){
+  const el=document.getElementById(elId); if(!el)return;
+  const idx=tSt.idx;
+  if(idx<0||!st.mcts||idx>=st.mcts.length){el.innerHTML='<div style="color:#1f2937;text-align:center;padding:8px">No data</div>';return;}
+  const ms=st.mcts[idx]; if(!ms||!ms.candidates||!ms.candidates.length){el.innerHTML='<div style="color:#1f2937;text-align:center;padding:8px">No data</div>';return;}
+  let h='<table><thead><tr><th>Move</th><th>N</th><th>W</th><th>Q</th><th>P</th></tr></thead><tbody>';
+  for(const c of ms.candidates){
+    const s=c.move===ms.selected_move?' class="sel"':'';
+    h+=`<tr${s}><td>${c.move}</td><td>${c.N}</td><td>${(-c.W).toFixed(2)}</td><td>${(-c.Q).toFixed(2)}</td><td>${c.P.toFixed(3)}</td></tr>`;
+  }
+  el.innerHTML=h+'</tbody></table>';
+}
+
+const socket=io();
+socket.on('connect',()=>{
+  document.getElementById('cdot').style.color='#22c55e';
+  document.getElementById('ctxt').textContent='Connected';
+  socket.emit('request_tournament_live_state');
+});
+socket.on('disconnect',()=>{
+  document.getElementById('cdot').style.color='#ef4444';
+  document.getElementById('ctxt').textContent='Disconnected';
+});
+socket.on('tournament_live_game_update',d=>applyT(d));
+socket.on('replay_tournament_game',data=>{
+  tReplayData=data;
+  tSt={moves:data.moves.slice(),fens:data.fens.slice(),mcts:(data.mcts_stats_per_move||[]).slice(),status:'finished',idx:-1};
+  tMovesUpTo=data.moves.length-1;
+  tboard&&tboard.position('start',false);
+  tSt.idx=-1; renderT(data);
+  if(tPaused)tPause();
+});
+
+async function fj(u){try{const r=await fetch(u);return r.ok?await r.json():null;}catch{return null;}}
+
+function updStatus(s){
+  if(!s)return;
+  document.getElementById('ssys').textContent=s.system||'—';
+  document.getElementById('sphase').textContent=(s.phase||'idle').toUpperCase();
+  document.getElementById('sphase').style.color=s.phase==='finished'?'#22c55e':(s.phase==='running'?'#f59e0b':'#94a3b8');
+  document.getElementById('sgame').textContent=`${s.game_idx||0}/${s.total_games||0}`;
+  document.getElementById('sround').textContent=s.round_idx!==undefined?(s.round_idx+1):'—';
+  document.getElementById('splayers').textContent=s.num_players||0;
+  document.getElementById('hsys').textContent=s.system||'—';
+  document.getElementById('hphase').textContent=(s.phase||'idle').toUpperCase();
+}
+
+function updStandings(rows){
+  const el=document.getElementById('stbl');
+  if(!rows||!rows.length){el.innerHTML='<tr><td colspan="9" style="text-align:center;color:#1f2937">No standings yet</td></tr>';return;}
+  el.innerHTML=rows.map(r=>{
+    const winpct=r.games?(r.score_pct).toFixed(1):'—';
+    return `<tr><td>${r.rank}</td><td>${r.name}</td><td>${r.games}</td><td>${r.wins}</td><td>${r.losses}</td><td>${r.draws}</td><td style="color:#22c55e;font-weight:700">${r.pts.toFixed(1)}</td><td>${winpct}</td><td style="color:#38bdf8">${Math.round(r.elo)}</td></tr>`;
+  }).join('');
+}
+
+async function pollAll(){
+  const [st,rows]=await Promise.all([fj('/api/tournament/status'),fj('/api/tournament/standings')]);
+  updStatus(st); updStandings(rows);
+}
+
+$(document).ready(async()=>{
+  initTBoard();
+  pollAll();
+  setInterval(pollAll,3000);
+});
+</script>
+</body>
+</html>
