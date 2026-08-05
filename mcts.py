@@ -148,7 +148,8 @@ class MCTS:
                  adjudicate_material: bool = True,
                  piece_values: Optional[dict] = None,
                  adjudicate_graded: bool = True,
-                 adjudicate_scaling: float = 9.0):
+                 adjudicate_scaling: float = 9.0,
+                 force_mate_in_one: bool = True):
         """
         Args:
             network: The neural network for position evaluation
@@ -179,6 +180,7 @@ class MCTS:
         self.piece_values = piece_values or {'P': 1, 'N': 3, 'B': 3, 'R': 5, 'Q': 9}
         self.adjudicate_graded = adjudicate_graded
         self.adjudicate_scaling = adjudicate_scaling
+        self.force_mate_in_one = force_mate_in_one
 
         # Profiling: when True, search() collects per-phase timing into stats['profiling']
         self.profile = False
@@ -762,8 +764,8 @@ class MCTS:
             # No children -- return empty
             return visit_policy, None
 
-        # Force checkmate move if MCTS found one
-        checkmate_move = self._find_checkmate_child(root)
+        # Force checkmate move if MCTS found one (mate-in-one override)
+        checkmate_move = self._find_checkmate_child(root) if self.force_mate_in_one else None
         if checkmate_move is not None:
             idx = move_to_policy_index(checkmate_move, root.board)
             visit_policy[idx] = 1.0
@@ -826,8 +828,8 @@ class MCTS:
         if not root.children:
             return visit_policy, None
 
-        # Force checkmate move if MCTS found one
-        checkmate_move = self._find_checkmate_child(root)
+        # Force checkmate move if MCTS found one (mate-in-one override)
+        checkmate_move = self._find_checkmate_child(root) if self.force_mate_in_one else None
         if checkmate_move is not None:
             idx = move_to_policy_index(checkmate_move, root.board)
             visit_policy[idx] = 1.0

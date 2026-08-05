@@ -24,7 +24,17 @@ python main.py train --gui
 
 # Launch GUI only (reads existing stats DB)
 python main.py gui
+
+# Run a round-robin tournament between invited checkpoints
+python main.py tournament --model-dir output/default/checkpoints
+
+# Swiss-system tournament, 1 game per pair, 5 rounds
+python main.py tournament --model-dir output/default/checkpoints --system swiss --swiss-rounds 5 --games-per-pair 1
+
+# Explicitly invite models (comma separated 'name:path')
+python main.py tournament --models "latest:output/default/best.pt,step_500:output/default/checkpoints/step_500.pt"
 ```
+The tournament view (with the live board, MCTS statistics and standings table) is at `http://127.0.0.1:5000/tournament`. Use `--no-gui` to disable it.
 
 ### CLI Overrides
 ```bash

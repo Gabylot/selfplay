@@ -39,6 +39,7 @@ from network import AlphaZeroNet
 from mcts import MCTS
 from inference_client import InferenceClient
 from shared_memory_transport import SharedMemoryTransport
+from forced_mate import ForceMateMCTS, reset_memo
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -201,6 +202,11 @@ def play_one_game(mcts_engine, max_game_length=150, adjudicate_material=True,
     if piece_values is None:
         piece_values = {'P': 1, 'N': 3, 'B': 3, 'R': 5, 'Q': 9}
 
+    # Per-game memo reset for the forced-mate proof search (no-op when
+    # the override is disabled).  Keeps the memo bounded in long-lived
+    # worker processes that play many games.
+    reset_memo()
+
     board = chess.Board()
     game_states = []
     mcts_stats_list = []
@@ -321,7 +327,20 @@ def play_one_game(mcts_engine, max_game_length=150, adjudicate_material=True,
 
 
 def self_play_game(network, config, on_move=None):
-    mcts_engine = MCTS(
+    # Use the forced-mate override for endgame conversion when enabled
+    # (see forced_mate.py).  The proof search is gated to sparse boards
+    # (<= force_mate_gate_pieces pieces) and cheap (sub-ms).
+    force_mate = getattr(config.selfplay, 'force_mate', False)
+    mcts_cls = ForceMateMCTS if force_mate else MCTS
+    mcts_kwargs = {}
+    if force_mate:
+        mcts_kwargs = {
+            'max_force_plies': getattr(config.selfplay, 'force_mate_max_plies', 5),
+            'min_pieces_gate': getattr(config.selfplay, 'force_mate_gate_pieces', 8),
+            'deep_plies': getattr(config.selfplay, 'force_mate_deep_plies', 9),
+            'deep_gate_pieces': getattr(config.selfplay, 'force_mate_deep_gate_pieces', 4),
+        }
+    mcts_engine = mcts_cls(
         network=network,
         num_simulations=config.mcts.num_simulations,
         c_puct=config.mcts.c_puct,
@@ -335,6 +354,8 @@ def self_play_game(network, config, on_move=None):
         piece_values=config.selfplay.piece_values,
         adjudicate_graded=getattr(config.selfplay, 'adjudicate_graded', True),
         adjudicate_scaling=getattr(config.selfplay, 'adjudicate_scaling', 9.0),
+        force_mate_in_one=getattr(config.mcts, 'force_mate_in_one', True),
+        **mcts_kwargs,
     )
     return play_one_game(
         mcts_engine=mcts_engine,
@@ -400,8 +421,24 @@ def _worker_process(worker_id, task_queue, result_queue, config_dict, shutdown_e
         net.load_state_dict(torch.load(buf, map_location='cpu', weights_only=True))
         net.eval()
 
-    def mcts(net, noise):
-        return MCTS(
+    # The forced-mate override is wired ONLY into the selfplay branch below
+    # (force_mate=True).  Eval branches (gating / reference) keep it disabled
+    # so they measure true strength.
+    force_mate_enabled = getattr(config.selfplay, 'force_mate', False)
+
+    force_mate_in_one = getattr(config.mcts, 'force_mate_in_one', True)
+
+    def mcts(net, noise, force_mate=False):
+        cls = ForceMateMCTS if force_mate else MCTS
+        mcts_kwargs = {}
+        if force_mate:
+            mcts_kwargs = {
+                'max_force_plies': getattr(config.selfplay, 'force_mate_max_plies', 5),
+                'min_pieces_gate': getattr(config.selfplay, 'force_mate_gate_pieces', 8),
+                'deep_plies': getattr(config.selfplay, 'force_mate_deep_plies', 9),
+                'deep_gate_pieces': getattr(config.selfplay, 'force_mate_deep_gate_pieces', 4),
+            }
+        return cls(
             network=net,
             num_simulations=config.mcts.num_simulations,
             c_puct=config.mcts.c_puct,
@@ -415,6 +452,8 @@ def _worker_process(worker_id, task_queue, result_queue, config_dict, shutdown_e
             piece_values=config.selfplay.piece_values,
             adjudicate_graded=getattr(config.selfplay, 'adjudicate_graded', True),
             adjudicate_scaling=getattr(config.selfplay, 'adjudicate_scaling', 9.0),
+            force_mate_in_one=force_mate_in_one,
+            **mcts_kwargs,
         )
 
     while not shutdown_event.is_set():
@@ -426,10 +465,10 @@ def _worker_process(worker_id, task_queue, result_queue, config_dict, shutdown_e
 
         if t == 'selfplay':
             if inference_client is not None:
-                eng = mcts(inference_client, noise=True)
+                eng = mcts(inference_client, noise=True, force_mate=force_mate_enabled)
             else:
                 load(net_a, task['weights'])
-                eng = mcts(net_a, noise=True)
+                eng = mcts(net_a, noise=True, force_mate=force_mate_enabled)
 
             result_queue.put({
                 'worker_id': worker_id, 'type': 'live_start',
