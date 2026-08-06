@@ -58,7 +58,14 @@ body{font-family:'Segoe UI',Arial,sans-serif;background:#0b1220;color:#d1d5db}
 .viewer.open{display:block}
 .vinner{display:grid;grid-template-columns:auto 1fr;gap:14px}
 @media(max-width:860px){.vinner{grid-template-columns:1fr}}
-.bwrap{background:#0f172a;border-radius:7px;padding:10px;align-self:start}
+.bwrap{background:#0f172a;border-radius:7px;padding:10px;align-self:start;position:relative}
+
+/* PV line + arrow toggle */
+.pv{font-family:'Courier New',monospace;font-size:11px;color:#94a3b8;background:#0f172a;border:1px solid #1e3a5f;border-radius:5px;padding:6px 8px;margin-top:8px;min-height:16px;line-height:1.4;word-break:break-all}
+.pvtgl{display:flex;align-items:center;gap:6px;margin-top:6px;font-size:10px;color:#64748b}
+.pvtgl button{background:#1e3a5f;color:#cbd5e1;border:1px solid #2d4f7c;border-radius:4px;padding:2px 8px;cursor:pointer;font-size:10px}
+.pvtgl button.active{background:#f59e0b;border-color:#f59e0b;color:#0b1220;font-weight:700}
+svg.pv-ovl{position:absolute;top:0;left:0;pointer-events:none;z-index:6}
 .vside{display:flex;flex-direction:column;gap:8px}
 
 /* Controls */
@@ -185,7 +192,12 @@ table.dt tr:hover td{background:#0f172a}
     <button onclick="closeViewer()" style="float:right;background:#1e3a5f;border:1px solid #2d4f7c;color:#d1d5db;border-radius:4px;padding:2px 9px;cursor:pointer;font-size:11px">✕ Close</button>
   </h2>
   <div class="vinner">
-    <div class="bwrap"><div id="mboard" style="width:340px"></div></div>
+    <div class="bwrap"><div id="mboard" style="width:340px"></div>
+      <div id="vpv" class="pv">PV: —</div>
+      <div class="pvtgl">PV arrows <button id="vpvbtn" onclick="V.togglePV()">Off</button>
+        <span style="color:#475569;margin-left:2px">(shows the engine's next line on the board)</span>
+      </div>
+    </div>
     <div class="vside">
       <div class="ctrl">
         <span style="font-size:11px;color:#475569">Move <b id="vMov">0</b><span id="vOf"></span></span>
@@ -207,6 +219,7 @@ table.dt tr:hover td{background:#0f172a}
         <div class="wdlleg"><span><span class="sw s-w"></span>Win</span><span><span class="sw s-d"></span>Draw</span><span><span class="sw s-l"></span>Loss</span></div></div>
       <div><div class="seclbl">Policy prior at root (top candidates, red = played)</div><div class="chmini"><canvas id="vpol"></canvas></div></div>
       <div><div class="seclbl">Why this move?</div><div id="vwhy" style="background:#0f172a;border:1px solid #1e3a5f;border-radius:5px;padding:8px;font-size:11px;line-height:1.6;color:#64748b">Select a move…</div></div>
+      <div><div class="seclbl">Search Effort (sims · avg depth)</div><div class="chmini"><canvas id="vseff"></canvas></div></div>
       <div><div class="seclbl">Recent Games (this worker)</div><div class="rlist" id="vrec"><div style="color:#374151;padding:4px 7px">No completed games yet</div></div></div>
     </div>
   </div>
@@ -287,8 +300,8 @@ table.dt tr:hover td{background:#0f172a}
 // ════════════════════════════════════════════
 const CO={responsive:true,maintainAspectRatio:false,
   plugins:{legend:{labels:{color:'#64748b',font:{size:10}}}},
-  scales:{x:{ticks:{color:'#374151',font:{size:9}},grid:{color:'#0a1020'}},
-          y:{ticks:{color:'#374151',font:{size:9}},grid:{color:'#0a1020'}}}};
+  scales:{x:{ticks:{color:'#e5e7eb',font:{size:9}},grid:{color:'#0a1020'}},
+          y:{ticks:{color:'#e5e7eb',font:{size:9}},grid:{color:'#0a1020'}}}};
 function mk(id,ds,ex){return new Chart(document.getElementById(id),{type:'line',data:{labels:[],datasets:ds},options:{...CO,...ex}});}
 const CL=mk('closs',[{label:'Policy',data:[],borderColor:'#ef4444',fill:false,pointRadius:0},
   {label:'Value',data:[],borderColor:'#3b82f6',fill:false,pointRadius:0},
@@ -314,8 +327,8 @@ function makeQChart(id){
       backgroundColor:'rgba(245,158,11,.10)',fill:true,pointRadius:0,borderWidth:1.5}]},
     options:{responsive:true,maintainAspectRatio:false,animation:false,
       plugins:{legend:{display:false}},
-      scales:{x:{ticks:{color:'#374151',font:{size:8},maxTicksLimit:8},grid:{color:'#0a1020'}},
-              y:{min:-1,max:1,ticks:{color:'#475569',font:{size:8},stepSize:0.5},
+      scales:{x:{ticks:{color:'#e5e7eb',font:{size:8},maxTicksLimit:8},grid:{color:'#0a1020'}},
+              y:{min:-1,max:1,ticks:{color:'#e5e7eb',font:{size:8},stepSize:0.5},
                  grid:{color:'#1e3a5f'}}}}});
 }
 function makeMPSChart(id){
@@ -325,8 +338,8 @@ function makeMPSChart(id){
       backgroundColor:'rgba(56,189,248,.12)',fill:true,pointRadius:0,borderWidth:1.5}]},
     options:{responsive:true,maintainAspectRatio:false,animation:false,
       plugins:{legend:{display:false}},
-      scales:{x:{ticks:{color:'#374151',font:{size:8},maxTicksLimit:8},grid:{color:'#0a1020'}},
-              y:{beginAtZero:true,ticks:{color:'#475569',font:{size:8}},grid:{color:'#1e3a5f'}}}}});
+      scales:{x:{ticks:{color:'#e5e7eb',font:{size:8},maxTicksLimit:8},grid:{color:'#0a1020'}},
+              y:{beginAtZero:true,ticks:{color:'#e5e7eb',font:{size:8}},grid:{color:'#1e3a5f'}}}}});
 }
 function makeWDLChart(id){
   return new Chart(document.getElementById(id),{
@@ -337,8 +350,8 @@ function makeWDLChart(id){
       {label:'Loss',data:[],borderColor:'#ef4444',backgroundColor:'rgba(239,68,68,.38)',fill:true,pointRadius:0,borderWidth:1,stack:'w'}]},
     options:{responsive:true,maintainAspectRatio:false,animation:false,
       plugins:{legend:{display:false}},
-      scales:{x:{stacked:true,ticks:{color:'#374151',font:{size:8},maxTicksLimit:8},grid:{color:'#0a1020'}},
-              y:{stacked:true,min:0,max:1,ticks:{color:'#475569',font:{size:8}},grid:{color:'#1e3a5f'}}}}});
+      scales:{x:{stacked:true,ticks:{color:'#e5e7eb',font:{size:8},maxTicksLimit:8},grid:{color:'#0a1020'}},
+              y:{stacked:true,min:0,max:1,ticks:{color:'#e5e7eb',font:{size:8}},grid:{color:'#1e3a5f'}}}}});
 }
 function makePolicyChart(id){
   return new Chart(document.getElementById(id),{
@@ -346,14 +359,68 @@ function makePolicyChart(id){
     data:{labels:[],datasets:[{label:'P',data:[],backgroundColor:[]}]},
     options:{indexAxis:'y',responsive:true,maintainAspectRatio:false,animation:false,
       plugins:{legend:{display:false}},
-      scales:{x:{min:0,beginAtZero:true,ticks:{color:'#475569',font:{size:8}},grid:{color:'#0a1020'}},
-              y:{ticks:{color:'#d1d5db',font:{size:8}},grid:{display:false}}}}});
+      scales:{x:{min:0,beginAtZero:true,ticks:{color:'#e5e7eb',font:{size:8}},grid:{color:'#0a1020'}},
+              y:{ticks:{color:'#e5e7eb',font:{size:8}},grid:{display:false}}}}});
+}
+// Search effort per move: sims (bars, left axis) + avg depth (line, right axis).
+// High-sims jumps identify forced/surprise moves, low sims show routine ones.
+function makeEffChart(id){
+  return new Chart(document.getElementById(id),{
+    type:'bar',
+    data:{labels:[],datasets:[
+      {label:'sims',type:'bar',data:[],backgroundColor:'rgba(59,130,246,.45)',yAxisID:'y'},
+      {label:'depth',type:'line',data:[],borderColor:'#f59e0b',backgroundColor:'rgba(245,158,11,.15)',
+         fill:true,pointRadius:0,borderWidth:1.5,yAxisID:'y1'}]},
+    options:{responsive:true,maintainAspectRatio:false,animation:false,
+      plugins:{legend:{display:false}},
+      scales:{x:{ticks:{color:'#e5e7eb',font:{size:8},maxTicksLimit:8},grid:{color:'#0a1020'}},
+              y:{beginAtZero:true,position:'left',ticks:{color:'#e5e7eb',font:{size:8}},grid:{color:'#0a1020'},
+                 title:{display:true,text:'sims',color:'#475569',font:{size:8}}},
+              y1:{position:'right',ticks:{color:'#e5e7eb',font:{size:8}},grid:{drawOnChartArea:false},
+                 title:{display:true,text:'depth',color:'#475569',font:{size:8}}}}}});
 }
 
 // Plot the agent's evaluation (Q) from White's perspective for every move.
 // MCTS stores Q from the perspective of the player to move at the root; for a
 // White move that's Black's perspective (flip), for a Black move it's already
 // White's (no flip). White moves are the even plies (0, 2, 4, …).
+// ── cursor helpers ───────────────────────────────────────────────────────
+// Mark the current playhead on a line chart: every data point is drawn as 0-sized
+// except the ply we're currently viewing, which gets a filled dot + white ring.
+function chartCursor(set,n,idx,fill){
+  const bg=[]; for(let i=0;i<n;i++)bg.push(i===idx?fill:'transparent');
+  const rad=[]; for(let i=0;i<n;i++)rad.push(i===idx?4.5:0);
+  const bd=[]; for(let i=0;i<n;i++)bd.push(i===idx?'#fff':'transparent');
+  const bw=[]; for(let i=0;i<n;i++)bw.push(i===idx?1.5:0);
+  set.pointBackgroundColor=bg;
+  set.pointRadius=rad;
+  set.pointBorderColor=bd;
+  set.pointBorderWidth=bw;
+}
+// For bar datasets (e.g. search-effort sims): brighten the current bar.
+function barCursor(set,n,idx,base,hot){
+  set._base=set._base||base;
+  const colors=[]; for(let i=0;i<n;i++)colors.push(i===idx?hot:set._base);
+  set.backgroundColor=colors;
+}
+function plotCursor(p){
+  const s=p.state, idx=s.idx, n=s.moves.length;
+  // Only re-render the charts when the playhead or move count actually changed;
+  // otherwise a finished game (no new live moves) would never refresh the dot.
+  const changed=(p._curIdx!==idx||p._curN!==n);
+  p._curIdx=idx;p._curN=n;
+  if(p.qc&&p.qc.data.datasets.length){chartCursor(p.qc.data.datasets[0],n,idx,'#f59e0b');if(changed)p.qc.update('none');}
+  if(p.wdl&&p.wdl.data.datasets.length){
+    const cols=['#3b82f6','#6b7280','#ef4444'];
+    for(let i=0;i<p.wdl.data.datasets.length;i++)chartCursor(p.wdl.data.datasets[i],n,idx,cols[i]);
+    if(changed)p.wdl.update('none');
+  }
+  if(p.eff&&p.eff.data.datasets.length){
+    barCursor(p.eff.data.datasets[0],n,idx,'rgba(59,130,246,.45)','rgba(147,197,253,.95)');
+    if(p.eff.data.datasets[1])chartCursor(p.eff.data.datasets[1],n,idx,'#f59e0b');
+    if(changed)p.eff.update('none');
+  }
+}
 function plotQ(p){
   if(!p.qc)return;
   const s=p.state;
@@ -407,6 +474,26 @@ function plotWDL(p){
   p.wdl.update('none');
 }
 
+// Search effort per move (sims bars + avg-depth line). Gated on move count so it
+// only replots when new moves arrive (not on every playback tick).
+function plotEff(p){
+  if(!p.eff)return;
+  const s=p.state;
+  if(p._elLen===s.moves.length)return;
+  p._elLen=s.moves.length;
+  const labels=[],sims=[],depth=[];
+  for(let i=0;i<s.moves.length;i++){
+    const ms=s.mcts[i];
+    labels.push(i+1);
+    sims.push(ms&&ms.sims!=null?Number(ms.sims):null);
+    depth.push(ms&&ms.depth!=null?Number(ms.depth):null);
+  }
+  p.eff.data.labels=labels;
+  p.eff.data.datasets[0].data=sims;
+  p.eff.data.datasets[1].data=depth;
+  p.eff.update('none');
+}
+
 // Horizontal bar chart of the policy prior (P) over the root's top candidates
 // for the currently selected ply. Red bar marks the move that was actually
 // played.
@@ -450,6 +537,78 @@ function renderWhy(p){
   h+=` · W <b style="color:#d1d5db">${(-Number(sel.W)).toFixed(2)}</b> · prior P <b style="color:#d1d5db">${selP.toFixed(3)}</b> (max ${maxP.toFixed(3)})`;
   if(surprise)h+=`<br><span style="color:#f59e0b">${surprise}</span>`;
   el.innerHTML=h;
+}
+
+// ── Principal variation (clutter-free) ───────────────────────────────────
+// The PV is the engine's intended main line. In a replayed self-play game the
+// played continuation IS that line (low-temperature selection ≈ max-visits),
+// so we surface the next plies after the current board position.
+//  * A plain text line is always shown (no clutter).
+//  * Arrows on the board are opt-in and capped at 2 faint overlays.
+function pvFromUci(u){return {fro:u.slice(0,2),to:u.slice(2,4)};}
+function pvContinuation(p){
+  const s=p.state, idx=s.idx, out=[];
+  if(idx>=0&&idx+1<s.moves.length){
+    const lim=Math.min(s.moves.length, idx+1+6);
+    for(let i=idx+1;i<lim;i++)out.push(s.moves[i]);
+  }
+  return out;
+}
+function renderPV(p){
+  const el=document.getElementById(p.d.pv); if(!el)return;
+  const nxt=pvContinuation(p);
+  el.textContent=nxt.length?'PV: '+nxt.join(' '):'PV: —';
+  if(p.pvArrows)drawPVArrows(p,nxt.slice(0,2)); else removePVArrows(p);
+}
+function boardHost(){return document.getElementById('mboard')||document.getElementById('eboard');}
+function sqPt(file,rank,ori,size){
+  const f=file.charCodeAt(0)-97;
+  const col=ori==='black'?7-f:f;
+  const row=ori==='black'?rank-1:8-rank;
+  return{x:(col+0.5)*size,y:(row+0.5)*size};
+}
+function drawPVArrows(p,nxt){
+  const host=boardHost();
+  if(!host||!host.clientWidth||!(host.clientWidth>0))return;   // not laid out yet
+  if(!document.createElementNS)return;
+  const size=host.clientWidth/8;
+  let ori='white';
+  try{ori=(mboard&&mboard.orientation&&mboard.orientation())||'white';}catch(e){}
+  let svg=host.querySelector&&host.querySelector('svg.pv-ovl');
+  if(!svg){
+    svg=document.createElementNS('http://www.w3.org/2000/svg','svg');
+    svg.setAttribute('class','pv-ovl');
+    svg.setAttribute('width',String(size*8));
+    svg.setAttribute('height',String(size*8));
+    svg.setAttribute('viewBox',`0 0 ${size*8} ${size*8}`);
+    const defs=document.createElementNS('http://www.w3.org/2000/svg','defs');
+    const mk=document.createElementNS('http://www.w3.org/2000/svg','marker');
+    mk.setAttribute('id','pvhead');
+    mk.setAttribute('markerWidth','8');mk.setAttribute('markerHeight','8');
+    mk.setAttribute('refX','7');mk.setAttribute('refY','4');mk.setAttribute('orient','auto');
+    mk.innerHTML='<path d="M0,0 L8,4 L0,8 z" fill="#f59e0b" opacity="0.6"/>';
+    defs.appendChild(mk);svg.appendChild(defs);
+    host.appendChild(svg);
+  }
+  svg.innerHTML='';
+  for(const u of nxt){
+    const a=pvFromUci(u);
+    if(a.fro.length<2||a.to.length<2)continue;
+    const f=parseInt(a.fro[1],10),t=parseInt(a.to[1],10);
+    if(!f||!t)continue;
+    const p1=sqPt(a.fro[0],f,ori,size),p2=sqPt(a.to[0],t,ori,size);
+    const ln=document.createElementNS('http://www.w3.org/2000/svg','line');
+    ln.setAttribute('x1',p1.x);ln.setAttribute('y1',p1.y);
+    ln.setAttribute('x2',p2.x);ln.setAttribute('y2',p2.y);
+    ln.setAttribute('stroke','#f59e0b');ln.setAttribute('stroke-width','3.5');
+    ln.setAttribute('stroke-opacity','0.55');ln.setAttribute('stroke-linecap','round');
+    ln.setAttribute('marker-end','url(#pvhead)');
+    svg.appendChild(ln);
+  }
+}
+function removePVArrows(p){
+  const host=boardHost();
+  if(host&&host.querySelector){const s=host.querySelector('svg.pv-ovl');if(s)s.remove();}
 }
 
 // ════════════════════════════════════════════
@@ -519,8 +678,10 @@ class Player{
     this.iv=null;
     this.replay=false;               // true while showing a finished game
     this.jumpToTail=false;           // next commit shows newest move instantly
-    this.qc=null; this.wdl=null; this.pol=null;   // chart handles (created in init)
-    this._qLen=-1; this._wlLen=-1; this._polIdx=-1;
+    this.qc=null; this.wdl=null; this.pol=null; this.eff=null;   // chart handles (created in init)
+    this._qLen=-1; this._wlLen=-1; this._polIdx=-1; this._elLen=-1;
+    this._curIdx=-1; this._curN=-1;   // cursor-change sentinels for plotCursor
+    this.pvArrows=false;           // board arrow overlay (off by default)
   }
 
   // Resolve a dom entry by id (or return it directly if already an element).
@@ -541,7 +702,8 @@ class Player{
       if(this.state.status==='finished')return;
       this.gid=gid;
       this.state=emptySt();
-      this._qLen=-1; this._wlLen=-1; this._polIdx=-1;
+      this._qLen=-1; this._wlLen=-1; this._polIdx=-1; this._elLen=-1;
+      this._curIdx=-1; this._curN=-1;
       const b=this._el('board');
       if(b)b.position('start',false);
     }
@@ -561,6 +723,7 @@ class Player{
     if(this.jumpToTail){s.idx=s.fens.length-1;this.jumpToTail=false;}
     plotQ(this);
     plotWDL(this);
+    plotEff(this);
     this.paint();
     this.ensureAdvance();
   }
@@ -613,6 +776,14 @@ class Player{
     if(!this.paused)this.ensureAdvance();
   }
 
+  // Toggle the principal-variation arrow overlay on the board.
+  togglePV(){
+    this.pvArrows=!this.pvArrows;
+    const b=this._el('pvBtn');
+    if(b){b.textContent=this.pvArrows?'On':'Off';b.classList.toggle('active',this.pvArrows);}
+    this.paint();
+  }
+
   // ---- rendering ----
   paint(){
     const s=this.state;
@@ -636,6 +807,8 @@ class Player{
     // policy bar re-plots only when the selected ply changes
     if(this.pol&&this._polIdx!==s.idx){this._polIdx=s.idx;renderPolicyBars(this);}
     renderWhy(this);
+    renderPV(this);
+    plotCursor(this);
     const res=this._el('res');
     if(res){
       if(s.result){
@@ -657,8 +830,8 @@ class Player{
     const lb=this._el('btnL');if(lb)lb.style.display='';
     const pb=this._el('btnP');if(pb){pb.textContent='▶ Play';pb.classList.remove('active');}
     this.paused=true;this.auto=false;
-    this._qLen=-1;this._wlLen=-1;this._polIdx=-1;
-    plotQ(this);plotWDL(this);
+    this._qLen=-1;this._wlLen=-1;this._polIdx=-1;this._elLen=-1;this._curIdx=-1;this._curN=-1;
+    plotQ(this);plotWDL(this);plotEff(this);
     this.paint();
   }
 }
@@ -676,6 +849,7 @@ function initMBoard(){
 const V=new Player({
   board:null,
   ml:'vml',ms:'vmcts',mov:'vMov',of:'vOf',badge:'vbadge',res:'vres',info:null,why:'vwhy',
+  pv:'vpv',pvBtn:'vpvbtn',
   btnP:'vpbtn',btnL:'vlbtn',slider:'vspd',spdLbl:'vspdlbl',
   onLive:()=>{document.getElementById('vlbtn').style.display='none';socket.emit('request_worker_detail',{worker_id:vWorker});},
   onPick:i=>{V.go(i);}
@@ -686,7 +860,7 @@ function openV(w){
   document.getElementById('viewer').className='card viewer open';
   document.getElementById('vwid').textContent=w;
   document.getElementById('vlbtn').style.display='none';
-  V.replay=false;V.gid=0;V.state=emptySt();V._qLen=-1;V._wlLen=-1;V._polIdx=-1;
+  V.replay=false;V.gid=0;V.state=emptySt();V._qLen=-1;V._wlLen=-1;V._polIdx=-1;V._elLen=-1;V._curIdx=-1;V._curN=-1;
   mboard&&mboard.position('start',false);
   V.paused=false;V.auto=true;V.jumpToTail=true;V.stop();
   const pb=document.getElementById('vpbtn');
@@ -976,7 +1150,8 @@ $(document).ready(async()=>{
   V.qc=makeQChart('vq'); E.qc=makeQChart('eq');
   V.wdl=makeWDLChart('vwl'); E.wdl=makeWDLChart('ewl');
   V.pol=makePolicyChart('vpol');
-  V._qLen=-1; E._qLen=-1; V._wlLen=-1; E._wlLen=-1; V._polIdx=-1;
+  V.eff=makeEffChart('vseff');
+  V._qLen=-1; E._qLen=-1; V._wlLen=-1; E._wlLen=-1; V._polIdx=-1; V._elLen=-1;
   CHART_MPS=makeMPSChart('cmps');
   V.spd();
   const wc=await fj('/api/num_workers');
