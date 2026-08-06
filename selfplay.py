@@ -376,7 +376,8 @@ def self_play_game(network, config, on_move=None):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _worker_process(worker_id, task_queue, result_queue, config_dict, shutdown_event,
-                    request_queue=None, response_queue=None, shared_buffers=None):
+                    request_queue=None, response_queue=None, shared_buffers=None,
+                    concurrency=1):
     import torch, sys, os
     from config import Config
     from network import AlphaZeroNet
@@ -401,7 +402,7 @@ def _worker_process(worker_id, task_queue, result_queue, config_dict, shutdown_e
         # Pass shared_buffers for zero-copy IPC when available.
         inference_client = InferenceClient(
             worker_id, request_queue, response_queue, network_id=0,
-            shared_buffers=shared_buffers,
+            shared_buffers=shared_buffers, concurrency=concurrency,
         )
 
     def make_net():
@@ -523,9 +524,9 @@ def _worker_process(worker_id, task_queue, result_queue, config_dict, shutdown_e
                 # ── GPU path: route both nets through the dual-network server ──
                 if inference_client is not None:
                     client_a = InferenceClient(worker_id, request_queue, response_queue, network_id=0,
-                                               shared_buffers=shared_buffers)
+                                               shared_buffers=shared_buffers, concurrency=concurrency)
                     client_b = InferenceClient(worker_id, request_queue, response_queue, network_id=1,
-                                               shared_buffers=shared_buffers)
+                                               shared_buffers=shared_buffers, concurrency=concurrency)
                     ea = mcts(client_a, False); eb = mcts(client_b, False)
                 else:
                     load(net_a, task['weights_a']); load(net_b, task['weights_b'])
@@ -567,7 +568,7 @@ def _worker_process(worker_id, task_queue, result_queue, config_dict, shutdown_e
                 # ── GPU path: network A via the GPU server (network_id=0) ──
                 if inference_client is not None:
                     client_a = InferenceClient(worker_id, request_queue, response_queue, network_id=0,
-                                               shared_buffers=shared_buffers)
+                                               shared_buffers=shared_buffers, concurrency=concurrency)
                     ea = mcts(client_a, False)
                 else:
                     load(net_a, task['weights_a'])
@@ -672,6 +673,7 @@ class ParallelSelfPlay:
                 inf_max_batch = getattr(inf_cfg, 'max_batch', 64) if inf_cfg else 64
                 mcts_batch_size = getattr(config.mcts, 'batch_size', 1)
                 max_batch = max(inf_max_batch, mcts_batch_size)
+                client_concurrency = getattr(inf_cfg, 'client_concurrency', 1) if inf_cfg else 1
                 state_dtype_str = getattr(inf_cfg, 'state_dtype', 'float16') if inf_cfg else 'float16'
                 import numpy as _np
                 state_dtype = _np.float16 if state_dtype_str == 'float16' else _np.float32
@@ -679,10 +681,12 @@ class ParallelSelfPlay:
                     num_workers=num_workers,
                     max_batch=max_batch,
                     state_dtype=state_dtype,
+                    num_slots=max(1, client_concurrency),
                 )
                 self._shared_transport.create_buffers()
                 print(f"[INFO] Shared-memory IPC enabled "
-                      f"(dtype={state_dtype_str}, max_batch={max_batch})")
+                      f"(dtype={state_dtype_str}, max_batch={max_batch}, "
+                      f"slots={client_concurrency})")
 
     def start(self):
         if self._use_gpu:
@@ -700,6 +704,10 @@ class ParallelSelfPlay:
                 kwargs['response_queue'] = self._response_qs[i]
                 if self._use_shared_memory and self._shared_transport is not None:
                     kwargs['shared_buffers'] = self._shared_transport.get_worker_buffers(i)
+                inf_cfg = getattr(self.config, 'inference', None)
+                kwargs['concurrency'] = (
+                    getattr(inf_cfg, 'client_concurrency', 1) if inf_cfg else 1
+                )
             p = mp.Process(target=_worker_process,
                            args=(i, tq, self._result_q, cd, self._shutdown),
                            kwargs=kwargs, daemon=True)

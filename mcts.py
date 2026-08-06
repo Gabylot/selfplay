@@ -65,7 +65,7 @@ class MCTSNode:
                  'legal_moves_cached', 'visit_count', 'virtual_loss',
                  '_game_over_cached', '_terminal_value_cached',
                  '_checkmate_child_cached', '_checkmate_child_move',
-                 '_position_hash', 'depth']
+                 '_position_hash', 'depth', 'rs_id']
 
     def __init__(self, board: Optional[chess.Board] = None,
                  parent: Optional['MCTSNode'] = None,

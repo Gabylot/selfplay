@@ -38,6 +38,8 @@ Shutdown : None sentinel in request_queue
 import io
 import time
 import queue
+import threading
+import contextlib
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -109,6 +111,21 @@ class GPUInferenceServer:
         self.shutdown_event = shutdown_event
         self.shared_buffers = shared_buffers  # dict[worker_id → buffers]
         self.stats_queue = stats_queue        # optional mp.Queue for benchmark timing
+
+# ── Pipelining (optional, enabled by run()) ──
+        # The host thread aggregates requests into mega-batches and enqueues
+        # them here.  A dedicated forward-worker thread pulls a batch and does
+        # SHM-read + numpy build + GPU forward + distribute, so the host's
+        # aggregation of batch N overlaps the GPU + copy of batch N-1.
+        #
+        # Note: _work_queue and _model_lock are created lazily in run() because
+        # queue.Queue holds a _thread.lock and threading.Lock is not picklable —
+        # the server object is pickled into the GPU subprocess via mp.Process.
+        # The forward-worker thread is only used inside run().
+        self._work_queue = None
+        self._forward_thread = None
+        self._model_lock = None  # created in run()
+        self._forward_busy = False  # set by the forward-worker thread
 
         inf_cfg = getattr(config, 'inference', None)
         self.max_batch = getattr(inf_cfg, 'max_batch', 64) if inf_cfg else 64
@@ -184,6 +201,18 @@ class GPUInferenceServer:
         # Load any weights already in the queue
         self._drain_weight_queue(nets, device)
 
+        # ── Start the forward-worker thread (pipelining) ──
+        # The host thread below aggregates requests into mega-batches and
+        # enqueues them; this thread does SHM-read + numpy build + GPU
+        # forward + distribute.  Aggregation of batch N therefore overlaps
+        # the GPU forward + copies of batch N-1.
+        self._model_lock = threading.Lock()  # only main server process
+        self._work_queue = queue.Queue(maxsize=32)  # created after fork/spawn
+        self._forward_thread = threading.Thread(
+            target=self._forward_worker, args=(device,), daemon=True
+        )
+        self._forward_thread.start()
+
         # ── Main inference loop ──
         while not self.shutdown_event.is_set():
             # Drain weight queue first (non-blocking)
@@ -202,11 +231,14 @@ class GPUInferenceServer:
             if req is None:
                 # Shutdown sentinel
                 self._send_shutdown_to_workers()
+                self._stop_forward_worker()
                 self._report_stats(t_start)
                 return
 
             self._handle_request(req, nets, device, net_a)
 
+        self._send_shutdown_to_workers()
+        self._stop_forward_worker()
         self._report_stats(t_start)
         print("[GPU-Server] Shutting down")
 
@@ -252,13 +284,21 @@ class GPUInferenceServer:
         # silently stretch to ~15.6ms (exactly the Windows timer issue
         # documented above, but on the deadline check instead of get()).
         # perf_counter() uses QueryPerformanceCounter (sub-ms resolution).
+        #
+        # Pipelined aggregation policy:
+        #   - If the forward worker is BUSY with a previous batch, keep
+        #     collecting here so we hand it one big batch once it drains —
+        #     this rebuilds the batch-accumulation the synchronous path got
+        #     "for free" from being blocked on the GPU forward.
+        #   - If the forward worker is IDLE, break as soon as the queue is
+        #     empty so the GPU never starves waiting for us to gather more.
+        pipelined = (self._forward_thread is not None
+                     and self._forward_thread.is_alive()
+                     and self._work_queue is not None)
         deadline = time.perf_counter() + self.max_wait_ms / 1000.0
         t_agg_start = time.perf_counter()
 
         while total_samples < self.max_batch:
-            if time.perf_counter() >= deadline:
-                break  # timer expired
-
             try:
                 req2 = self.request_queue.get_nowait()
 
@@ -285,7 +325,14 @@ class GPUInferenceServer:
                     total_samples += item2['batch_size']
 
             except queue.Empty:
-                break  # ← KEY: break immediately on empty queue (zero latency)
+                if pipelined and self._forward_busy:
+                    # Worker still busy — hold off firing a tiny batch and
+                    # give workers a moment to enqueue more requests.
+                    if time.perf_counter() >= deadline:
+                        break  # don't wait forever
+                    time.sleep(0.0001)
+                    continue
+                break  # idle worker + empty queue → fire immediately
 
         self.stats['aggregation_wait_time'] += time.perf_counter() - t_agg_start
 
@@ -297,15 +344,24 @@ class GPUInferenceServer:
 
         Returns a dict with keys:
             worker_id, request_id, network_id, is_shm, batch_size,
-            states (ndarray or None), buf (WorkerSharedBuffers or None)
+            slot, states (ndarray or None), buf (WorkerSharedBuffers or None)
+
+        Request protocol (shared-memory mode):
+            (worker_id, request_id, network_id, batch_size[, slot])
+        The optional 5th element is the shared-buffer slot index used for
+        client-side pipelining (multiple in-flight requests per worker).
+        4-tuples default to slot 0 (single-request-in-flight behaviour).
 
         For shared-memory requests, states are NOT read here — they are
         read later in ``_process_aggregated`` when ready to process.
-        This is safe because workers block synchronously on
-        ``predict``/``predict_batch`` and won't overwrite their buffer
-        until the server responds.
+        This is safe because each in-flight request owns its slot and a
+        worker only reuses a slot after the server has responded.
         """
-        worker_id, request_id, network_id, fourth = req
+        if len(req) >= 5:
+            worker_id, request_id, network_id, fourth, slot = req
+        else:
+            worker_id, request_id, network_id, fourth = req
+            slot = 0
         is_shm = isinstance(fourth, int)
 
         if is_shm:
@@ -319,6 +375,7 @@ class GPUInferenceServer:
                 'network_id': network_id,
                 'is_shm': True,
                 'batch_size': batch_size,
+                'slot': slot,
                 'states': None,
                 'buf': buf,
             }
@@ -334,6 +391,7 @@ class GPUInferenceServer:
                 'network_id': network_id,
                 'is_shm': False,
                 'batch_size': batch_size,
+                'slot': slot,
                 'states': states,
                 'buf': None,
             }
@@ -367,8 +425,12 @@ class GPUInferenceServer:
                 t0 = time.perf_counter()
                 buf = io.BytesIO(latest[nid])
                 state_dict = torch.load(buf, map_location='cpu', weights_only=True)
-                nets[nid].load_state_dict(state_dict)
-                nets[nid].eval()
+                # Serialize against the forward-worker thread which may be
+                # executing nets[nid] concurrently.
+                lock = self._model_lock if self._model_lock is not None else contextlib.nullcontext()
+                with lock:
+                    nets[nid].load_state_dict(state_dict)
+                    nets[nid].eval()
                 self.stats['weight_load_time'] += time.perf_counter() - t0
 
     def _process_aggregated(self, nets, device, pending, net_a):
@@ -378,10 +440,12 @@ class GPUInferenceServer:
 
         Steps:
         1. Group by ``network_id`` so each group uses the correct network.
-        2. For each group, read states from shared memory (shm) or use the
-           ndarray (queue mode), then concatenate into one mega-batch.
-        3. Run one ``net(mega_batch)`` forward pass.
-        4. Split results by ``offset`` and write/send to each worker.
+        2. For each group, build the host-side mega-batch numpy array
+           (reading shared memory on the host thread — this overlaps the
+           previous batch's GPU forward when pipelining is active).
+        3. Either run the GPU forward + distribute inline (tests /
+           single-threaded) or enqueue the group for the forward worker
+           thread (pipelined mode active in ``run()``).
 
         The offset tracking is the highest-risk part — an off-by-one would
         silently hand worker A the policy/value meant for worker B.  The
@@ -398,91 +462,147 @@ class GPUInferenceServer:
                 order.append(nid)
             groups[nid].append(item)
 
+        pipelined = (self._forward_thread is not None
+                     and self._forward_thread.is_alive()
+                     and self._work_queue is not None)
+
         # Process each group with the appropriate network
         for nid in order:
             group = groups[nid]
             net = nets.get(nid, net_a)
+            mega_states = self._build_mega(group)
+            if pipelined:
+                self._work_queue.put((net, group, mega_states))
+            else:
+                self._forward_and_distribute(net, device, group, mega_states)
 
-            # ── Read/collect states from all requests in this group ──
-            # Pre-allocate mega-batch and copy directly (avoids
-            # intermediate list + np.concatenate overhead).
-            total_in_group = sum(it['batch_size'] for it in group)
-            mega_states = np.empty(
-                (total_in_group, NUM_PLANES, 8, 8), dtype=np.float32
-            )
-            offset = 0
-            for item in group:
-                bs = item['batch_size']
-                if item['is_shm']:
-                    t0 = time.perf_counter()
-                    states = SharedMemoryTransport.read_states(
-                        item['buf'], bs
-                    )
-                    self.stats['shm_read_time'] += time.perf_counter() - t0
-                else:
-                    states = item['states']
-                    # Ensure 4D (single requests come as 3D)
-                    if states.ndim == 3:
-                        states = states[np.newaxis, ...]
-                mega_states[offset:offset + bs] = states
-                offset += bs
+    def _build_mega(self, group):
+        """Host-side: build the mega-batch numpy array for one group.
 
-            # ── Forward pass ──
-            t0 = time.perf_counter()
-            states_t = torch.from_numpy(mega_states).float().to(device)
+        Reads shared memory / gathers ndarrays into a contiguous
+        ``(total, NUM_PLANES, 8, 8)`` float32 array.  Pure host work, so in
+        pipelined mode it overlaps the forward worker's GPU pass.
+        """
+        # Pre-allocate mega-batch and copy directly (avoids
+        # intermediate list + np.concatenate overhead).
+        total_in_group = sum(it['batch_size'] for it in group)
+        mega_states = np.empty(
+            (total_in_group, NUM_PLANES, 8, 8), dtype=np.float32
+        )
+        offset = 0
+        for item in group:
+            bs = item['batch_size']
+            if item['is_shm']:
+                t0 = time.perf_counter()
+                states = SharedMemoryTransport.read_states(
+                    item['buf'], bs, item['slot']
+                )
+                self.stats['shm_read_time'] += time.perf_counter() - t0
+            else:
+                states = item['states']
+                # Ensure 4D (single requests come as 3D)
+                if states.ndim == 3:
+                    states = states[np.newaxis, ...]
+            mega_states[offset:offset + bs] = states
+            offset += bs
+        return mega_states
 
+    def _forward_and_distribute(self, net, device, group, mega_states):
+        """GPU forward + response distribution for one group.
+
+        Runs on the forward-worker thread in pipelined mode, or inline on
+        the host thread otherwise.  The model lock serializes this against
+        ``load_state_dict`` calls from the host thread.
+        """
+        # ── Forward pass ──
+        t0 = time.perf_counter()
+        states_t = torch.from_numpy(mega_states).float().to(device)
+
+        lock = self._model_lock if self._model_lock is not None else contextlib.nullcontext()
+        with lock:
             with torch.no_grad():
                 policy_logits, values = net(states_t)
                 policies = F.softmax(policy_logits, dim=1).cpu().numpy()
                 values = values.squeeze(-1).cpu().numpy()
-            self.stats['gpu_forward_time'] += time.perf_counter() - t0
-            self.stats['samples_processed'] += len(mega_states)
-            self.stats['aggregated_batches'] += 1
+        self.stats['gpu_forward_time'] += time.perf_counter() - t0
+        self.stats['samples_processed'] += len(mega_states)
+        self.stats['aggregated_batches'] += 1
 
-            # ── Distribute results to per-worker response queues ──
-            offset = 0
-            for item in group:
-                bs = item['batch_size']
-                item_policies = policies[offset:offset + bs]
-                item_values = values[offset:offset + bs]
-                offset += bs
+        self._distribute(group, policies, values)
 
-                worker_id = item['worker_id']
-                request_id = item['request_id']
+    def _distribute(self, group, policies, values):
+        """Split a group's mega-batch results back to the individual workers."""
+        offset = 0
+        for item in group:
+            bs = item['batch_size']
+            item_policies = policies[offset:offset + bs]
+            item_values = values[offset:offset + bs]
+            offset += bs
 
-                # ── Shared-memory response path ──
-                if (item['is_shm'] and self.shared_buffers is not None
-                        and worker_id in self.shared_buffers):
-                    buf = self.shared_buffers[worker_id]
-                    t0 = time.perf_counter()
-                    SharedMemoryTransport.write_policies_values(
-                        buf, item_policies, item_values
-                    )
-                    self.stats['shm_write_time'] += time.perf_counter() - t0
-                    try:
-                        self.response_queues[worker_id].put_nowait(
-                            (request_id, bs)
-                        )
-                    except Exception:
-                        pass
-                    continue
+            worker_id = item['worker_id']
+            request_id = item['request_id']
 
-                # ── Queue response path ──
+            # ── Shared-memory response path ──
+            if (item['is_shm'] and self.shared_buffers is not None
+                    and worker_id in self.shared_buffers):
+                buf = self.shared_buffers[worker_id]
+                t0 = time.perf_counter()
+                SharedMemoryTransport.write_policies_values(
+                    buf, item_policies, item_values, item['slot']
+                )
+                self.stats['shm_write_time'] += time.perf_counter() - t0
                 try:
-                    if bs == 1:
-                        self.response_queues[worker_id].put_nowait(
-                            (request_id, item_policies[0], float(item_values[0]))
-                        )
-                    else:
-                        self.response_queues[worker_id].put_nowait(
-                            (request_id, item_policies, item_values)
-                        )
+                    self.response_queues[worker_id].put_nowait(
+                        (request_id, bs)
+                    )
                 except Exception:
-                    pass  # queue full or closed — worker likely dead
+                    pass
+                continue
 
-            # Safety assertion: offset must equal total samples in this group
-            assert offset == sum(it['batch_size'] for it in group), \
-                f"Offset tracking error: offset={offset} != total={sum(it['batch_size'] for it in group)}"
+            # ── Queue response path ──
+            try:
+                if bs == 1:
+                    self.response_queues[worker_id].put_nowait(
+                        (request_id, item_policies[0], float(item_values[0]))
+                    )
+                else:
+                    self.response_queues[worker_id].put_nowait(
+                        (request_id, item_policies, item_values)
+                    )
+            except Exception:
+                pass  # queue full or closed — worker likely dead
+
+        # Safety assertion: offset must equal total samples in this group
+        assert offset == sum(it['batch_size'] for it in group), \
+            f"Offset tracking error: offset={offset} != total={sum(it['batch_size'] for it in group)}"
+
+    def _forward_worker(self, device):
+        """Forward-worker thread: pulls groups and runs GPU + distribute.
+
+        This decouples the GPU forward (with its .to/.cpu copies) from the
+        host thread's request aggregation, so aggregation of batch N
+        overlaps GPU + copies of batch N-1.
+        """
+        while True:
+            job = self._work_queue.get()
+            if job is None:
+                break
+            net, group, mega_states = job
+            self._forward_busy = True
+            try:
+                self._forward_and_distribute(net, device, group, mega_states)
+            finally:
+                self._forward_busy = False
+
+    def _stop_forward_worker(self):
+        """Signal the forward worker to stop and wait for it to drain."""
+        if self._forward_thread is not None and self._work_queue is not None:
+            try:
+                self._work_queue.put_nowait(None)
+            except queue.Full:
+                pass
+            self._forward_thread.join(timeout=5.0)
+            self._forward_thread = None
 
     def _send_shutdown_to_workers(self):
         """Send a sentinel to each worker's response queue so they unblock."""

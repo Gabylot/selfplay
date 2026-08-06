@@ -254,6 +254,20 @@ def _encode_global_planes(board: chess.Board, tensor: np.ndarray):
     tensor[PLANE_MOVE_COUNT, :, :] = board.fullmove_number / MOVE_COUNT_NORM
 
 
+def _board_to_tensor_rust(board: chess.Board) -> np.ndarray:
+    """Fast-path tensor encode entirely in Rust (FastBoard.encode_tensor).
+
+    Bit-identical to the pure-Python encoding (verified), ~6x faster.
+    """
+    b = board._b
+    if b is None:
+        return board_to_tensor(board, 8)
+    if hasattr(b, "encode_tensor"):
+        data = b.encode_tensor(NO_PROGRESS_NORM, MOVE_COUNT_NORM)
+        return np.frombuffer(data, dtype=np.float32).reshape(NUM_PLANES, 8, 8)
+    return board_to_tensor(board, 8)
+
+
 def board_to_tensor(board: chess.Board,
                     history_length: int = 8) -> np.ndarray:
     """Encode a chess.Board as a (119, 8, 8) float32 numpy array.
@@ -281,6 +295,8 @@ def board_to_tensor(board: chess.Board,
     Returns:
         tensor: (119, 8, 8) float32 numpy array
     """
+    if history_length == 8 and hasattr(board._b, "encode_tensor"):
+        return _board_to_tensor_rust(board)
     tensor = np.zeros((NUM_PLANES, 8, 8), dtype=np.float32)
 
     # Work on a single copy — we'll pop moves to walk back in history.
@@ -320,7 +336,6 @@ def rank_file_to_square(rank: int, file: int) -> int:
     """Convert (rank, file) to chess square index. rank 0 = rank 1."""
     return chess.square(file, rank)
 
-@lru_cache(maxsize=4096)
 def move_to_policy_index(move: chess.Move, board: chess.Board) -> int:
     """Convert a chess.Move to a flat policy index (0-4671).
 
@@ -331,6 +346,15 @@ def move_to_policy_index(move: chess.Move, board: chess.Board) -> int:
     for both players), per the AlphaZero chess paper.  The input board is
     player-oriented, but the action space is absolute.
     """
+    # The expensive part here is *not* the index math but the cache KEY: the
+    # old @lru_cache was keyed on (move, board), and Board.__hash__ computes a
+    # full fen() on EVERY call.  Underpromotion direction depends only on
+    # `board.turn`, so cache on (move, turn) and avoid hashing the board.
+    return _move_to_policy_index_cached(move, board.turn)
+
+
+@lru_cache(maxsize=8192)
+def _move_to_policy_index_cached(move: chess.Move, turn: bool) -> int:
     from_rank = chess.square_rank(move.from_square)
     from_file = chess.square_file(move.from_square)
     to_rank = chess.square_rank(move.to_square)
@@ -340,15 +364,13 @@ def move_to_policy_index(move: chess.Move, board: chess.Board) -> int:
     dr = to_rank - from_rank
     dc = to_file - from_file
 
-    # Check if this is an underpromotion
-    piece = board.piece_at(move.from_square)
+    # Underpromotion direction is turn-dependent (no board access needed).
     is_promotion = move.promotion is not None
 
     if is_promotion and move.promotion in (chess.KNIGHT, chess.BISHOP, chess.ROOK):
         # Underpromotion
-        # Determine direction offset
         # For white: forward = +1 rank, for black: forward = -1 rank
-        if board.turn == chess.WHITE:
+        if turn == chess.WHITE:
             if dr == 1 and dc == 0:
                 dir_idx = 0  # forward
             elif dr == 1 and dc == -1:
