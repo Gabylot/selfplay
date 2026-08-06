@@ -243,7 +243,15 @@ def play_one_game(mcts_engine, max_game_length=150, adjudicate_material=True,
         game_states.append((st, visit_policy.copy(), cp, legal_mask))
         mcts_stats_list.append(stats)
 
-        mcts_move_data = {'selected_move': selected_move.uci(), 'candidates': move_candidates}
+        mcts_move_data = {
+            'selected_move': selected_move.uci(),
+            'candidates':     move_candidates,
+            # Augment the per-move snapshot with search-effort so the GUI's
+            # "why this move?" panel can report how deep / how much MCTS ran.
+            'depth':          round(float(stats.get('avg_depth') or 0), 2),
+            'sims':           int(stats.get('num_simulations')
+                                  or sum(c['N'] for c in move_candidates)),
+        }
         board.push(selected_move)
         move_count += 1
         if on_move:

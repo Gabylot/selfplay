@@ -131,6 +131,11 @@ table.dt tr:hover td{background:#0f172a}
 .erbox .eprom{font-size:10px;font-weight:700;margin-top:4px}
 
 .seclbl{font-size:9px;color:#374151;text-transform:uppercase;letter-spacing:1px;margin-bottom:3px}
+
+/* W/D/L legend */
+.wdlleg{display:flex;gap:10px;align-items:center;margin-top:4px;font-size:10px;color:#475569}
+.wdlleg .sw{display:inline-block;width:9px;height:9px;border-radius:2px;margin-right:4px;vertical-align:-1px}
+.wdlleg .s-w{background:#3b82f6}.wdlleg .s-d{background:#6b7280}.wdlleg .s-l{background:#ef4444}
 </style>
 </head>
 <body>
@@ -198,6 +203,10 @@ table.dt tr:hover td{background:#0f172a}
         <div><div class="seclbl">MCTS Candidates (N W Q P)</div><div class="mbox" id="vmcts"><div style="color:#1f2937;text-align:center;padding:8px">No data</div></div></div>
       </div>
       <div><div class="seclbl">White-POV Q (agent's view, +1 = white winning)</div><div class="chmini"><canvas id="vq"></canvas></div></div>
+      <div><div class="seclbl">Win / Draw / Loss (est. from value head)</div><div class="chmini"><canvas id="vwl"></canvas></div>
+        <div class="wdlleg"><span><span class="sw s-w"></span>Win</span><span><span class="sw s-d"></span>Draw</span><span><span class="sw s-l"></span>Loss</span></div></div>
+      <div><div class="seclbl">Policy prior at root (top candidates, red = played)</div><div class="chmini"><canvas id="vpol"></canvas></div></div>
+      <div><div class="seclbl">Why this move?</div><div id="vwhy" style="background:#0f172a;border:1px solid #1e3a5f;border-radius:5px;padding:8px;font-size:11px;line-height:1.6;color:#64748b">Select a move…</div></div>
       <div><div class="seclbl">Recent Games (this worker)</div><div class="rlist" id="vrec"><div style="color:#374151;padding:4px 7px">No completed games yet</div></div></div>
     </div>
   </div>
@@ -227,6 +236,8 @@ table.dt tr:hover td{background:#0f172a}
         <div><div class="seclbl">MCTS Candidates</div><div class="mbox" id="emcts"><div style="color:#1f2937;text-align:center;padding:8px">No data</div></div></div>
       </div>
       <div><div class="seclbl">White-POV Q</div><div class="chmini"><canvas id="eq"></canvas></div></div>
+      <div><div class="seclbl">Win / Draw / Loss (est. from value head)</div><div class="chmini"><canvas id="ewl"></canvas></div>
+        <div class="wdlleg"><span><span class="sw s-w"></span>Win</span><span><span class="sw s-d"></span>Draw</span><span><span class="sw s-l"></span>Loss</span></div></div>
       <div><div class="seclbl">Recent Eval Games</div><div class="rlist" id="erec"><div style="color:#374151;padding:4px 7px">No eval games yet</div></div></div>
     </div>
   </div>
@@ -317,6 +328,27 @@ function makeMPSChart(id){
       scales:{x:{ticks:{color:'#374151',font:{size:8},maxTicksLimit:8},grid:{color:'#0a1020'}},
               y:{beginAtZero:true,ticks:{color:'#475569',font:{size:8}},grid:{color:'#1e3a5f'}}}}});
 }
+function makeWDLChart(id){
+  return new Chart(document.getElementById(id),{
+    type:'line',
+    data:{labels:[],datasets:[
+      {label:'Win',data:[],borderColor:'#3b82f6',backgroundColor:'rgba(59,130,246,.38)',fill:true,pointRadius:0,borderWidth:1,stack:'w'},
+      {label:'Draw',data:[],borderColor:'#6b7280',backgroundColor:'rgba(107,114,128,.38)',fill:true,pointRadius:0,borderWidth:1,stack:'w'},
+      {label:'Loss',data:[],borderColor:'#ef4444',backgroundColor:'rgba(239,68,68,.38)',fill:true,pointRadius:0,borderWidth:1,stack:'w'}]},
+    options:{responsive:true,maintainAspectRatio:false,animation:false,
+      plugins:{legend:{display:false}},
+      scales:{x:{stacked:true,ticks:{color:'#374151',font:{size:8},maxTicksLimit:8},grid:{color:'#0a1020'}},
+              y:{stacked:true,min:0,max:1,ticks:{color:'#475569',font:{size:8}},grid:{color:'#1e3a5f'}}}}});
+}
+function makePolicyChart(id){
+  return new Chart(document.getElementById(id),{
+    type:'bar',
+    data:{labels:[],datasets:[{label:'P',data:[],backgroundColor:[]}]},
+    options:{indexAxis:'y',responsive:true,maintainAspectRatio:false,animation:false,
+      plugins:{legend:{display:false}},
+      scales:{x:{min:0,beginAtZero:true,ticks:{color:'#475569',font:{size:8}},grid:{color:'#0a1020'}},
+              y:{ticks:{color:'#d1d5db',font:{size:8}},grid:{display:false}}}}});
+}
 
 // Plot the agent's evaluation (Q) from White's perspective for every move.
 // MCTS stores Q from the perspective of the player to move at the root; for a
@@ -338,6 +370,86 @@ function plotQ(p){
   p.qc.data.labels=labels;
   p.qc.data.datasets[0].data=data;
   p.qc.update('none');
+}
+
+// Convert a white-POV value in [-1,1] into a coarse Win/Draw/Loss probability
+// triple. The scalar value head doesn't separate the three outcomes, so we use
+// a transparent logistic+draw-band model: draws peak at even positions, wins
+// rise with the evaluation, and (Win+Draw+Loss)=1 everywhere.
+function wdlFromValue(v){
+  const k=1.4, D0=0.55, band=1.1;         // sharpness, draw mass, draw width
+  const e=Math.max(-1,Math.min(1,v));
+  const D=D0*Math.exp(-(e/band)*(e/band));        // draw probability
+  const f=1/(1+Math.exp(-k*e));                 // share of decisive for White
+  const dec=1-D;
+  return [dec*f, D, dec*(1-f)];                 // [Win, Draw, Loss] white-pov
+}
+function plotWDL(p){
+  if(!p.wdl)return;
+  const s=p.state;
+  if(p._wlLen===s.moves.length)return;
+  p._wlLen=s.moves.length;
+  const labels=[],W=[],D=[],L=[];
+  for(let i=0;i<s.moves.length;i++){
+    const ms=s.mcts[i];
+    const c=ms&&ms.selected_move?(ms.candidates||[]).find(x=>x.move===ms.selected_move):null;
+    labels.push(i+1);
+    if(c&&isFinite(c.Q)){
+      const v=(i%2===0)?-c.Q:c.Q;   // white-perspective value
+      const wd=wdlFromValue(v);
+      W.push(wd[0]);D.push(wd[1]);L.push(wd[2]);
+    }else{W.push(null);D.push(null);L.push(null);}
+  }
+  p.wdl.data.labels=labels;
+  p.wdl.data.datasets[0].data=W;
+  p.wdl.data.datasets[1].data=D;
+  p.wdl.data.datasets[2].data=L;
+  p.wdl.update('none');
+}
+
+// Horizontal bar chart of the policy prior (P) over the root's top candidates
+// for the currently selected ply. Red bar marks the move that was actually
+// played.
+function renderPolicyBars(p){
+  const ch=p.pol; if(!ch)return;
+  const s=p.state, idx=s.idx;
+  if(idx<0||!s.mcts||idx>=s.mcts.length)return;
+  const ms=s.mcts[idx]; if(!ms||!ms.candidates||!ms.candidates.length)return;
+  const sorted=[...ms.candidates].sort((a,b)=>Number(b.P||0)-Number(a.P||0)).slice(0,12);
+  ch.data.labels=sorted.map(c=>c.move);
+  ch.data.datasets[0].data=sorted.map(c=>Number(c.P)||0);
+  ch.data.datasets[0].backgroundColor=sorted.map(c=>c.move===ms.selected_move?'#ef4444':'#3b82f6');
+  ch.update('none');
+}
+
+// Interpretive panel for the selected ply: depth, search effort, the played
+// move's N/W/Q/P plus its visit-rank and a "policy surprise" flag (the engine
+// played a move the prior rated low, i.e. it spotted something MCTS upweighted).
+function renderWhy(p){
+  const el=document.getElementById(p.d.why); if(!el)return;
+  const s=p.state, idx=s.idx;
+  if(idx<0||!s.mcts||idx>=s.mcts.length){el.innerHTML='Select a move…';return;}
+  const ms=s.mcts[idx]; if(!ms||!ms.selected_move){el.innerHTML='No MCTS data for this ply';return;}
+  const cs=ms.candidates||[];
+  const sel=cs.find(c=>c.move===ms.selected_move);
+  if(!sel){el.innerHTML='No root-child stats recorded at this ply';return;}
+  const totalN=cs.reduce((a,c)=>(a+(Number(c.N)||0)),0)||1;
+  const byN=[...cs].sort((a,b)=>(Number(b.N)||0)-(Number(a.N)||0));
+  const rank=byN.findIndex(c=>c.move===sel.move)+1;
+  const maxP=Math.max(...cs.map(c=>Number(c.P)||0));
+  const selP=Number(sel.P)||0;
+  const selN=Number(sel.N)||0;
+  const surprise= maxP>0 && selP/maxP<0.5 ? ' — low policy prior, engine overrode it (exploration)' : '';
+  const qval=(idx%2===0)?-Number(sel.Q):Number(sel.Q);  // white-perspective
+  let h='';
+  h+=`<b style="color:#22c55e">${ms.selected_move}</b> — ply ${idx+1}`;
+  if(ms.depth!=null)h+=` · search avg depth <b style="color:#d1d5db">${(+ms.depth).toFixed(1)}</b>`;
+  if(ms.sims!=null)h+=` · sims <b style="color:#d1d5db">${ms.sims}</b>`;
+  h+=`<br>Visits <b style="color:#d1d5db">${selN}</b> (${(selN/totalN*100).toFixed(0)}%) · rank <b style="color:#d1d5db">#${rank}</b>/${cs.length}`;
+  h+=` · Q (white-pov) <b style="color:${qval>=0?'#22c55e':'#ef4444'}">${qval.toFixed(2)}</b>`;
+  h+=` · W <b style="color:#d1d5db">${(-Number(sel.W)).toFixed(2)}</b> · prior P <b style="color:#d1d5db">${selP.toFixed(3)}</b> (max ${maxP.toFixed(3)})`;
+  if(surprise)h+=`<br><span style="color:#f59e0b">${surprise}</span>`;
+  el.innerHTML=h;
 }
 
 // ════════════════════════════════════════════
@@ -407,6 +519,8 @@ class Player{
     this.iv=null;
     this.replay=false;               // true while showing a finished game
     this.jumpToTail=false;           // next commit shows newest move instantly
+    this.qc=null; this.wdl=null; this.pol=null;   // chart handles (created in init)
+    this._qLen=-1; this._wlLen=-1; this._polIdx=-1;
   }
 
   // Resolve a dom entry by id (or return it directly if already an element).
@@ -427,6 +541,7 @@ class Player{
       if(this.state.status==='finished')return;
       this.gid=gid;
       this.state=emptySt();
+      this._qLen=-1; this._wlLen=-1; this._polIdx=-1;
       const b=this._el('board');
       if(b)b.position('start',false);
     }
@@ -445,6 +560,7 @@ class Player{
     }
     if(this.jumpToTail){s.idx=s.fens.length-1;this.jumpToTail=false;}
     plotQ(this);
+    plotWDL(this);
     this.paint();
     this.ensureAdvance();
   }
@@ -517,6 +633,9 @@ class Player{
     }
     if(this.d.ml)renderML(s,this.d.ml,this.d.onPick);
     if(this.d.ms)renderMCTS(s,this.d.ms);
+    // policy bar re-plots only when the selected ply changes
+    if(this.pol&&this._polIdx!==s.idx){this._polIdx=s.idx;renderPolicyBars(this);}
+    renderWhy(this);
     const res=this._el('res');
     if(res){
       if(s.result){
@@ -538,7 +657,8 @@ class Player{
     const lb=this._el('btnL');if(lb)lb.style.display='';
     const pb=this._el('btnP');if(pb){pb.textContent='▶ Play';pb.classList.remove('active');}
     this.paused=true;this.auto=false;
-    this._qLen=-1;plotQ(this);
+    this._qLen=-1;this._wlLen=-1;this._polIdx=-1;
+    plotQ(this);plotWDL(this);
     this.paint();
   }
 }
@@ -555,7 +675,7 @@ function initMBoard(){
 
 const V=new Player({
   board:null,
-  ml:'vml',ms:'vmcts',mov:'vMov',of:'vOf',badge:'vbadge',res:'vres',info:null,
+  ml:'vml',ms:'vmcts',mov:'vMov',of:'vOf',badge:'vbadge',res:'vres',info:null,why:'vwhy',
   btnP:'vpbtn',btnL:'vlbtn',slider:'vspd',spdLbl:'vspdlbl',
   onLive:()=>{document.getElementById('vlbtn').style.display='none';socket.emit('request_worker_detail',{worker_id:vWorker});},
   onPick:i=>{V.go(i);}
@@ -566,7 +686,7 @@ function openV(w){
   document.getElementById('viewer').className='card viewer open';
   document.getElementById('vwid').textContent=w;
   document.getElementById('vlbtn').style.display='none';
-  V.replay=false;V.gid=0;V.state=emptySt();V._qLen=-1;
+  V.replay=false;V.gid=0;V.state=emptySt();V._qLen=-1;V._wlLen=-1;V._polIdx=-1;
   mboard&&mboard.position('start',false);
   V.paused=false;V.auto=true;V.jumpToTail=true;V.stop();
   const pb=document.getElementById('vpbtn');
@@ -854,7 +974,9 @@ $(document).ready(async()=>{
   initMBoard(); initEBoard();
   V.d.board=mboard; E.d.board=eboard;
   V.qc=makeQChart('vq'); E.qc=makeQChart('eq');
-  V._qLen=-1; E._qLen=-1;
+  V.wdl=makeWDLChart('vwl'); E.wdl=makeWDLChart('ewl');
+  V.pol=makePolicyChart('vpol');
+  V._qLen=-1; E._qLen=-1; V._wlLen=-1; E._wlLen=-1; V._polIdx=-1;
   CHART_MPS=makeMPSChart('cmps');
   V.spd();
   const wc=await fj('/api/num_workers');
