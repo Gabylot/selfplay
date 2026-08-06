@@ -16,12 +16,35 @@ from typing import List, Optional, Dict, Any
 from collections import deque
 
 
+# ── Detail-view focus registry ────────────────────────────────────────────────
+# Only the worker whose detail view is currently expanded in the browser needs
+# the full per-move snapshots (moves + fens + MCTS stats).  Pushing those for
+# *every* worker on every emit was the main source of socket floods and browser
+# frame drops on fast self-play.  app.py updates this when the browser opens/
+# closes the viewer; LiveGameState._do_emit() checks it before emitting detail.
+_expanded_worker = None
+_expanded_worker_lock = threading.Lock()
+
+
+def set_expanded_worker(worker_id):
+    """Record which worker's detail view is expanded (-1/None = none)."""
+    global _expanded_worker
+    with _expanded_worker_lock:
+        _expanded_worker = worker_id
+
+
+def get_expanded_worker():
+    """Return the currently expanded worker id (or None)."""
+    with _expanded_worker_lock:
+        return _expanded_worker
+
+
 class LiveGameState:
     """Thread-safe live game state. One instance per worker (or eval board)."""
 
     # Minimum seconds between throttled emits (prevents flooding Socket.IO
     # with too many packets when replaying a full game in a tight loop).
-    _MIN_EMIT_INTERVAL = 0.1  # 100ms
+    _MIN_EMIT_INTERVAL = 0.05  # 50ms — live moves broadcast ~20×/sec max
 
     def __init__(self, socketio=None, max_history: int = 20,
                  worker_id: int = -1, is_eval: bool = False,
@@ -239,11 +262,14 @@ class LiveGameState:
             tile = self.get_tile_state()
             self._socketio.emit('worker_tile_update', tile)
 
-            # 2. Full detail update (for the expanded viewer — browser ignores
-            #    it if this worker isn't the one currently expanded)
-            with self._lock:
-                full = self._full_state()
-            self._socketio.emit('worker_detail_update', full)
+            # 2. Full detail update ONLY for the worker whose detail view is
+            #    currently expanded — the browser ignores events for any other
+            #    worker, so pushing them all was pure waste (each snapshot is
+            #    the whole game's moves + fens + MCTS history).
+            if self._worker_id == get_expanded_worker():
+                with self._lock:
+                    full = self._full_state()
+                self._socketio.emit('worker_detail_update', full)
 
     # ── Backwards-compat alias ────────────────────────────────────────────
     def _emit_update(self):

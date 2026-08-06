@@ -4,7 +4,7 @@ from pathlib import Path
 from flask import Flask, render_template, jsonify, send_from_directory
 from flask_socketio import SocketIO
 from stats import StatsLogger
-from gui.live_game import LiveGameState
+from gui.live_game import LiveGameState, set_expanded_worker
 
 app = Flask(__name__, template_folder=str(Path(__file__).parent/"templates"))
 app.config['SECRET_KEY'] = 'alphazero-chess'
@@ -101,6 +101,19 @@ def on_request_worker_states():
 @socketio.on('request_worker_detail')
 def on_request_worker_detail(data):
     wid = data.get('worker_id', 0)
+    if 0 <= wid < len(_worker_live_games):
+        socketio.emit('worker_detail_update', _worker_live_games[wid].get_state())
+
+@socketio.on('select_worker')
+def on_select_worker(data):
+    """Register which worker's detail view is open in the browser.
+
+    LiveGameState._do_emit() only pushes full detail snapshots for this
+    worker, so fast self-play doesn't flood the socket with unused data.
+    -1 (or missing) means no detail view is open.
+    """
+    wid = -1 if data is None else data.get('worker_id', -1)
+    set_expanded_worker(wid if 0 <= wid < len(_worker_live_games) else -1)
     if 0 <= wid < len(_worker_live_games):
         socketio.emit('worker_detail_update', _worker_live_games[wid].get_state())
 

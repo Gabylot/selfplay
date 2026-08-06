@@ -45,7 +45,8 @@ def signal_handler(sig, frame):
 # Training loop
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _dispatch_live_message(psp, worker_live_games, result):
+def _dispatch_live_message(psp, worker_live_games, worker_live_game_ids,
+                           step, result):
     """Handle a single live_start / live_move / live_end result immediately
     so the GUI stays responsive.  Returns True if a live message was
     dispatched, False otherwise (e.g. for a full selfplay result)."""
@@ -55,8 +56,14 @@ def _dispatch_live_message(psp, worker_live_games, result):
     rtype = result.get('type')
     if rtype == 'live_start':
         wid = result['worker_id']
+        # Every worker runs exactly one game at a time and emits exactly one
+        # live_start grip-cycle, so a monotonic per-worker counter is a safe,
+        # stable id the frontend can use to detect game boundaries.  Previously
+        # game_id was hard-coded to 0, which made the browser merge consecutive
+        # self-play games into one display (the "skips a game" / fast-forward).
+        worker_live_game_ids[wid] += 1
         wlg = worker_live_games[wid]
-        wlg.start_game(0, 0,  # game_id/step set later by caller
+        wlg.start_game(worker_live_game_ids[wid], step,
                        game_type=result.get('game_type', 'selfplay'),
                        match_info=result.get('match_info'))
         return True
@@ -210,7 +217,8 @@ def run_training(config, gui_enabled=False, num_workers=None):
                 continue
 
             # ── Live incremental messages (real-time GUI updates) ──
-            if _dispatch_live_message(psp, worker_live_games, result):
+            if _dispatch_live_message(psp, worker_live_games, worker_live_game_ids,
+                                      step, result):
                 continue
 
             # Only process self-play results in the main loop
@@ -284,7 +292,8 @@ def run_training(config, gui_enabled=False, num_workers=None):
                 # so the browser stays in sync instead of showing a burst later.
                 _pending_selfplay = []
                 for r in psp.collect_available():
-                    if _dispatch_live_message(psp, worker_live_games, r):
+                    if _dispatch_live_message(psp, worker_live_games, worker_live_game_ids,
+                                              step, r):
                         pass
                     elif r.get('type') == 'selfplay' and not r.get('done'):
                         _pending_selfplay.append(r)
@@ -293,7 +302,8 @@ def run_training(config, gui_enabled=False, num_workers=None):
                     if _shutdown: break
                     # Drain any new live messages between batches
                     for r in psp.collect_available():
-                        if _dispatch_live_message(psp, worker_live_games, r):
+                        if _dispatch_live_message(psp, worker_live_games, worker_live_game_ids,
+                                                  step, r):
                             pass
                         elif r.get('type') == 'selfplay' and not r.get('done'):
                             _pending_selfplay.append(r)

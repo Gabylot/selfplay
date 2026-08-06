@@ -12,7 +12,7 @@
 <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.7.4/socket.io.min.js"></script>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
-body{font-family:'Segoe UI',Arial,sans-serif;background:#111827;color:#d1d5db}
+body{font-family:'Segoe UI',Arial,sans-serif;background:#0b1220;color:#d1d5db}
 .hdr{background:#0f172a;padding:12px 20px;border-bottom:1px solid #1e3a5f;display:flex;align-items:center;gap:12px}
 .hdr h1{font-size:17px;color:#f1f5f9;letter-spacing:.3px}
 .hdr .sub{font-size:11px;color:#475569;margin-left:auto}
@@ -21,7 +21,7 @@ body{font-family:'Segoe UI',Arial,sans-serif;background:#111827;color:#d1d5db}
 
 /* Stat strip */
 .strip{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:14px}
-.sbox{background:#1e293b;border:1px solid #1e3a5f;border-radius:6px;padding:8px 12px;flex:1;min-width:100px;text-align:center}
+.sbox{background:#1e293b;border:1px solid #1e3a5f;border-radius:8px;padding:8px 12px;flex:1;min-width:100px;text-align:center}
 .sbox .l{font-size:9px;color:#475569;text-transform:uppercase;letter-spacing:1px}
 .sbox .v{font-size:20px;font-weight:700;margin-top:2px}
 .red{color:#ef4444}.blue{color:#3b82f6}.green{color:#22c55e}.amber{color:#f59e0b}.purple{color:#a78bfa}.sky{color:#38bdf8}.muted{color:#6b7280}
@@ -39,7 +39,7 @@ body{font-family:'Segoe UI',Arial,sans-serif;background:#111827;color:#d1d5db}
 
 /* Game grid */
 .game-grid{display:grid;gap:8px}
-.tile{background:#0f172a;border:1px solid #1e3a5f;border-radius:7px;cursor:pointer;overflow:hidden;transition:border-color .15s,box-shadow .15s}
+.tile{background:#0f172a;border:1px solid #1e3a5f;border-radius:8px;cursor:pointer;overflow:hidden;transition:border-color .15s,box-shadow .15s}
 .tile:hover{border-color:#3b82f6;box-shadow:0 0 0 1px #3b82f6}
 .tile.active{border-color:#22c55e;box-shadow:0 0 0 2px #22c55e}
 .tile-hdr{padding:5px 8px;display:flex;align-items:center;gap:6px;background:#080e1a;border-bottom:1px solid #1e3a5f;font-size:11px}
@@ -50,7 +50,8 @@ body{font-family:'Segoe UI',Arial,sans-serif;background:#111827;color:#d1d5db}
 .tbadge.finished{background:#450a0a;color:#fca5a5}
 .tbadge.idle{background:#1e293b;color:#475569}
 .tile-board{width:100%;aspect-ratio:1;pointer-events:none}
-.tile-foot{padding:3px 8px;font-size:9px;color:#475569;display:flex;justify-content:space-between}
+.tile-foot{padding:4px 8px;font-size:9px;color:#475569;display:flex;justify-content:space-between;align-items:center}
+.tile-foot .rate{color:#38bdf8;font-variant-numeric:tabular-nums}
 
 /* Viewer */
 .viewer{display:none}
@@ -102,9 +103,13 @@ body{font-family:'Segoe UI',Arial,sans-serif;background:#111827;color:#d1d5db}
 .tpill{font-size:8px;font-weight:700;padding:1px 4px;border-radius:5px;margin-right:3px}
 .tpill.gating{background:#450a0a;color:#fca5a5}
 .tpill.reference{background:#1e3a5f;color:#93c5fd}
+.tpill.selfplay{background:#0f172a;color:#86efac}
 
 /* Charts */
 .chwrap{position:relative;height:240px}
+.chmini{position:relative;height:90px}
+.hdr .ps{font-size:12px;color:#38bdf8;font-weight:700;margin-left:14px;font-variant-numeric:tabular-nums}
+.hdr .ps .lbl{font-size:9px;color:#475569;font-weight:600;margin-right:3px}
 
 /* Tables */
 table.dt{width:100%;border-collapse:collapse;font-size:11px}
@@ -132,7 +137,9 @@ table.dt tr:hover td{background:#0f172a}
 <div class="hdr">
   <h1>AlphaZero Chess Engine</h1>
   <div class="conn"><span id="cdot" style="color:#ef4444">●</span> <span id="ctxt" style="margin-left:3px">Connecting…</span></div>
-  <div class="sub">step <b id="hstep">0</b> · games <b id="hgames">0</b> · buf <b id="hbuf">0</b></div>
+  <div class="sub">step <b id="hstep">0</b> · games <b id="hgames">0</b> · buf <b id="hbuf">0</b>
+    <span class="ps" title="Total moves/sec across all workers"><span class="lbl">⚡</span><span id="hMps">0.0</span></span>
+  </div>
 </div>
 <div class="wrap">
 
@@ -154,6 +161,12 @@ table.dt tr:hover td{background:#0f172a}
   <div class="olbls"><span>White <span id="ow">0%</span></span><span>Draw <span id="od">0%</span></span><span>Black <span id="ob">0%</span></span></div>
 </div>
 
+<!-- ═══ REAL-TIME RATE (all workers) ═══ -->
+<div class="card" style="padding:8px 14px;margin-bottom:10px">
+  <div class="seclbl" style="display:flex;justify-content:space-between">Total Moves/sec <span id="cmps_lbl" style="color:#475569">—</span></div>
+  <div class="chmini"><canvas id="cmps"></canvas></div>
+</div>
+
 <!-- ═══ GAME GRID ═══ -->
 <div class="card">
   <h2>Live Self-Play · <span id="wcnt">?</span> Workers</h2>
@@ -170,19 +183,21 @@ table.dt tr:hover td{background:#0f172a}
     <div class="bwrap"><div id="mboard" style="width:340px"></div></div>
     <div class="vside">
       <div class="ctrl">
-        <button id="vpbtn" class="active" onclick="vPause()">⏸ Pause</button>
-        <button onclick="vBack()">◀ Back</button>
-        <button onclick="vFwd()">▶ Fwd</button>
-        <button onclick="vStart()">⏮ Start</button>
-        <button onclick="vEnd()">⏭ End</button>
-        <button id="vlbtn" onclick="vLive()" style="display:none">🔴 Live</button>
-        <div class="spd">Speed <input type="range" id="vspd" min="100" max="3000" value="500" step="100" oninput="vSpdChange()"> <span id="vspdlbl">500ms</span></div>
+        <span style="font-size:11px;color:#475569">Move <b id="vMov">0</b><span id="vOf"></span></span>
+        <button id="vpbtn" class="active" onclick="V.toggle()">⏸ Pause</button>
+        <button onclick="V.back()">◀ Back</button>
+        <button onclick="V.fwd()">▶ Fwd</button>
+        <button onclick="V.first()">⏮ Start</button>
+        <button onclick="V.last()">⏭ End</button>
+        <button id="vlbtn" onclick="V.live()" style="display:none">🔴 Live</button>
+        <div class="spd">Speed <input type="range" id="vspd" min="100" max="3000" value="600" step="100" oninput="V.spd()"> <span id="vspdlbl">600ms</span></div>
       </div>
       <div id="vres" style="font-size:12px;color:#475569;display:none"></div>
       <div style="display:grid;grid-template-columns:1fr 1fr;gap:7px">
         <div><div class="seclbl">Move List</div><div class="mlist" id="vml"></div></div>
         <div><div class="seclbl">MCTS Candidates (N W Q P)</div><div class="mbox" id="vmcts"><div style="color:#1f2937;text-align:center;padding:8px">No data</div></div></div>
       </div>
+      <div><div class="seclbl">White-POV Q (agent's view, +1 = white winning)</div><div class="chmini"><canvas id="vq"></canvas></div></div>
       <div><div class="seclbl">Recent Games (this worker)</div><div class="rlist" id="vrec"><div style="color:#374151;padding:4px 7px">No completed games yet</div></div></div>
     </div>
   </div>
@@ -195,22 +210,23 @@ table.dt tr:hover td{background:#0f172a}
     <div class="bwrap"><div id="eboard" style="width:280px"></div></div>
     <div class="vside">
       <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
-        <span style="font-size:11px;color:#475569">Eval Game <b id="egid">—</b> · Move <b id="emov">0</b></span>
+        <span style="font-size:11px;color:#475569">Eval Game <b id="egid">—</b> · Move <b id="eMov">0</b></span>
         <span class="badge idle" id="ebadge">IDLE</span>
       </div>
       <div class="ctrl">
-        <button id="epbtn" class="active" onclick="ePause()">⏸ Pause</button>
-        <button onclick="eBack()">◀ Back</button>
-        <button onclick="eFwd()">▶ Fwd</button>
-        <button onclick="eStart()">⏮ Start</button>
-        <button onclick="eEnd()">⏭ End</button>
-        <button id="elbtn" onclick="eLive()" style="display:none">🔴 Live</button>
+        <button id="epbtn" class="active" onclick="E.toggle()">⏸ Pause</button>
+        <button onclick="E.back()">◀ Back</button>
+        <button onclick="E.fwd()">▶ Fwd</button>
+        <button onclick="E.first()">⏮ Start</button>
+        <button onclick="E.last()">⏭ End</button>
+        <button id="elbtn" onclick="E.live()" style="display:none">🔴 Live</button>
       </div>
       <div id="eres" style="font-size:11px;color:#475569;display:none"></div>
       <div style="display:grid;grid-template-columns:1fr 1fr;gap:7px">
         <div><div class="seclbl">Move List</div><div class="mlist" id="eml"></div></div>
         <div><div class="seclbl">MCTS Candidates</div><div class="mbox" id="emcts"><div style="color:#1f2937;text-align:center;padding:8px">No data</div></div></div>
       </div>
+      <div><div class="seclbl">White-POV Q</div><div class="chmini"><canvas id="eq"></canvas></div></div>
       <div><div class="seclbl">Recent Eval Games</div><div class="rlist" id="erec"><div style="color:#374151;padding:4px 7px">No eval games yet</div></div></div>
     </div>
   </div>
@@ -279,201 +295,60 @@ const CR=mk('crates',[{label:'White%',data:[],borderColor:'#3b82f6',fill:false,p
   {scales:{...CO.scales,y:{...CO.scales.y,min:0,max:100}}});
 function fill(c,rows,ks){if(!rows||!rows.length)return;c.data.labels=rows.map(r=>r.step||r.game_id||0);ks.forEach((k,i)=>{c.data.datasets[i].data=rows.map(r=>r[k]);});c.update('none');}
 
-// ════════════════════════════════════════════
-// Tile grid
-// ════════════════════════════════════════════
-let numW=0, tileBoards=[], tileStates={};
+// ── small charts (moves/sec + White-POV Q) ──
+function makeQChart(id){
+  return new Chart(document.getElementById(id),{
+    type:'line',
+    data:{labels:[],datasets:[{label:'White-POV Q',data:[],borderColor:'#f59e0b',
+      backgroundColor:'rgba(245,158,11,.10)',fill:true,pointRadius:0,borderWidth:1.5}]},
+    options:{responsive:true,maintainAspectRatio:false,animation:false,
+      plugins:{legend:{display:false}},
+      scales:{x:{ticks:{color:'#374151',font:{size:8},maxTicksLimit:8},grid:{color:'#0a1020'}},
+              y:{min:-1,max:1,ticks:{color:'#475569',font:{size:8},stepSize:0.5},
+                 grid:{color:'#1e3a5f'}}}}});
+}
+function makeMPSChart(id){
+  return new Chart(document.getElementById(id),{
+    type:'line',
+    data:{labels:[],datasets:[{label:'moves/sec',data:[],borderColor:'#38bdf8',
+      backgroundColor:'rgba(56,189,248,.12)',fill:true,pointRadius:0,borderWidth:1.5}]},
+    options:{responsive:true,maintainAspectRatio:false,animation:false,
+      plugins:{legend:{display:false}},
+      scales:{x:{ticks:{color:'#374151',font:{size:8},maxTicksLimit:8},grid:{color:'#0a1020'}},
+              y:{beginAtZero:true,ticks:{color:'#475569',font:{size:8}},grid:{color:'#1e3a5f'}}}}});
+}
 
-function buildGrid(n){
-  numW=n;
-  document.getElementById('wcnt').textContent=n;
-  const g=document.getElementById('grid');
-  g.innerHTML='';
-  const cols=Math.min(n,4);
-  g.style.gridTemplateColumns=`repeat(${cols},1fr)`;
-  tileBoards=[];
-  for(let i=0;i<n;i++){
-    const d=document.createElement('div');
-    d.className='tile'; d.id=`t${i}`;
-    d.innerHTML=`<div class="tile-hdr"><span class="wlbl">W${i}</span><span class="glbl" id="tg${i}">—</span><span class="tbadge idle" id="tb${i}">IDLE</span></div><div id="tb${i}b" class="tile-board"></div><div class="tile-foot"><span id="tm${i}">0 moves</span><span id="tr${i}" style="color:#1f2937">—</span></div>`;
-    d.onclick=()=>openV(i);
-    g.appendChild(d);
-    tileBoards.push(Chessboard(`tb${i}b`,{position:'start',showNotation:false,pieceTheme:'/chess_pieces/{piece}.png'}));
+// Plot the agent's evaluation (Q) from White's perspective for every move.
+// MCTS stores Q from the perspective of the player to move at the root; for a
+// White move that's Black's perspective (flip), for a Black move it's already
+// White's (no flip). White moves are the even plies (0, 2, 4, …).
+function plotQ(p){
+  if(!p.qc)return;
+  const s=p.state;
+  if(p._qLen===s.moves.length)return;
+  p._qLen=s.moves.length;
+  const labels=[],data=[];
+  for(let i=0;i<s.moves.length;i++){
+    const ms=s.mcts[i];
+    const c=ms&&ms.selected_move?(ms.candidates||[]).find(x=>x.move===ms.selected_move):null;
+    let val=null;
+    if(c&&isFinite(c.Q))val=(i%2===0)?-c.Q:c.Q;   // white-perspective
+    labels.push(i+1); data.push(val);
   }
-}
-
-function applyTile(s){
-  const w=s.worker_id; if(w>=numW)return;
-  tileStates[w]=s;
-  const badge=document.getElementById(`tb${w}`), gid=document.getElementById(`tg${w}`),
-        mv=document.getElementById(`tm${w}`), res=document.getElementById(`tr${w}`);
-  if(badge){badge.className=`tbadge ${s.status||'idle'}`;badge.textContent=(s.status||'idle').toUpperCase();}
-  if(gid)gid.textContent=s.game_id?`#${s.game_id}`:'—';
-  if(mv)mv.textContent=`${s.num_moves||0} moves`;
-  if(res){
-    const gt=s.game_type||'selfplay';
-    const typeColor=gt==='gating'?'#f87171':gt==='reference'?'#60a5fa':'#1f2937';
-    if(s.status==='finished'&&s.result){
-      const c=s.result==='1-0'?'#3b82f6':s.result==='0-1'?'#ef4444':'#475569';
-      res.innerHTML=`<span style="color:${c}">${s.result}</span>`;
-    } else res.innerHTML='—';
-  }
-  const fen=s.latest_fen||'start';
-  try{tileBoards[w]&&tileBoards[w].position(fen,false);}catch(e){}
-
-  // If this worker is the one currently expanded, keep viewer in sync
-  if(vWorker===w&&!vReplaying) applyDetail(s);
+  p.qc.data.labels=labels;
+  p.qc.data.datasets[0].data=data;
+  p.qc.update('none');
 }
 
 // ════════════════════════════════════════════
-// Viewer
+// Shared renderers (move list + MCTS)
 // ════════════════════════════════════════════
-let mboard=null, vWorker=-1, vReplaying=false, vReplayData=null;
-let vSt={moves:[],fens:[],mcts:[],status:'idle',idx:-1};
-let vPaused=false, vIv=null, vSpd=500, vMovesUpTo=-1;
-
-function initMBoard(){
-  mboard=Chessboard('mboard',{position:'start',showNotation:true,pieceTheme:'/chess_pieces/{piece}.png'});
-  $(window).resize(()=>mboard&&mboard.resize());
+function inl(st,i){
+  if(!st.mcts||i>=st.mcts.length)return'';
+  const ms=st.mcts[i]; if(!ms||!ms.selected_move)return'';
+  const c=(ms.candidates||[]).find(x=>x.move===ms.selected_move);
+  if(!c)return''; return` (N:${c.N} Q:${(-c.Q).toFixed(2)})`;
 }
-
-function openV(w){
-  vWorker=w; vReplaying=false; vReplayData=null;
-  document.getElementById('viewer').className='card viewer open';
-  document.getElementById('vwid').textContent=w;
-  document.getElementById('vlbtn').style.display='none';
-  vSt={moves:[],fens:[],mcts:[],status:'idle',idx:-1}; vMovesUpTo=-1;
-  mboard&&mboard.position('start',false);
-  socket.emit('request_worker_detail',{worker_id:w});
-  socket.emit('request_game_history',{worker_id:w});
-  document.querySelectorAll('.tile').forEach(t=>t.classList.remove('active'));
-  document.getElementById(`t${w}`)?.classList.add('active');
-  document.getElementById('viewer').scrollIntoView({behavior:'smooth',block:'start'});
-}
-
-function closeViewer(){
-  vWorker=-1; vStop();
-  document.getElementById('viewer').className='card viewer';
-  document.querySelectorAll('.tile').forEach(t=>t.classList.remove('active'));
-}
-
-function applyDetail(data){
-  if(!data)return;
-  const nm=data.moves||[], nf=data.fens||[], nc=data.mcts_stats_per_move||[];
-  if(!vReplaying){
-    // If new game started, reset
-    if(data.game_id && data.game_id !== (vSt._gid||0)){
-      vSt={moves:[],fens:[],mcts:[],status:data.status||'idle',idx:-1,_gid:data.game_id};
-      vMovesUpTo=-1;
-      mboard&&mboard.position('start',false);
-    }
-    vSt.status=data.status||'idle';
-    while(vMovesUpTo<nm.length-1){
-      vMovesUpTo++;
-      vSt.moves.push(nm[vMovesUpTo]);
-      vSt.fens.push(nf[vMovesUpTo]);
-      if(vMovesUpTo<nc.length)vSt.mcts.push(nc[vMovesUpTo]);
-    }
-    if(!vPaused)vSt.idx=vSt.fens.length-1;
-  }
-  renderV();
-}
-
-function renderV(){
-  const badge=document.getElementById('vbadge');
-  if(badge){badge.className=`badge ${vSt.status}`;badge.textContent=vSt.status.toUpperCase();}
-  if(mboard){
-    if(vSt.idx>=0&&vSt.idx<vSt.fens.length)mboard.position(vSt.fens[vSt.idx],false);
-    else if(!vSt.fens.length)mboard.position('start',false);
-  }
-  renderML(vSt,'vml',i=>{vSt.idx=i;renderV();});
-  renderMCTS(vSt,'vmcts');
-  const rEl=document.getElementById('vres');
-  const src=vReplaying?vReplayData:null;
-  if(rEl&&src&&src.result){
-    const c=src.result==='1-0'?'#3b82f6':src.result==='0-1'?'#ef4444':'#475569';
-    rEl.innerHTML=`<span style="color:${c};font-weight:700">${src.result}</span> — ${src.termination||''}`;
-    rEl.style.display='block';
-  } else if(rEl)rEl.style.display='none';
-}
-
-function vPause(){vPaused=!vPaused;const b=document.getElementById('vpbtn');if(vPaused){b.textContent='▶ Play';b.classList.remove('active');vStop();}else{b.textContent='⏸ Pause';b.classList.add('active');vPlay();}}
-function vPlay(){vStop();vIv=setInterval(()=>{if(vSt.idx<vSt.fens.length-1){vSt.idx++;renderV();}else vStop();},vSpd);}
-function vStop(){if(vIv){clearInterval(vIv);vIv=null;}}
-function vBack(){if(vSt.idx>0){vSt.idx--;renderV();}}
-function vFwd(){if(vSt.idx<vSt.fens.length-1){vSt.idx++;renderV();}}
-function vStart(){vSt.idx=-1;mboard&&mboard.position('start',true);renderML(vSt,'vml',i=>{vSt.idx=i;renderV();});renderMCTS(vSt,'vmcts');}
-function vEnd(){if(vSt.fens.length){vSt.idx=vSt.fens.length-1;renderV();}}
-function vLive(){vReplaying=false;vReplayData=null;document.getElementById('vlbtn').style.display='none';socket.emit('request_worker_detail',{worker_id:vWorker});}
-function vSpdChange(){vSpd=parseInt(document.getElementById('vspd').value);document.getElementById('vspdlbl').textContent=vSpd+'ms';if(!vPaused)vPlay();}
-
-function replayGame(w,gid){
-  vReplaying=true;
-  document.getElementById('vlbtn').style.display='';
-  socket.emit('request_replay_game',{worker_id:w,game_id:gid});
-}
-
-// ════════════════════════════════════════════
-// Eval board
-// ════════════════════════════════════════════
-let eboard=null;
-let eSt={moves:[],fens:[],mcts:[],status:'idle',idx:-1};
-let ePaused=false, eIv=null, eReplaying=false, eReplayData=null, eMovesUpTo=-1, eLastGid=0;
-
-function initEBoard(){eboard=Chessboard('eboard',{position:'start',showNotation:true,pieceTheme:'/chess_pieces/{piece}.png'});}
-
-function applyEval(data){
-  if(!data)return;
-  const nm=data.moves||[],nf=data.fens||[],nc=data.mcts_stats_per_move||[];
-  if(!eReplaying){
-    if(data.game_id&&data.game_id!==eLastGid){
-      eLastGid=data.game_id;
-      eSt={moves:[],fens:[],mcts:[],status:data.status||'idle',idx:-1};
-      eMovesUpTo=-1; eboard&&eboard.position('start',false);
-    }
-    eSt.status=data.status||'idle';
-    while(eMovesUpTo<nm.length-1){eMovesUpTo++;eSt.moves.push(nm[eMovesUpTo]);eSt.fens.push(nf[eMovesUpTo]);if(eMovesUpTo<nc.length)eSt.mcts.push(nc[eMovesUpTo]);}
-    if(!ePaused)eSt.idx=eSt.fens.length-1;
-  }
-  renderE(data);
-}
-
-function renderE(data){
-  const src=eReplaying?eReplayData:data;
-  const badge=document.getElementById('ebadge');
-  if(badge){badge.className=`badge ${eSt.status}`;badge.textContent=eSt.status.toUpperCase();}
-  document.getElementById('emov').textContent=eSt.idx+1;
-  if(src){
-    document.getElementById('egid').textContent=src.game_id?`#${src.game_id}`:'—';
-    document.getElementById('eminfo').textContent=src.match_info||'';
-  }
-  if(eboard){
-    if(eSt.idx>=0&&eSt.idx<eSt.fens.length)eboard.position(eSt.fens[eSt.idx],false);
-    else eboard.position('start',false);
-  }
-  renderML(eSt,'eml',i=>{eSt.idx=i;renderE(null);});
-  renderMCTS(eSt,'emcts');
-  const rEl=document.getElementById('eres');
-  if(rEl&&src&&src.result){
-    const c=src.result==='1-0'?'#3b82f6':src.result==='0-1'?'#ef4444':'#475569';
-    rEl.innerHTML=`<span style="color:${c};font-weight:700">${src.result}</span> — ${src.termination||''}`;
-    rEl.style.display='block';
-  } else if(rEl)rEl.style.display='none';
-}
-
-function ePause(){ePaused=!ePaused;const b=document.getElementById('epbtn');if(ePaused){b.textContent='▶ Play';b.classList.remove('active');eStop();}else{b.textContent='⏸ Pause';b.classList.add('active');ePlay();}}
-function ePlay(){eStop();eIv=setInterval(()=>{if(eSt.idx<eSt.fens.length-1){eSt.idx++;renderE(null);}else eStop();},500);}
-function eStop(){if(eIv){clearInterval(eIv);eIv=null;}}
-function eBack(){if(eSt.idx>0){eSt.idx--;renderE(null);}}
-function eFwd(){if(eSt.idx<eSt.fens.length-1){eSt.idx++;renderE(null);}}
-function eStart(){eSt.idx=-1;eboard&&eboard.position('start',true);renderML(eSt,'eml',i=>{eSt.idx=i;renderE(null);});renderMCTS(eSt,'emcts');}
-function eEnd(){if(eSt.fens.length){eSt.idx=eSt.fens.length-1;renderE(null);}}
-function eLive(){eReplaying=false;eReplayData=null;document.getElementById('elbtn').style.display='none';socket.emit('request_eval_live_state');}
-function evalReplayGame(gid){eReplaying=true;document.getElementById('elbtn').style.display='';socket.emit('request_replay_eval_game',{game_id:gid});}
-
-// ════════════════════════════════════════════
-// Shared renderers
-// ════════════════════════════════════════════
 function renderML(st,elId,onClick){
   const el=document.getElementById(elId); if(!el)return;
   let h='';
@@ -489,14 +364,6 @@ function renderML(st,elId,onClick){
   const cur=el.querySelector('.mv.cur');
   if(cur)el.scrollTop=cur.offsetTop-el.clientHeight/2+cur.offsetHeight/2;
 }
-
-function inl(st,i){
-  if(!st.mcts||i>=st.mcts.length)return'';
-  const ms=st.mcts[i]; if(!ms||!ms.selected_move)return'';
-  const c=(ms.candidates||[]).find(x=>x.move===ms.selected_move);
-  if(!c)return''; return` (N:${c.N} Q:${(-c.Q).toFixed(2)})`;
-}
-
 function renderMCTS(st,elId){
   const el=document.getElementById(elId); if(!el)return;
   const idx=st.idx;
@@ -509,17 +376,330 @@ function renderMCTS(st,elId){
   }
   el.innerHTML=h+'</tbody></table>';
 }
-
 function renderRecent(hist,elId,clickFn){
   const el=document.getElementById(elId); if(!el)return;
   if(!hist||!hist.length){el.innerHTML='<div style="color:#374151;padding:4px 7px">No completed games yet</div>';return;}
   let h='';
   [...hist].forEach(g=>{
     const r=g.result||'*', cls=r==='1-0'?'w':r==='0-1'?'b':'d';
-    const tp=g.game_type, pill=tp?`<span class="tpill ${tp==='gating'?'gating':'reference'}">${tp.toUpperCase()}</span>`:'';
+    const tp=g.game_type, pill=tp?`<span class="tpill ${tp==='gating'?'gating':tp==='reference'?'reference':'selfplay'}">${tp.toUpperCase()}</span>`:'';
     h+=`<div class="ritem" onclick="${clickFn}(${JSON.stringify(g.game_id)})">${pill}#${g.game_id} <span style="color:#374151">(${g.num_moves})</span><span class="rtag ${cls}">${r}</span></div>`;
   });
   el.innerHTML=h;
+}
+
+// ════════════════════════════════════════════
+// Player engine — decouples data arrival from playback.
+// Moves are appended to a queue; a fixed-cadence clock steps the playhead
+// toward the newest move. Bursts from fast self-play therefore play at a
+// constant speed instead of teleporting/skipping.
+// ════════════════════════════════════════════
+function emptySt(){return {moves:[],fens:[],mcts:[],idx:-1,status:'idle',type:'selfplay',result:null,term:null,match:''};}
+
+class Player{
+  constructor(dom){
+    this.d=dom;                      // {board,ml,ms,mov,badge,res,info,btn} ids
+    this.gid=0;
+    this.state=emptySt();
+    this.cadence=600;
+    this.auto=true;                  // follow live arrivals
+    this.paused=false;
+    this.iv=null;
+    this.replay=false;               // true while showing a finished game
+    this.jumpToTail=false;           // next commit shows newest move instantly
+  }
+
+  // Resolve a dom entry by id (or return it directly if already an element).
+  // dom entries are stored as string ids and only resolved at use time so the
+  // elements are fetched fresh (elements may be recreated by Chart/HTML tooling).
+  _el(name){const v=this.d[name];return typeof v==='string'?(document.getElementById(v)):v;}
+
+  // ---- data ingest (from push events / snapshots) ----
+  commit(data){
+    if(!data)return;
+    if(this.replay)return;              // showing a selected finished game — ignore live push
+    const nm=data.moves||[], nf=data.fens||[], nc=data.mcts_stats_per_move||[];
+    const gid=data.game_id||0;
+    if(gid && gid!==this.gid){
+      // If the game we're showing just finished, STAY on it instead of
+      // yanking to the next game. The user can switch back to live via the
+      // tile/re-open or the Live button (which resets this.gid).
+      if(this.state.status==='finished')return;
+      this.gid=gid;
+      this.state=emptySt();
+      const b=this._el('board');
+      if(b)b.position('start',false);
+    }
+    this.state=this.state||emptySt();
+    const s=this.state;
+    s.status=data.status||'idle';
+    if(data.game_type)s.type=data.game_type;
+    if(data.match_info!==undefined)s.match=data.match_info;
+    if(data.result!==undefined)s.result=data.result;
+    if(data.termination!==undefined)s.term=data.termination;
+    // append only what is new (index-aligned)
+    for(let i=s.moves.length;i<nm.length;i++){
+      s.moves.push(nm[i]);
+      s.fens.push(nf[i]);
+      s.mcts.push(nc[i]||null);
+    }
+    if(this.jumpToTail){s.idx=s.fens.length-1;this.jumpToTail=false;}
+    plotQ(this);
+    this.paint();
+    this.ensureAdvance();
+  }
+
+  // ---- playback ----
+  ensureAdvance(){
+    if(!this.auto||this.paused||this.replay)return;
+    const tail=this.state.fens.length-1;
+    if(this.state.idx>=tail)return;
+    if(this.iv)return;                       // already stepping
+    if(this.state.idx<0)this.state.idx=0;
+    this.iv=setInterval(()=>{
+      if(this.state.idx<this.state.fens.length-1){this.state.idx++;this.paint();}
+      else this.stop();
+    },this.cadence);
+  }
+  stop(){if(this.iv){clearInterval(this.iv);this.iv=null;}}
+  _clamp(i){return Math.max(-1,Math.min(i,this.state.fens.length-1));}
+  go(i){this.stop();this.state.idx=this._clamp(i);this.paint();}
+  first(){this.go(-1);}
+  last(){this.go(this.state.fens.length-1);}
+  back(){this.go(this.state.idx-1);}
+  fwd(){this.go(this.state.idx+1);}
+  toggle(){
+    if(this.paused){this.resume();}else{this.pause();}
+  }
+  resume(){
+    this.paused=false;this.auto=true;this.replay=false;
+    const b=this._el('btnP');
+    if(b){b.textContent='⏸ Pause';b.classList.add('active');}
+    this.ensureAdvance();
+  }
+  pause(){
+    this.paused=true;this.stop();
+    const b=this._el('btnP');
+    if(b){b.textContent='▶ Play';b.classList.remove('active');}
+  }
+  live(){
+    // Explicitly switch to the newest live game (resets the parked finished
+    // game) and follow it.
+    this.replay=false;
+    this.gid=0; this.state=emptySt(); this.jumpToTail=true;
+    this.resume();
+    if(this.d.onLive)this.d.onLive();
+  }
+  spd(){
+    const sl=this._el('slider');if(!sl)return;
+    this.cadence=parseInt(sl.value,10)||this.cadence;
+    const lb=this._el('spdLbl');if(lb)lb.textContent=this.cadence+'ms';
+    if(!this.paused)this.ensureAdvance();
+  }
+
+  // ---- rendering ----
+  paint(){
+    const s=this.state;
+    const badge=this._el('badge');
+    if(badge){badge.className=`badge ${s.status}`;badge.textContent=s.status.toUpperCase();}
+    const mov=this._el('mov');
+    if(mov){
+      mov.textContent=s.idx+1;
+      const of=this._el('of');
+      if(of)of.textContent=s.fens.length?' / '+s.fens.length:'';
+    }
+    const info=this._el('info');
+    if(s.match!==undefined&&info)info.textContent=s.match||'';
+    const board=this._el('board');
+    if(board){
+      if(s.idx>=0&&s.idx<s.fens.length)board.position(s.fens[s.idx],false);
+      else board.position('start',false);
+    }
+    if(this.d.ml)renderML(s,this.d.ml,this.d.onPick);
+    if(this.d.ms)renderMCTS(s,this.d.ms);
+    const res=this._el('res');
+    if(res){
+      if(s.result){
+        const c=s.result==='1-0'?'#3b82f6':s.result==='0-1'?'#ef4444':'#475569';
+        res.innerHTML=`<span style="color:${c};font-weight:700">${s.result}</span> — ${s.term||''}`;
+        res.style.display='block';
+      }else res.style.display='none';
+    }
+  }
+  loadReplay(data){
+    this.replay=true;
+    this.stop();
+    this.gid=data.game_id||0;
+    this.state={moves:(data.moves||[]).slice(),fens:(data.fens||[]).slice(),
+             mcts:((data.mcts_stats_per_move||[]).slice()).map(x=>x||null),
+             idx:-1,status:'finished',type:data.game_type||'selfplay',
+             result:data.result||null,term:data.termination||null,match:data.match_info||''};
+    const b=this._el('board');if(b)b.position('start',false);
+    const lb=this._el('btnL');if(lb)lb.style.display='';
+    const pb=this._el('btnP');if(pb){pb.textContent='▶ Play';pb.classList.remove('active');}
+    this.paused=true;this.auto=false;
+    this._qLen=-1;plotQ(this);
+    this.paint();
+  }
+}
+
+// ════════════════════════════════════════════
+// Worker detail viewer (V)
+// ════════════════════════════════════════════
+let mboard=null, vWorker=-1;
+
+function initMBoard(){
+  mboard=Chessboard('mboard',{position:'start',showNotation:true,pieceTheme:'/chess_pieces/{piece}.png'});
+  $(window).resize(()=>mboard&&mboard.resize());
+}
+
+const V=new Player({
+  board:null,
+  ml:'vml',ms:'vmcts',mov:'vMov',of:'vOf',badge:'vbadge',res:'vres',info:null,
+  btnP:'vpbtn',btnL:'vlbtn',slider:'vspd',spdLbl:'vspdlbl',
+  onLive:()=>{document.getElementById('vlbtn').style.display='none';socket.emit('request_worker_detail',{worker_id:vWorker});},
+  onPick:i=>{V.go(i);}
+});
+
+function openV(w){
+  vWorker=w;
+  document.getElementById('viewer').className='card viewer open';
+  document.getElementById('vwid').textContent=w;
+  document.getElementById('vlbtn').style.display='none';
+  V.replay=false;V.gid=0;V.state=emptySt();V._qLen=-1;
+  mboard&&mboard.position('start',false);
+  V.paused=false;V.auto=true;V.jumpToTail=true;V.stop();
+  const pb=document.getElementById('vpbtn');
+  if(pb){pb.textContent='⏸ Pause';pb.classList.add('active');}
+  socket.emit('select_worker',{worker_id:w});
+  socket.emit('request_worker_detail',{worker_id:w});
+  socket.emit('request_game_history',{worker_id:w});
+  document.querySelectorAll('.tile').forEach(t=>t.classList.remove('active'));
+  document.getElementById(`t${w}`)?.classList.add('active');
+  document.getElementById('viewer').scrollIntoView({behavior:'smooth',block:'start'});
+}
+function closeViewer(){
+  socket.emit('select_worker',{worker_id:-1});
+  vWorker=-1;V.stop();
+  document.getElementById('viewer').className='card viewer';
+  document.querySelectorAll('.tile').forEach(t=>t.classList.remove('active'));
+}
+function replayGame(w,gid){
+  V.replay=true;
+  document.getElementById('vlbtn').style.display='';
+  socket.emit('request_replay_game',{worker_id:w,game_id:gid});
+}
+
+// ════════════════════════════════════════════
+// Eval board (E)
+// ════════════════════════════════════════════
+let eboard=null;
+function initEBoard(){eboard=Chessboard('eboard',{position:'start',showNotation:true,pieceTheme:'/chess_pieces/{piece}.png'});}
+
+const E=new Player({
+  board:null,
+  ml:'eml',ms:'emcts',mov:'eMov',of:null,badge:'ebadge',res:'eres',info:'eminfo',
+  btnP:'epbtn',btnL:'elbtn',slider:null,spdLbl:null,
+  onLive:()=>{document.getElementById('elbtn').style.display='none';socket.emit('request_eval_live_state');},
+  onPick:i=>{E.go(i);}
+});
+E.cadence=500;
+E.jumpToTail=true;   // on first live eval snapshot, jump to the newest move
+function evalReplayGame(gid){E.replay=true;document.getElementById('elbtn').style.display='';socket.emit('request_replay_eval_game',{game_id:gid});}
+
+// Eval board also renders the game-id label during paint.
+const _Epaint=E.paint.bind(E);
+E.paint=function(){
+  _Epaint();
+  const eg=document.getElementById('egid');
+  if(eg)eg.textContent=this.gid?`#${this.gid}`:'—';
+};
+
+// ════════════════════════════════════════════
+// Tile grid
+// ════════════════════════════════════════════
+let numW=0, tileBoards=[], tileStates={}, tileTimes={}, tileMoves={};
+
+// moves/sec tracking (cumulative across workers, sampled 1×/s)
+let cumMoves=0, lastTileMoves={}, mpsHist=[], CHART_MPS=null;
+
+function buildGrid(n){
+  numW=n;
+  document.getElementById('wcnt').textContent=n;
+  const g=document.getElementById('grid');
+  g.innerHTML='';
+  const cols=Math.min(n,4);
+  g.style.gridTemplateColumns=`repeat(${cols},1fr)`;
+  tileBoards=[];tileTimes={};tileMoves={};lastTileMoves={};
+  for(let i=0;i<n;i++){
+    const d=document.createElement('div');
+    d.className='tile'; d.id=`t${i}`;
+    d.innerHTML=`<div class="tile-hdr"><span class="wlbl">W${i}</span><span class="glbl" id="tg${i}">—</span><span class="tbadge idle" id="tb${i}">IDLE</span></div><div id="tb${i}b" class="tile-board"></div><div class="tile-foot"><span id="tm${i}">0 moves</span><span class="rate" id="tr${i}"></span></div>`;
+    d.onclick=()=>openV(i);
+    g.appendChild(d);
+    tileBoards.push(Chessboard(`tb${i}b`,{position:'start',showNotation:false,pieceTheme:'/chess_pieces/{piece}.png'}));
+    tileTimes[i]=0;tileMoves[i]=0;
+  }
+}
+
+function applyTile(s){
+  const w=s.worker_id; if(w===undefined||w<0||w>=numW)return;
+  tileStates[w]=s;
+  const badge=document.getElementById(`tb${w}`), gid=document.getElementById(`tg${w}`),
+        mv=document.getElementById(`tm${w}`), res=document.getElementById(`tr${w}`);
+  if(badge){badge.className=`tbadge ${s.status||'idle'}`;badge.textContent=(s.status||'idle').toUpperCase();}
+  if(gid)gid.textContent=s.game_id?`#${s.game_id}`:'—';
+  if(mv)mv.textContent=`${s.num_moves||0} moves`;
+  // moves/sec estimate (rolling)
+  const now=performance.now();
+  if(res){
+    if(s.status==='finished'&&s.result){
+      const c=s.result==='1-0'?'#3b82f6':s.result==='0-1'?'#ef4444':'#475569';
+      res.innerHTML=`<span style="color:${c};font-weight:700">${s.result}</span>`;
+      res.style.color=c;
+    }else{
+      const nm=s.num_moves||0;
+      if(tileTimes[w]&&nm>tileMoves[w]&&nm>0){
+        const dt=(now-tileTimes[w])/1000;
+        if(dt>0.05){
+          const rate=((nm-tileMoves[w])/dt).toFixed(1);
+          res.textContent=`${rate} m/s`;
+          res.style.color='#38bdf8';
+        }
+      }else if(nm===0){res.textContent='';}
+    }
+  }
+  tileTimes[w]=now;tileMoves[w]=s.num_moves||0;
+  const prevNm=lastTileMoves[w]||0;
+  const nm=s.num_moves||0;
+  if(nm>prevNm)cumMoves+=nm-prevNm;
+  lastTileMoves[w]=nm;
+  const fen=s.latest_fen||'start';
+  try{tileBoards[w]&&tileBoards[w].position(fen,false);}catch(e){}
+}
+
+function updateMPS(){
+  const now=Date.now()/1000;
+  mpsHist.push({t:now,m:cumMoves});
+  while(mpsHist.length&&now-mpsHist[0].t>60)mpsHist.shift();
+  const el=document.getElementById('hMps'), lbl=document.getElementById('cmps_lbl');
+  let mps=0;
+  if(mpsHist.length>=2){
+    const a=mpsHist[0],b=mpsHist[mpsHist.length-1],dt=b.t-a.t;
+    if(dt>0.05)mps=(b.m-a.m)/dt;
+  }
+  if(el)el.textContent=mps.toFixed(1);
+  if(lbl)lbl.textContent=mps.toFixed(1)+' m/s';
+  const cm=CHART_MPS;
+  if(cm){
+    // per-sample slope ⇒ pointwise moves/sec, x = seconds ago (0 = now)
+    cm.data.labels=mpsHist.map(p=>(now-p.t).toFixed(0));
+    cm.data.datasets[0].data=mpsHist.map((p,i)=>{
+      if(i===0)return mps;
+      return (p.m-mpsHist[i-1].m)/Math.max(1e-4,p.t-mpsHist[i-1].t);
+    });
+    cm.update('none');
+  }
 }
 
 // ════════════════════════════════════════════
@@ -540,7 +720,6 @@ socket.on('disconnect',()=>{
 
 socket.on('num_workers',d=>{if(d.num_workers>0&&d.num_workers!==numW)buildGrid(d.num_workers);});
 
-// Bulk state (on connect / poll)
 socket.on('worker_states',states=>{
   if(states.length&&states.length!==numW)buildGrid(states.length);
   states.forEach(applyTile);
@@ -549,9 +728,9 @@ socket.on('worker_states',states=>{
 // ★ Real-time per-move tile update (push from LiveGameState._emit)
 socket.on('worker_tile_update',s=>applyTile(s));
 
-// ★ Real-time full detail update (push from LiveGameState._emit)
+// ★ Real-time detail update — server only pushes this for the focused worker
 socket.on('worker_detail_update',data=>{
-  if(vWorker>=0&&data.worker_id===vWorker&&!vReplaying)applyDetail(data);
+  if(vWorker>=0&&data.worker_id===vWorker)V.commit(data);
 });
 
 socket.on('game_history',data=>{
@@ -559,24 +738,10 @@ socket.on('game_history',data=>{
     renderRecent(data.history,'vrec',`replayGame.bind(null,${vWorker})`);
 });
 
-socket.on('replay_game',data=>{
-  vReplayData=data;
-  vSt={moves:data.moves.slice(),fens:data.fens.slice(),mcts:(data.mcts_stats_per_move||[]).slice(),status:'finished',idx:-1};
-  vMovesUpTo=data.moves.length-1;
-  mboard&&mboard.position('start',false);
-  vSt.idx=-1; renderV();
-  if(vPaused)vPause();
-});
+socket.on('replay_game',data=>{if(data.worker_id===vWorker)V.loadReplay(data);});
 
-socket.on('eval_live_game_update',data=>applyEval(data));
-socket.on('replay_eval_game',data=>{
-  eReplayData=data;
-  eSt={moves:data.moves.slice(),fens:data.fens.slice(),mcts:(data.mcts_stats_per_move||[]).slice(),status:'finished',idx:-1};
-  eMovesUpTo=data.moves.length-1;
-  eboard&&eboard.position('start',false);
-  eSt.idx=-1; renderE(data);
-  if(ePaused)ePause();
-});
+socket.on('eval_live_game_update',data=>E.commit(data));
+socket.on('replay_eval_game',data=>E.loadReplay(data));
 socket.on('eval_game_history',hist=>renderRecent(hist,'erec','evalReplayGame'));
 
 // ════════════════════════════════════════════
@@ -606,7 +771,6 @@ function updSum(d){
 }
 
 function updEvalSummary(promo,evalh){
-  // Latest gating result (promo is ordered ASC, so last entry is most recent)
   if(promo&&promo.length){
     const g=promo[promo.length-1];
     const wld=`${g.wins}W / ${g.losses}L / ${g.draws}D`;
@@ -617,7 +781,6 @@ function updEvalSummary(promo,evalh){
     pe.textContent=g.promoted?'✓ PROMOTED':'✗ Not promoted';
     pe.style.color=g.promoted?'#22c55e':'#ef4444';
   }
-  // Latest reference result (evalh is ordered ASC, so last entry is most recent)
   if(evalh&&evalh.length){
     const r=evalh[evalh.length-1];
     const wld=`${r.wins}W / ${r.losses}L / ${r.draws}D`;
@@ -633,11 +796,9 @@ function updEvalTable(promo,evalh){
     et.innerHTML='<tr><td colspan="5" style="text-align:center;color:#1f2937">No data</td></tr>';
     return;
   }
-  // Combine both histories into unified rows
   let rows=[];
   if(promo)promo.forEach(d=>rows.push({step:d.step,opponent:'Best Network (Gating)',wins:d.wins,losses:d.losses,draws:d.draws,win_rate:d.win_rate,promoted:d.promoted}));
   if(evalh)evalh.forEach(d=>rows.push({step:d.step,opponent:'Alpha-Beta (Reference)',wins:d.wins,losses:d.losses,draws:d.draws,win_rate:d.win_rate,promoted:null}));
-  // Sort by step descending, show most recent 30
   rows.sort((a,b)=>b.step-a.step);
   et.innerHTML=rows.slice(0,30).map(d=>{
     const wr=(d.win_rate*100).toFixed(1)+'%';
@@ -673,11 +834,9 @@ async function pollAll(){
     }
     fill(CR,rc,['white_win_pct','draw_pct','black_win_pct']);
   }
-  // Promo table
   const pt=document.getElementById('ptbl');
   if(!promo||!promo.length){pt.innerHTML='<tr><td colspan="6" style="text-align:center;color:#1f2937">No data</td></tr>';}
   else pt.innerHTML=[...promo].reverse().slice(0,20).map(d=>`<tr><td>${d.step}</td><td style="color:${d.promoted?'#22c55e':'#ef4444'}">${d.promoted?'YES':'NO'}</td><td>${(d.win_rate*100).toFixed(1)}%</td><td>${d.wins}W/${d.losses}L/${d.draws}D</td><td>${d.old_elo?Math.round(d.old_elo):'—'}</td><td>${d.new_elo?Math.round(d.new_elo):'—'}</td></tr>`).join('');
-  // Games table
   const gt=document.getElementById('gtbl');
   if(!games||!games.length){gt.innerHTML='<tr><td colspan="7" style="text-align:center;color:#1f2937">No games</td></tr>';}
   else gt.innerHTML=[...games].reverse().slice(0,30).map(d=>{
@@ -685,7 +844,6 @@ async function pollAll(){
     const md=d.material_diff, mds=md!=null?(md>0?'+':'')+md:'—';
     return`<tr><td>${d.game_id}</td><td style="color:${c};font-weight:700">${r}</td><td>${d.length}</td><td>${d.termination}</td><td>${d.step}</td><td>${d.avg_mcts_depth?d.avg_mcts_depth.toFixed(1):'—'}</td><td>${mds}</td></tr>`;
   }).join('');
-  // Also poll tile states
   socket.emit('request_worker_states');
 }
 
@@ -694,10 +852,16 @@ async function pollAll(){
 // ════════════════════════════════════════════
 $(document).ready(async()=>{
   initMBoard(); initEBoard();
+  V.d.board=mboard; E.d.board=eboard;
+  V.qc=makeQChart('vq'); E.qc=makeQChart('eq');
+  V._qLen=-1; E._qLen=-1;
+  CHART_MPS=makeMPSChart('cmps');
+  V.spd();
   const wc=await fj('/api/num_workers');
   if(wc&&wc.num_workers>0)buildGrid(wc.num_workers);
   pollAll();
   setInterval(pollAll,5000);
+  setInterval(updateMPS,1000);
 });
 </script>
 </body>
