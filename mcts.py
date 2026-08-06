@@ -94,6 +94,37 @@ class MCTSNode:
         # Cached depth from root — avoids O(depth) walk in _node_depth()
         self.depth = 0 if parent is None else parent.depth + 1
 
+    @staticmethod
+    def new_child(parent: 'MCTSNode', move, prior: float) -> 'MCTSNode':
+        """Fast-path constructor for child nodes (the search hot loop).
+
+        Avoids the ~22 attribute stores of ``__init__`` for the large
+        majority of nodes that start with default values.  Semantically
+        identical: children get the same initial state via ``__init__``.
+        """
+        node = object.__new__(MCTSNode)
+        node._board = None
+        node._board_ready = False
+        node.parent = parent
+        node.move = move
+        node.children = {}
+        node.N = 0
+        node.W = 0.0
+        node.Q = 0.0
+        node.P = prior
+        node.P_orig = prior
+        node.is_expanded = False
+        node.legal_moves_cached = None
+        node.visit_count = 0
+        node.virtual_loss = 0
+        node._game_over_cached = None
+        node._terminal_value_cached = None
+        node._position_hash = None
+        node._checkmate_child_cached = False
+        node._checkmate_child_move = None
+        node.depth = parent.depth + 1
+        return node
+
     @property
     def board(self) -> chess.Board:
         """Lazily materialize the board on first access.
@@ -613,7 +644,7 @@ class MCTS:
 
             # FastMove supports .from_square, .to_square, .promotion, .uci(),
             # so the child node can use it just like a chess.Move.
-            child = MCTSNode(parent=node, move=raw_move, prior=prior)
+            child = MCTSNode.new_child(node, raw_move, prior)
             node.children[action_idx] = child
 
         if not node.children:
