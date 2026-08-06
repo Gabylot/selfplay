@@ -567,37 +567,49 @@ class MCTS:
         if not raw_moves:
             return 0.0
 
-        # ── Compute policy indices for every legal move in one pass ──
-        move_indices = []
-        for raw_move in raw_moves:
-            try:
-                action_idx = move_to_policy_index(raw_move, node.board)
-                move_indices.append(action_idx)
-            except ValueError as e:
-                with open("encoding_failures.log", "a") as f:
-                    f.write(f"FEN: {node.board.fen()}\n"
-                            f"Move: {raw_move.uci()}\n"
-                            f"Error: {e}\n\n")
-                move_indices.append(None)
-
-        # ── Build legal move mask ──
-        mask = np.zeros(NUM_ACTIONS, dtype=np.float32)
-        for action_idx in move_indices:
-            if action_idx is not None:
-                mask[action_idx] = 1.0
-
-        legal_policy = policy * mask
-        legal_sum = legal_policy.sum()
-        if legal_sum > 0:
-            legal_policy = legal_policy / legal_sum
+        # ── Compute policy indices in ONE Rust call (no per-move Python
+        # loop).  Falls back to the Python path if the board lacks the
+        # fast method (e.g. python-chess fallback boards).
+        rust_idxs = node.board._b.legal_move_policy_indices() \
+            if hasattr(node.board._b, 'legal_move_policy_indices') else None
+        if rust_idxs is not None and len(rust_idxs) == len(raw_moves):
+            move_indices = rust_idxs
         else:
-            legal_policy = mask / mask.sum()
+            move_indices = []
+            for raw_move in raw_moves:
+                try:
+                    action_idx = move_to_policy_index(raw_move, node.board)
+                    move_indices.append(action_idx)
+                except ValueError as e:
+                    with open("encoding_failures.log", "a") as f:
+                        f.write(f"FEN: {node.board.fen()}\n"
+                                f"Move: {raw_move.uci()}\n"
+                                f"Error: {e}\n\n")
+                    move_indices.append(None)
+
+        # ── Renormalize over ONLY the legal children, not the full 4672 --
+        # vector (gather is far cheaper than building + reducing a mask).
+        valid_idx = [m for m in move_indices if m is not None]
+        if valid_idx:
+            legal = policy[np.asarray(valid_idx, dtype=np.intp)]
+            legal_sum = legal.sum()
+            if legal_sum > 0:
+                priors = legal / legal_sum
+            else:
+                # All-legal-zero policy: fall back to uniform (matches the
+                # old mask/reduce path, which used mask / mask.sum()).
+                priors = np.full(len(valid_idx), 1.0 / len(valid_idx),
+                                 dtype=np.float32)
+        else:
+            priors = None
 
         # ── Create children, storing the raw FastMove directly ──
+        k = 0
         for raw_move, action_idx in zip(raw_moves, move_indices):
             if action_idx is None:
                 continue
-            prior = float(legal_policy[action_idx])
+            prior = float(priors[k]) if priors is not None else 0.0
+            k += 1
 
             # FastMove supports .from_square, .to_square, .promotion, .uci(),
             # so the child node can use it just like a chess.Move.

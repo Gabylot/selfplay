@@ -72,7 +72,7 @@ Move Encoding (8x8x73 = 4672 action space) — unchanged, matches Table S2:
 """
 
 import numpy as np
-from wrapt import lru_cache
+from functools import lru_cache
 import chess
 from typing import Optional
 
