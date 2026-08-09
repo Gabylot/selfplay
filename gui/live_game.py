@@ -46,6 +46,11 @@ class LiveGameState:
     # with too many packets when replaying a full game in a tight loop).
     _MIN_EMIT_INTERVAL = 0.05  # 50ms — live moves broadcast ~20×/sec max
 
+    # Minimum interval between global game-stats broadcasts.  These carry a
+    # whole-training cumulative (all workers × all subgames) so the browser's
+    # moves/sec meter reflects real throughput, not just the featured games.
+    _GLOBAL_STATS_INTERVAL = 0.15
+
     def __init__(self, socketio=None, max_history: int = 20,
                  worker_id: int = -1, is_eval: bool = False,
                  event_tag: str = None):
@@ -86,6 +91,7 @@ class LiveGameState:
         self._last_emit_time: float   = 0.0
         self._emit_pending:   bool    = False
         self._emit_timer:     Optional[threading.Timer] = None
+        self._last_global_stats: float = 0.0
 
     # ── Public API called by training/eval loops ──────────────────────────
 
@@ -270,6 +276,29 @@ class LiveGameState:
                 with self._lock:
                     full = self._full_state()
                 self._socketio.emit('worker_detail_update', full)
+
+    def broadcast_global_stats(self, total_moves: int, total_games: int):
+        """Broadcast whole-training cumulative counts to the browser.
+
+        These are the authoritative move totals across *all* workers and
+        *all* subgames (not just the featured game shown in each grid tile),
+        so the browser's moves/sec meter reflects real throughput.  Throttled
+        like ordinary emits since self-play pushes many moves per second.
+
+        Args:
+            total_moves: Cumulative self-play moves across every subgame.
+            total_games: Cumulative self-play games across every subgame.
+        """
+        if self._socketio is None:
+            return
+        now = time.monotonic()
+        if now - self._last_global_stats < self._GLOBAL_STATS_INTERVAL:
+            return
+        self._last_global_stats = now
+        self._socketio.emit('global_stats', {
+            'total_moves': total_moves,
+            'total_games': total_games,
+        })
 
     # ── Backwards-compat alias ────────────────────────────────────────────
     def _emit_update(self):

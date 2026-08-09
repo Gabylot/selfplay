@@ -41,12 +41,102 @@ def signal_handler(sig, frame):
     print("\n[INFO] Shutdown signal received…")
 
 
+def _free_tensorboard_port(host, port):
+    """Terminate any listening process on ``host:port`` whose command line
+    looks like a TensorBoard started by an earlier training run.
+
+    Leftover TensorBoard processes from a previous session keep the pinned
+    port to themselves, so a freshly-launched one dies with ``Address already
+    in use`` and the user keeps staring at the OLD run's data.  Only processes
+    whose command line mentions ``tensorboard`` are touched — anything else on
+    the port is left alone.  (Windows only; on other platforms the caller just
+    fails to bind.)"""
+    import subprocess
+    if os.name != "nt":
+        return
+    try:
+        out = subprocess.check_output(["netstat", "-ano"], text=True,
+                                      encoding="utf-8", errors="replace")
+    except Exception:
+        return
+    pids = set()
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) >= 5 and parts[0].upper() == "TCP":
+            local = parts[1]
+            if ":" not in local:
+                continue
+            ip, _, p = local.rpartition(":")
+            if p.isdigit() and int(p) == port and ip.lstrip("[") == host:
+                if parts[-1].isdigit():
+                    pids.add(int(parts[-1]))
+    for pid in pids:
+        try:
+            cmdline = subprocess.check_output(
+                ["powershell", "-NoProfile", "-Command",
+                 f"(Get-CimInstance Win32_Process -Filter 'ProcessId={pid}').CommandLine"],
+                text=True, errors="replace",
+                creationflags=subprocess.CREATE_NO_WINDOW).strip()
+        except Exception:
+            cmdline = ""
+        if "tensorboard" in cmdline.lower():
+            try:
+                subprocess.run(["taskkill", "/F", "/PID", str(pid)],
+                               capture_output=True,
+                               creationflags=subprocess.CREATE_NO_WINDOW)
+                print(f"[INFO] Stale TensorBoard (PID {pid}) on {host}:{port} "
+                      f"terminated; will relaunch for this run.")
+            except Exception:
+                pass
+
+
+def _launch_tensorboard(log_dir, host="127.0.0.1", port=6006):
+    """Launch TensorBoard as a detached background process.
+
+    Uses an absolute logdir and a pinned host/port so it reliably shows the
+    current run's events.  (A relative ``--logdir`` silently points at the
+    wrong directory when launched from elsewhere.)  If a sibling ``runs_archive``
+    (a frozen, step-sorted history snapshot) exists next to the live ``runs``
+    dir it is served too, so the full run is visible from step 1.  The scalar
+    sample cap is raised so runs beyond 10k steps are not truncated.  Returns
+    the Popen handle or None if it could not be started.
+    """
+    import shutil, subprocess
+    if (Path(log_dir).parent / "runs_archive").is_dir():
+        # Serve the parent so both the live run dir and the frozen history
+        # snapshot show up as runs (a single `--logdir parent/` is required;
+        # the multi-dir `;` form indexes nothing on this setup).
+        logdir_arg = str(Path(log_dir).parent)
+    else:
+        logdir_arg = str(log_dir)
+    _free_tensorboard_port(host, int(port))
+    extra = ["--samples_per_plugin", "scalars=50000"]
+    exe = shutil.which("tensorboard")
+    if exe:
+        cmd = [exe, "--logdir", logdir_arg, "--host", host,
+               "--port", str(port), "--reload_interval", "2"] + extra
+    else:
+        cmd = [sys.executable, "-m", "tensorboard.main",
+               "--logdir", logdir_arg, "--host", host,
+               "--port", str(port), "--reload_interval", "2"] + extra
+    try:
+        flags = 0
+        if os.name == "nt":
+            flags = subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP
+        return subprocess.Popen(cmd, stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL, creationflags=flags)
+    except Exception as exc:
+        print(f"[WARN] Could not auto-start TensorBoard: {exc}")
+        return None
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Training loop
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _dispatch_live_message(psp, worker_live_games, worker_live_game_ids,
-                           step, result):
+                           worker_feature, worker_active, step, result,
+                           global_stats=None):
     """Handle a single live_start / live_move / live_end result immediately
     so the GUI stays responsive.  Returns True if a live message was
     dispatched, False otherwise (e.g. for a full selfplay result)."""
@@ -54,31 +144,49 @@ def _dispatch_live_message(psp, worker_live_games, worker_live_game_ids,
         return False
 
     rtype = result.get('type')
+    wid = result['worker_id']
+    # subgame ordinal: games_per_worker > 1 can emit interleaved live streams
+    # per worker; only the currently-featured subgame reaches the GUI tile.
+    sub = result.get('sub', 0)
+
     if rtype == 'live_start':
-        wid = result['worker_id']
-        # Every worker runs exactly one game at a time and emits exactly one
-        # live_start grip-cycle, so a monotonic per-worker counter is a safe,
-        # stable id the frontend can use to detect game boundaries.  Previously
-        # game_id was hard-coded to 0, which made the browser merge consecutive
-        # self-play games into one display (the "skips a game" / fast-forward).
-        worker_live_game_ids[wid] += 1
-        wlg = worker_live_games[wid]
-        wlg.start_game(worker_live_game_ids[wid], step,
-                       game_type=result.get('game_type', 'selfplay'),
-                       match_info=result.get('match_info'))
+        # A game started on this worker.  If nothing is currently featured,
+        # feature it; otherwise ignore (we show only one game per worker).
+        worker_active[wid].add(sub)
+        if global_stats is not None:
+            global_stats['total_games'] += 1
+        if worker_feature[wid] is None:
+            worker_feature[wid] = sub
+            worker_live_game_ids[wid] += 1
+            wlg = worker_live_games[wid]
+            wlg.start_game(worker_live_game_ids[wid], step,
+                           game_type=result.get('game_type', 'selfplay'),
+                           match_info=result.get('match_info'))
         return True
 
     if rtype == 'live_move':
-        wid = result['worker_id']
-        wlg = worker_live_games[wid]
-        wlg.update(result['fen'], result['move'], result['move_number'],
-                   mcts_stats=result.get('mcts_stats'))
+        if global_stats is not None:
+            global_stats['total_moves'] += 1
+            # Broadcast the authoritative whole-training total so the browser's
+            # moves/sec meter counts every subgame, not just the featured one.
+            worker_live_games[wid].broadcast_global_stats(
+                global_stats['total_moves'], global_stats['total_games'])
+        if worker_feature[wid] == sub:
+            wlg = worker_live_games[wid]
+            wlg.update(result['fen'], result['move'], result['move_number'],
+                       mcts_stats=result.get('mcts_stats'))
         return True
 
     if rtype == 'live_end':
-        wid = result['worker_id']
-        wlg = worker_live_games[wid]
-        wlg.game_over(result['result'], result.get('termination', ''))
+        worker_active[wid].discard(sub)
+        if worker_feature[wid] == sub:
+            wlg = worker_live_games[wid]
+            wlg.game_over(result['result'], result.get('termination', ''))
+            # Stay with the finished game (show its result) and await the next
+            # live_start.  Do NOT switch the tile to a subgame that is already
+            # in progress: start_game() would reset it to move 1, discarding
+            # every move it already played.
+            worker_feature[wid] = None
         return True
 
     return False
@@ -180,9 +288,17 @@ def run_training(config, gui_enabled=False, num_workers=None):
     # seamlessly from where the last run left off.
     tb = TensorBoardLogger(tb_log_dir, enabled=tb_enabled, initial_step=step,
                            initial_game_id=game_id)
+    tb_proc = None
     if tb_enabled:
         print(f"[INFO] TensorBoard logging → {tb_log_dir}  (resuming from step {step})")
         print(f"[INFO] Run: tensorboard --logdir {tb_log_dir}")
+        if getattr(config.tensorboard, 'auto_launch', True):
+            tb_host = getattr(config.tensorboard, 'host', '127.0.0.1')
+            tb_port = int(getattr(config.tensorboard, 'port', 6006))
+            tb_proc = _launch_tensorboard(tb_log_dir, tb_host, tb_port)
+            if tb_proc is not None:
+                print(f"[INFO] TensorBoard auto-started → http://{tb_host}:{tb_port} "
+                      f"(reload every 2s)")
     tb.log_config(step, config.to_dict())
 
     # Load replay buffer
@@ -206,6 +322,15 @@ def run_training(config, gui_enabled=False, num_workers=None):
 
     # Per-worker live game tracking for real-time updates
     worker_live_game_ids = [0] * num_workers
+    # Feature one game per worker: worker_feature[wid] = subgame ordinal shown;
+    # worker_active[wid] = set of currently-running subgame ordinals.
+    worker_feature = [None] * num_workers
+    worker_active  = [set() for _ in range(num_workers)]
+
+    # Whole-training cumulative counters (all workers × all subgames) fed to
+    # the GUI moves/sec meter so it counts real throughput, not just the
+    # featured games shown in the tiles.
+    global_stats = {'total_moves': 0, 'total_games': 0}
 
     try:
         while not _shutdown:
@@ -218,7 +343,8 @@ def run_training(config, gui_enabled=False, num_workers=None):
 
             # ── Live incremental messages (real-time GUI updates) ──
             if _dispatch_live_message(psp, worker_live_games, worker_live_game_ids,
-                                      step, result):
+                                      worker_feature, worker_active, step, result,
+                                      global_stats):
                 continue
 
             # Only process self-play results in the main loop
@@ -293,7 +419,8 @@ def run_training(config, gui_enabled=False, num_workers=None):
                 _pending_selfplay = []
                 for r in psp.collect_available():
                     if _dispatch_live_message(psp, worker_live_games, worker_live_game_ids,
-                                              step, r):
+                                              worker_feature, worker_active, step, r,
+                                              global_stats):
                         pass
                     elif r.get('type') == 'selfplay' and not r.get('done'):
                         _pending_selfplay.append(r)
@@ -303,7 +430,8 @@ def run_training(config, gui_enabled=False, num_workers=None):
                     # Drain any new live messages between batches
                     for r in psp.collect_available():
                         if _dispatch_live_message(psp, worker_live_games, worker_live_game_ids,
-                                                  step, r):
+                                                  worker_feature, worker_active, step, r,
+                                                  global_stats):
                             pass
                         elif r.get('type') == 'selfplay' and not r.get('done'):
                             _pending_selfplay.append(r)
@@ -607,6 +735,11 @@ def run_training(config, gui_enabled=False, num_workers=None):
         stats.close()
         if tb is not None:
             tb.close()
+        if tb_proc is not None:
+            try:
+                tb_proc.terminate()
+            except Exception:
+                pass
         print("[INFO] Done.")
 
 
@@ -1024,6 +1157,23 @@ def main():
     parser.add_argument("--blocks",   type=int, default=None)
     parser.add_argument("--filters",  type=int, default=None)
     parser.add_argument("--run-name", type=str, default=None)
+    parser.add_argument("--fen", type=str, default=None,
+                        help="Starting position (FEN) for every self-play game "
+                             "instead of the standard start")
+    parser.add_argument("--pieces", type=str, default=None, metavar="SPEC",
+                        action="append",
+                        help="Start positions for self-play games. A piece set "
+                             "e.g. 'KRkr' (uppercase = white, lowercase = black) "
+                             "starts each game at a different random legal "
+                             "position with exactly those pieces; the token "
+                             "'standard' uses the normal start. Mix them with "
+                             "commas or by repeating the flag, and weight them "
+                             "with ':n', e.g. 'standard:80,KQk:10,KRk:10' (80% "
+                             "standard, 10% each endgame). Overrides --fen.")
+    parser.add_argument("--rand-colors", action="store_true",
+                        help="With --pieces, flip the colour assignment per "
+                             "game: an asymmetric spec like 'KQQk' randomly "
+                             "gives either side the 2 queens every game")
     parser.add_argument("--workers",  type=int, default=None)
     parser.add_argument("--benchmark-games", type=int, default=10,
                         help="Self-play games to collect in benchmark mode (default: 10)")
@@ -1045,11 +1195,21 @@ def main():
                         help="Disable the tournament GUI view")
     args = parser.parse_args()
 
+    if args.pieces:
+        from selfplay import _split_piece_specs, _parse_piece_mix
+        try:
+            _parse_piece_mix(_split_piece_specs(",".join(args.pieces)))
+        except ValueError as exc:
+            parser.error(f"--pieces: {exc}")
+
     ov = {}
     if args.sims:     ov.setdefault('mcts',{})['num_simulations']=args.sims
     if args.blocks:   ov.setdefault('network',{})['num_residual_blocks']=args.blocks
     if args.filters:  ov.setdefault('network',{})['num_filters']=args.filters
     if args.run_name: ov.setdefault('main',{})['run_name']=args.run_name
+    if args.fen:      ov.setdefault('selfplay',{})['start_fen']=args.fen
+    if args.pieces:   ov.setdefault('selfplay',{})['start_pieces']=",".join(args.pieces)
+    if args.rand_colors: ov.setdefault('selfplay',{})['start_colors_random']=True
     if args.system:          ov.setdefault('tournament',{})['system']=args.system
     if args.games_per_pair:  ov.setdefault('tournament',{})['games_per_pair']=args.games_per_pair
     if args.swiss_rounds:    ov.setdefault('tournament',{})['swiss_rounds']=args.swiss_rounds

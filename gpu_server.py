@@ -235,8 +235,13 @@ class GPUInferenceServer:
                 self._report_stats(t_start)
                 return
 
-            self._handle_request(req, nets, device, net_a)
-
+            try:
+                self._handle_request(req, nets, device, net_a)
+            except Exception as e:
+                # A failure aggregating/handling one request must not kill or
+                # wedge the server loop.  Log it and keep serving.
+                self.stats['host_errors'] = self.stats.get('host_errors', 0) + 1
+                print(f"[GPU-Server] request handling error: {e!r}")
         self._send_shutdown_to_workers()
         self._stop_forward_worker()
         self._report_stats(t_start)
@@ -472,7 +477,17 @@ class GPUInferenceServer:
             net = nets.get(nid, net_a)
             mega_states = self._build_mega(group)
             if pipelined:
-                self._work_queue.put((net, group, mega_states))
+                # Bounded enqueue with inline fallback.  A plain blocking
+                # put() wedges the WHOLE server if the forward worker has
+                # died/stalled: the queue fills to maxsize and the host
+                # thread blocks in put() forever, so no request ever gets a
+                # response.  If we can't enqueue promptly, run the forward
+                # inline on this thread — the model lock serializes forwards,
+                # and it un-sticks the system even if the worker is dead.
+                try:
+                    self._work_queue.put_nowait((net, group, mega_states))
+                except queue.Full:
+                    self._forward_and_distribute(net, device, group, mega_states)
             else:
                 self._forward_and_distribute(net, device, group, mega_states)
 
@@ -591,6 +606,12 @@ class GPUInferenceServer:
             self._forward_busy = True
             try:
                 self._forward_and_distribute(net, device, group, mega_states)
+            except Exception as e:
+                # A transient GPU/DirectML error must NOT kill this thread.
+                # Dropping one batch is far better than silently wedging every
+                # worker forever.  Log it so the root cause is visible.
+                self.stats['forward_errors'] = self.stats.get('forward_errors', 0) + 1
+                print(f"[GPU-Server] forward error (dropping batch {len(mega_states)} samples): {e!r}")
             finally:
                 self._forward_busy = False
 

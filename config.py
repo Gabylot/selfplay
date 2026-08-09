@@ -40,6 +40,19 @@ def load_config(path: Optional[str] = None) -> dict:
         },
         "selfplay": {
             "network_source": "latest",
+            # FEN every self-play game starts from (None = standard start).
+            "start_fen": None,
+            # Start positions for self-play games: a piece set always frames a fresh
+            # random legal position with exactly those pieces, e.g. "KQk,KRk"
+            # (case = color). Weights per entry are allowed, e.g.
+            # "standard:80,KQk:10,KRk:10" keeps 80% of games on the normal
+            # start (token "standard") so the agent can't unlearn them.
+            # Ignored when start_fen is set.
+            "start_pieces": None,
+            # For asymmetric piece specs (e.g. "KQQk") this flips the
+            # colour assignment per game, so either side gets the strong
+            # pieces 50% of the time.
+            "start_colors_random": False,
             "max_game_length": 150,
             "adjudicate_material": True,
             "piece_values": {"P": 1, "N": 3, "B": 3, "R": 5, "Q": 9},
@@ -48,6 +61,13 @@ def load_config(path: Optional[str] = None) -> dict:
             "temperature_threshold": 30,
             "temperature_high": 1.0,
             "temperature_low": 0.1,
+            # Endgame tuning: applied when <= endgame_piece_gate pieces stay
+            # on the board (usually the "simple endgames" the net struggles
+            # to convert).  Uses its own temperature and a deeper simulation
+            # budget without touching the middlegame settings.
+            "endgame_temperature": 0.3,
+            "endgame_piece_gate": 6,
+            "endgame_num_simulations": 1600,
             # Exact forced-mate override for endgame conversion
             # (see forced_mate.py).  When enabled, self-play move selection
             # is overridden by a proof search when a forced mate within
@@ -94,6 +114,9 @@ def load_config(path: Optional[str] = None) -> dict:
         "tensorboard": {
             "enabled": True,
             "log_dir": "runs",
+            "auto_launch": True,
+            "host": "127.0.0.1",
+            "port": 6006,
         },
         "gui": {
             "host": "127.0.0.1",

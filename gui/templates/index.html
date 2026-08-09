@@ -964,10 +964,6 @@ function applyTile(s){
     }
   }
   tileTimes[w]=now;tileMoves[w]=s.num_moves||0;
-  const prevNm=lastTileMoves[w]||0;
-  const nm=s.num_moves||0;
-  if(nm>prevNm)cumMoves+=nm-prevNm;
-  lastTileMoves[w]=nm;
   const fen=s.latest_fen||'start';
   try{tileBoards[w]&&tileBoards[w].position(fen,false);}catch(e){}
 }
@@ -1021,6 +1017,11 @@ socket.on('worker_states',states=>{
 
 // ★ Real-time per-move tile update (push from LiveGameState._emit)
 socket.on('worker_tile_update',s=>applyTile(s));
+
+// ★ Authoritative whole-training cumulative counts (all workers × all
+//   subgames).  cumMoves drives the moves/sec meter so it reflects real
+//   throughput, not just the featured game per tile.
+socket.on('global_stats',d=>{if(d&&typeof d.total_moves==='number')cumMoves=d.total_moves;});
 
 // ★ Real-time detail update — server only pushes this for the focused worker
 socket.on('worker_detail_update',data=>{
