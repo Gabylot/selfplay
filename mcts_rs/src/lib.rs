@@ -26,6 +26,10 @@ struct Node {
     policy_orig: f32, // untouched prior (for noise / recycling)
     is_expanded: bool,
     virtual_loss: u16,
+    // Policy index (0..NUM_ACTIONS) of the move that produced this node, or
+    // NONE for the root.  Lets the Python driver recover the move for a node
+    // without mirroring every child as a Python object.
+    action: i32,
 }
 
 struct Arena {
@@ -61,6 +65,7 @@ fn create_node(a: &mut Arena, parent: i32, policy: f32) -> i32 {
         policy_orig: policy,
         is_expanded: false,
         virtual_loss: 0,
+        action: NONE,
     });
     a.children.push(Vec::new());
     if parent >= 0 {
@@ -306,4 +311,106 @@ pub extern "C" fn mcts_rs_get_w(node: i32) -> f64 {
 pub extern "C" fn mcts_rs_count() -> i64 {
     let a = arena().lock().unwrap();
     a.nodes.len() as i64
+}
+
+/// Create all children of `parent` in a single call, then mark `parent`
+/// expanded.  `idx` holds the policy index of each legal move and `prior` the
+/// (already renormalised) prior; both have `count` entries.  The new child ids
+/// are written to `out_ids` in the same order.  Returns `count`.
+///
+/// This replaces the per-child `mcts_rs_add_child` FFI round-trip (and its
+/// per-call lock) that dominated RustMCTS expansion.
+#[no_mangle]
+pub extern "C" fn mcts_rs_expand_batch(
+    parent: i32,
+    idx: *const i32,
+    prior: *const f32,
+    count: usize,
+    out_ids: *mut i32,
+) -> i32 {
+    let mut a = arena().lock().unwrap();
+    if parent < 0 || parent as usize >= a.nodes.len() || count == 0 {
+        return 0;
+    }
+    let p = parent as usize;
+    for k in 0..count {
+        let act = unsafe { *idx.add(k) };
+        let pr = unsafe { *prior.add(k) };
+        let id = a.nodes.len() as i32;
+        a.nodes.push(Node {
+            parent,
+            n: 0,
+            w: 0.0,
+            q: 0.0,
+            policy: pr,
+            policy_orig: pr,
+            is_expanded: false,
+            virtual_loss: 0,
+            action: act,
+        });
+        a.children.push(Vec::new());
+        a.children[p].push(id);
+        if !out_ids.is_null() {
+            unsafe { *out_ids.add(k) = id };
+        }
+    }
+    a.nodes[p].is_expanded = true;
+    count as i32
+}
+
+/// Whether a node has been expanded.
+#[no_mangle]
+pub extern "C" fn mcts_rs_is_expanded(node: i32) -> bool {
+    let a = arena().lock().unwrap();
+    node >= 0 && (node as usize) < a.nodes.len() && a.nodes[node as usize].is_expanded
+}
+
+/// Parent id of `node` (NONE for a root).
+#[no_mangle]
+pub extern "C" fn mcts_rs_get_parent(node: i32) -> i32 {
+    let a = arena().lock().unwrap();
+    if node >= 0 && (node as usize) < a.nodes.len() {
+        a.nodes[node as usize].parent
+    } else {
+        NONE
+    }
+}
+
+/// Policy index of the move that produced `node` (NONE for the root).
+#[no_mangle]
+pub extern "C" fn mcts_rs_get_action(node: i32) -> i32 {
+    let a = arena().lock().unwrap();
+    if node >= 0 && (node as usize) < a.nodes.len() {
+        a.nodes[node as usize].action
+    } else {
+        NONE
+    }
+}
+
+/// Read a node's children (ids + action indices) into `out_ids`/`out_actions`.
+/// Returns the number written (capped at `max_out`).
+#[no_mangle]
+pub extern "C" fn mcts_rs_children2(
+    node: i32,
+    out_ids: *mut i32,
+    out_actions: *mut i32,
+    max_out: usize,
+) -> i32 {
+    let a = arena().lock().unwrap();
+    if node < 0 || node as usize >= a.nodes.len() {
+        return 0;
+    }
+    let kids = &a.children[node as usize];
+    let n = kids.len().min(max_out);
+    for (i, &c) in kids.iter().take(n).enumerate() {
+        unsafe {
+            if !out_ids.is_null() {
+                *out_ids.add(i) = c;
+            }
+            if !out_actions.is_null() {
+                *out_actions.add(i) = a.nodes[c as usize].action;
+            }
+        }
+    }
+    n as i32
 }
