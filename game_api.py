@@ -20,6 +20,14 @@ _REGISTRY = {
 
 _override_name = None
 
+# Memoised active game module.  Every game_api helper funnels through
+# get_game(), which is on the MCTS hot path (called ~5x per leaf expansion and
+# per terminal check).  Re-resolving via importlib.import_module + get_config on
+# every call cost ~15% of search time; cache the module and only re-resolve when
+# the active game name changes (e.g. set_game() in a worker).
+_cached_game_name = None
+_cached_game_mod = None
+
 
 def set_game(name: str):
     """Override the active game name (used inside worker processes)."""
@@ -46,14 +54,18 @@ def is_game(name: str) -> bool:
 
 
 def get_game():
-    """Return the active game module (cached per game name)."""
+    """Return the active game module (memoised on the active game name)."""
+    global _cached_game_name, _cached_game_mod
     name = active_game_name()
-    mod = _REGISTRY.get(name)
-    if mod is None:
-        raise ValueError(
-            f"Unknown game '{name}'. Available games: {sorted(_REGISTRY)}"
-        )
-    return importlib.import_module(mod)
+    if name != _cached_game_name:
+        mod = _REGISTRY.get(name)
+        if mod is None:
+            raise ValueError(
+                f"Unknown game '{name}'. Available games: {sorted(_REGISTRY)}"
+            )
+        _cached_game_mod = importlib.import_module(mod)
+        _cached_game_name = name
+    return _cached_game_mod
 
 
 # ── Dimension helpers (network builder + IPC plumbing) ──

@@ -1530,8 +1530,16 @@ class ParallelSelfPlay:
         for tq in self._task_qs:
             try: tq.put_nowait(None)
             except: pass
+        # Give all workers a SHARED grace period, then kill.  A per-worker
+        # join(10) would cost 10s * num_workers (120s with 12 workers) because
+        # a worker blocked inside MCTS / an inference round-trip cannot observe
+        # the shutdown event until its game step returns.  Idle workers exit
+        # immediately on the ``None`` sentinel above, so a short shared window
+        # is enough; the rest are killed.
+        deadline = time.perf_counter() + 3.0
         for p in self._workers:
-            p.join(timeout=10)
+            remaining = deadline - time.perf_counter()
+            p.join(timeout=remaining if remaining > 0 else 0)
             if p.is_alive(): p.kill()
         self._workers.clear()
 
