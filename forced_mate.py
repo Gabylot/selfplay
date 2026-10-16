@@ -22,6 +22,7 @@ The solver is validated against naive brute-force minimax in
 ``verify_forced_mate_broad.py`` (see ``forced_mate`` vs ``brute_can_force``).
 """
 
+import threading
 import numpy as np
 import chess
 from typing import Optional
@@ -29,14 +30,27 @@ from typing import Optional
 from mcts import MCTS, NUM_ACTIONS, move_to_policy_index
 
 
-# Module-level memo shared across calls.  Reset per game with
-# ``reset_memo()`` to avoid unbounded growth in long-lived workers.
-_memo: dict = {}
+# Per-thread memo for the forced-mate proof search.  Worker processes run one
+# self-play game per thread (``_worker_loop_multi`` subgame threads), so a
+# single module-level dict would be mutated concurrently and a ``reset_memo()``
+# from one game would clobber another game's cache mid-search.  A thread-local
+# gives each game an independent cache, and ``reset_memo()`` only clears the
+# calling thread's cache.  Reset per game to keep it bounded in long-lived
+# workers.
+_memo_local = threading.local()
+
+
+def _memo() -> dict:
+    m = getattr(_memo_local, 'memo', None)
+    if m is None:
+        m = {}
+        _memo_local.memo = m
+    return m
 
 
 def reset_memo() -> None:
-    """Clear the forced-mate memo.  Call once per game."""
-    _memo.clear()
+    """Clear this thread's forced-mate memo.  Call once per game."""
+    _memo().clear()
 
 
 def forced_mate(board: chess.Board, plies: int) -> Optional[chess.Move]:
@@ -52,23 +66,24 @@ def forced_mate(board: chess.Board, plies: int) -> Optional[chess.Move]:
     """
     if board.is_game_over() or plies <= 0:
         return None
+    memo = _memo()
     key = (board.fen(), plies)
-    if key in _memo:
-        return _memo[key]
+    if key in memo:
+        return memo[key]
     if plies == 1:
         for m in board.legal_moves:
             nb = board.copy(stack=False)
             nb.push(m)
             if nb.is_checkmate():
-                _memo[key] = m
+                memo[key] = m
                 return m
-        _memo[key] = None
+        memo[key] = None
         return None
     for m in board.legal_moves:
         nb = board.copy(stack=False)
         nb.push(m)
         if nb.is_checkmate():
-            _memo[key] = m
+            memo[key] = m
             return m
         if nb.is_game_over():
             continue                      # stalemate/draw after m -> not mate
@@ -83,9 +98,9 @@ def forced_mate(board: chess.Board, plies: int) -> Optional[chess.Move]:
                 ok = False
                 break                     # opponent has a non-mating reply
         if ok:
-            _memo[key] = m
+            memo[key] = m
             return m
-    _memo[key] = None
+    memo[key] = None
     return None
 
 

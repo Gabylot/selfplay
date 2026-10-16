@@ -27,19 +27,24 @@ def mock_server(request_q, response_qs, shared_bufs, shutdown_event, ready_event
                 except: pass
             return
 
-        worker_id, request_id, network_id, fourth = req
+        # Protocol:
+        #   shared-memory : (worker_id, req_id, network_id, batch_size, slot)
+        #   queue fallback: (worker_id, req_id, network_id, states)
+        worker_id, request_id, network_id = req[0], req[1], req[2]
+        payload = req[3]
+        slot = req[4] if len(req) > 4 else 0
 
-        if isinstance(fourth, int):
-            batch_size = fourth
+        if isinstance(payload, int):
+            batch_size = payload
             buf = shared_bufs[worker_id]
-            states = SharedMemoryTransport.read_states(buf, batch_size)
+            states = SharedMemoryTransport.read_states(buf, batch_size, slot)
             n = batch_size
             policies = np.ones((n, NUM_ACTIONS), dtype=np.float32) / NUM_ACTIONS
             values = np.mean(states.reshape(n, -1), axis=1).astype(np.float32)
-            SharedMemoryTransport.write_policies_values(buf, policies, values)
+            SharedMemoryTransport.write_policies_values(buf, policies, values, slot)
             response_qs[worker_id].put_nowait((request_id, n))
         else:
-            states = fourth
+            states = payload
             if states.ndim == 4:
                 n = len(states)
                 policies = np.ones((n, NUM_ACTIONS), dtype=np.float32) / NUM_ACTIONS
@@ -139,19 +144,20 @@ def test_float16_precision():
     transport.create_buffers()
     buf = transport.get_worker_buffers(0)
 
+    last_plane = NUM_PLANES - 1
     states = np.zeros((4, NUM_PLANES, 8, 8), dtype=np.float32)
     states[0, 0, 3, 4] = 1.0
     states[0, 12, :, :] = 1.0
-    states[0, 136, :, :] = 0.15
+    states[0, last_plane, :, :] = 0.15
     states[1, 5, 0, 0] = 1.0
-    states[3, 136, :, :] = 0.99
+    states[3, last_plane, :, :] = 0.99
 
     SharedMemoryTransport.write_states(buf, states)
     recovered = SharedMemoryTransport.read_states(buf, 4)
 
     assert np.allclose(states[0, 0, 3, 4], recovered[0, 0, 3, 4])
-    assert abs(states[0, 136, 0, 0] - recovered[0, 136, 0, 0]) < 0.01
-    assert abs(states[3, 136, 0, 0] - recovered[3, 136, 0, 0]) < 0.01
+    assert abs(states[0, last_plane, 0, 0] - recovered[0, last_plane, 0, 0]) < 0.01
+    assert abs(states[3, last_plane, 0, 0] - recovered[3, last_plane, 0, 0]) < 0.01
     print(f"  Binary values exact, normalized within float16 precision")
     print(f"  Max diff: {np.max(np.abs(states - recovered)):.6f}")
     print("  PASSED\n")

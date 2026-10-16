@@ -1,0 +1,18 @@
+# Core runtime dependencies for the AlphaZero self-play engine.
+#
+# torch is intentionally NOT pinned here: you must install the build matched to
+# your accelerator separately, e.g.
+#   pip install torch --index-url https://download.pytorch.org/whl/cu124   # CUDA
+#   pip install torch --index-url https://download.pytorch.org/whl/rocm6.2 # ROCm
+# Then install the rest:
+#   pip install -r requirements.txt
+
+numpy>=1.24
+python-chess>=1.999
+PyYAML>=6.0
+flask>=3.0
+flask-socketio>=5.3
+
+# Optional: build the Rust fastchess encoding extension and mcts_rs engine
+# (pure-Python fallbacks are used when these are unavailable).
+# maturin>=1.0

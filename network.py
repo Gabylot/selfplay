@@ -1,7 +1,8 @@
-"""Dual-head ResNet for AlphaZero chess.
+"""Dual-head ResNet for AlphaZero.
 
 Small, CPU-friendly network with:
-- Policy head: outputs move probability distribution over 4672 actions
+- Policy head: outputs move probability distribution over game.num_actions
+  (dimensions from the active game, see game_api.py)
 - Value head: outputs scalar in [-1, 1] for expected outcome from current player's perspective
 - Random weight initialization (no pretraining)
 """
@@ -12,7 +13,7 @@ import torch.nn.functional as F
 import numpy as np
 from typing import Tuple, Optional
 
-from encoding import NUM_PLANES, NUM_ACTIONS
+import game_api
 
 
 class ResBlock(nn.Module):
@@ -35,12 +36,17 @@ class ResBlock(nn.Module):
 
 
 class AlphaZeroNet(nn.Module):
-    """Dual-head ResNet for chess position evaluation.
-    
+    """Dual-head ResNet for game position evaluation.
+
+    These dimensions come from the active game (see game_api.py), so the
+    same architecture serves chess (119 planes, 73 move-channels, 8x8),
+    connect four (4 planes, 1 channel, 6x7), or any future game.
+
     Architecture:
-        Input conv (119 -> num_filters)
+        Input conv (game.num_planes -> num_filters)
         N residual blocks (num_filters -> num_filters)
-        Policy head: Conv 1x1 -> BN -> ReLU -> Conv 1x1 (73 filters) -> 4672 logits
+        Policy head: Conv 1x1 -> BN -> ReLU -> Conv 1x1
+                     (game.policy_channels) -> game.num_actions logits
         Value head: Conv 1x1 (1 filter) -> BN -> ReLU -> FC -> tanh -> 1
     """
     
@@ -51,12 +57,18 @@ class AlphaZeroNet(nn.Module):
                  num_value_channels: int = 1,
                  value_fc_size: int = 128):
         super().__init__()
-        
+
+        self.game_name = game_api.active_game_name()
         self.num_residual_blocks = num_residual_blocks
         self.num_filters = num_filters
-        
+        self.num_planes = game_api.num_planes()
+        self.num_actions = game_api.num_actions()
+        self.policy_channels_out = game_api.policy_channels()
+        self.board_h = game_api.board_h()
+        self.board_w = game_api.board_w()
+
         # Input convolution
-        self.input_conv = nn.Conv2d(NUM_PLANES, num_filters, kernel_size=3, padding=1, bias=False)
+        self.input_conv = nn.Conv2d(self.num_planes, num_filters, kernel_size=3, padding=1, bias=False)
         self.input_bn = nn.BatchNorm2d(num_filters)
         
         # Residual blocks
@@ -64,21 +76,17 @@ class AlphaZeroNet(nn.Module):
             ResBlock(num_filters) for _ in range(num_residual_blocks)
         ])
         
-        # Policy head — matches the AlphaZero paper: an additional rectified
-        # BN-conv layer, then a final 1x1 convolution producing one logit
-        # per (square, move-plane) = 73 x 8 x 8 = 4672 logits.
+        # Policy head — one logit per (cell, move-channel) = num_actions.
         self.policy_conv = nn.Conv2d(num_filters, num_policy_channels, kernel_size=1, bias=False)
         self.policy_bn = nn.BatchNorm2d(num_policy_channels)
-        self.policy_logits_conv = nn.Conv2d(num_policy_channels, 73, kernel_size=1, bias=False)
+        self.policy_logits_conv = nn.Conv2d(num_policy_channels, self.policy_channels_out, kernel_size=1, bias=False)
 
-        # Value head — matches the AlphaZero paper: a batch-normalized 1x1
-        # convolution of 1 filter, then a rectified FC layer of size
-        # value_fc_size, then a tanh-linear layer of size 1.
-        # NOTE: num_value_channels is accepted for API compatibility only;
-        # the value head uses a single 1x1 filter per the paper.
+        # Value head — a batch-normalized 1x1 convolution of 1 filter,
+        # then a rectified FC layer, then a tanh-linear layer of size 1.
+        # NOTE: num_value_channels is accepted for API compatibility only.
         self.value_conv = nn.Conv2d(num_filters, 1, kernel_size=1, bias=False)
         self.value_bn = nn.BatchNorm2d(1)
-        self.value_fc1 = nn.Linear(8 * 8, value_fc_size)
+        self.value_fc1 = nn.Linear(self.board_h * self.board_w, value_fc_size)
         self.value_fc2 = nn.Linear(value_fc_size, 1)
         
         # Initialize weights
@@ -101,10 +109,10 @@ class AlphaZeroNet(nn.Module):
         """Forward pass.
         
         Args:
-            x: Input tensor of shape (batch, 119, 8, 8)
+            x: Input tensor of shape (batch, game.num_planes, H, W)
         
         Returns:
-            policy_logits: (batch, 4672) raw logits for move probabilities
+            policy_logits: (batch, game.num_actions) raw logits
             value: (batch, 1) scalar in [-1, 1]
         """
         # Input convolution
@@ -115,14 +123,13 @@ class AlphaZeroNet(nn.Module):
             x = block(x)
         
         # Policy head: rectified BN-conv, then a final 1x1 convolution over
-        # 73 move planes per square.  Rearranged from (B, 73, 8, 8) to the
-        # canonical (B, 4672) ordering — source square-major, then plane,
-        # i.e. flat index = square * 73 + plane — matching
-        # move_to_policy_index() in encoding.py.
+        # game.policy_channels move-channels per cell.  Rearranged from
+        # (B, channels, H, W) to the canonical flat (B, H*W*channels)
+        # ordering — matching the game's to_index() encoding.
         policy = F.relu(self.policy_bn(self.policy_conv(x)))
         policy_logits = self.policy_logits_conv(policy)
-        policy_logits = policy_logits.permute(0, 2, 3, 1)  # (B, 8, 8, 73)
-        policy_logits = policy_logits.reshape(policy_logits.size(0), -1)  # (B, 4672)
+        policy_logits = policy_logits.permute(0, 2, 3, 1)  # (B, H, W, ch)
+        policy_logits = policy_logits.reshape(policy_logits.size(0), -1)  # (B, num_actions)
 
         # Value head: 1-filter 1x1 conv, rectified FC, tanh-linear.
         value = F.relu(self.value_bn(self.value_conv(x)))
@@ -133,13 +140,13 @@ class AlphaZeroNet(nn.Module):
         return policy_logits, value
     
     def predict(self, state: np.ndarray) -> Tuple[np.ndarray, float]:
-        """Predict policy and value for a single board state.
+        """Predict policy and value for a single state.
         
         Args:
-            state: (119, 8, 8) numpy array
+            state: (game.num_planes, H, W) numpy array
         
         Returns:
-            policy: (4672,) numpy array of probabilities
+            policy: (game.num_actions,) numpy array of probabilities
             value: scalar float in [-1, 1]
         """
         self.eval()
@@ -154,13 +161,13 @@ class AlphaZeroNet(nn.Module):
         return policy, value
     
     def predictBatch(self, states: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        """Predict policy and value for a batch of board states.
+        """Predict policy and value for a batch of states.
         
         Args:
-            states: (batch, 119, 8, 8) numpy array
+            states: (batch, game.num_planes, H, W) numpy array
         
         Returns:
-            policies: (batch, 4672) numpy array of probabilities
+            policies: (batch, game.num_actions) numpy array of probabilities
             values: (batch,) numpy array of scalars
         """
         self.eval()
@@ -197,7 +204,9 @@ def load_checkpoint(path: str, model: AlphaZeroNet = None,
     If model is provided, loads state dict into it.
     If optimizer is provided, loads optimizer state dict.
     """
-    checkpoint = torch.load(path, map_location='cpu', weights_only=False)
+    # weights_only=True: checkpoints contain only tensors / primitives, so we
+    # never unpickle arbitrary objects from a checkpoint file.
+    checkpoint = torch.load(path, map_location='cpu', weights_only=True)
     
     if model is not None:
         model.load_state_dict(checkpoint['model_state_dict'])

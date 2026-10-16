@@ -1,7 +1,8 @@
-"""Evaluation, gating, and Elo tracking for AlphaZero chess engine.
+"""Evaluation, gating, and Elo tracking for AlphaZero.
 
 - Gating: periodically pit latest trained network vs current "best" network
-- Reference opponent: depth-2 alpha-beta search using material evaluation
+- Reference opponent: a fast game-specific reference player (chess: depth-2
+  alpha-beta with material evaluation; connect4: greedy solver heuristic)
 - Elo tracking with standard update formula
 
 Design: Self-play always uses the *latest* network.
@@ -15,9 +16,10 @@ import chess
 import numpy as np
 from typing import Tuple, Optional
 
+import game_api
 from network import AlphaZeroNet
 from mcts import MCTS
-from encoding import board_to_tensor
+from selfplay import play_two_engine_match, play_engine_vs_reference
 
 
 def elo_expected_score(rating_a: float, rating_b: float) -> float:
@@ -286,9 +288,9 @@ def play_match_vs_alpha_beta(network: AlphaZeroNet, config,
                                  game_type="reference",
                                  match_info=f"Reference Game {game_idx+1}/{num_games}")
         
-        board = chess.Board()
+        board = None
         move_count = 0
-        
+
         mcts = MCTS(
             network=network,
             num_simulations=config.mcts.num_simulations,
@@ -299,34 +301,12 @@ def play_match_vs_alpha_beta(network: AlphaZeroNet, config,
             c_virtual_loss=getattr(config.mcts, 'c_virtual_loss', 0.5),
             force_mate_in_one=getattr(config.mcts, 'force_mate_in_one', True),
         )
-        
-        while not board.is_game_over() and move_count < config.selfplay.max_game_length:
-            is_network_turn = (board.turn == chess.WHITE) == network_is_white
-            
-            if is_network_turn:
-                # Network's turn — use MCTS
-                root = mcts.get_root(board)
-                mcts.search(root)
-                _, selected_move = mcts.select_move_with_temperature(root, temperature=0.1)
-                if selected_move is None:
-                    break
-                # Build MCTS stats for callback
-                mcts_stats = _build_mcts_stats(root, selected_move) if on_move else None
-                board.push(selected_move)
-                if on_move:
-                    on_move(board.fen(), selected_move.uci(), move_count, mcts_stats=mcts_stats)
-            else:
-                # Alpha-beta's turn
-                move = alpha_beta_best_move(board, ab_depth)
-                if move is None:
-                    break
-                board.push(move)
-                if on_move:
-                    on_move(board.fen(), move.uci(), move_count)
-            
-            move_count += 1
-        
-        result = board.result()
+
+        _state, _move_count, result = play_engine_vs_reference(
+            mcts, network_is_white, config.selfplay.max_game_length,
+            depth=ab_depth, on_move=on_move)
+        move_count = _move_count
+
         if result == "1-0":
             if network_is_white:
                 wins += 1
@@ -383,31 +363,10 @@ def _build_mcts_stats(root, selected_move):
 
 def _play_evaluation_game(mcts_a: MCTS, mcts_b: MCTS, a_is_white: bool,
                            max_moves: int = 150, on_move=None) -> str:
-    """Play a single evaluation game between two MCTS agents."""
-    board = chess.Board()
-    move_count = 0
-    
-    while not board.is_game_over() and move_count < max_moves:
-        is_a_turn = (board.turn == chess.WHITE) == a_is_white
-        mcts = mcts_a if is_a_turn else mcts_b
-        
-        root = mcts.get_root(board)
-        mcts.search(root)
-        _, selected_move = mcts.select_move_with_temperature(root, temperature=0.1)
-        
-        if selected_move is None:
-            break
-        
-        # Build MCTS stats for callback
-        mcts_stats = _build_mcts_stats(root, selected_move) if on_move else None
-        
-        board.push(selected_move)
-        move_count += 1
-        
-        if on_move:
-            on_move(board.fen(), selected_move.uci(), move_count, mcts_stats=mcts_stats)
-    
-    return board.result() if board.is_game_over() else "*"
+    """Play a single evaluation game between two MCTS agents (any game)."""
+    _state, _move_count, result = play_two_engine_match(
+        mcts_a, mcts_b, a_is_white, max_moves, on_move=on_move)
+    return result
 
 
 # ============================================================
@@ -455,7 +414,14 @@ class Evaluator:
         
         win_rate = match_result['win_rate_a']
         promoted = win_rate > self.config.evaluation.gate_win_threshold
-        
+
+        # Update Elo (network A = latest, network B = best) BEFORE logging the
+        # promotion attempt so old_elo/new_elo reflect an actual change.
+        score_a = match_result['win_rate_a']
+        k = self.config.evaluation.elo_k_factor
+        old_elo = self.best_elo
+        self.best_elo = elo_update(self.best_elo, self.best_elo, score_a, k)
+
         # Log promotion attempt
         self.stats.log_promotion_attempt(
             step=step,
@@ -466,15 +432,9 @@ class Evaluator:
             losses=match_result['wins_b'],
             draws=match_result['draws'],
             new_elo=self.best_elo,
-            old_elo=self.best_elo,
+            old_elo=old_elo,
         )
-        
-        # Update Elo (network A = latest, network B = best)
-        score_a = match_result['win_rate_a']
-        k = self.config.evaluation.elo_k_factor
-        old_elo = self.best_elo
-        self.best_elo = elo_update(self.best_elo, self.best_elo, score_a, k)
-        
+
         self.stats.log_elo(
             self.best_elo, "gating", step,
             num_games, match_result['wins_a'], match_result['wins_b'], match_result['draws']

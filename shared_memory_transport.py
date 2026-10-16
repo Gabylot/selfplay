@@ -42,7 +42,7 @@ import multiprocessing as mp
 import numpy as np
 from typing import Optional, Dict, List
 
-from encoding import NUM_PLANES, NUM_ACTIONS
+import game_api
 
 
 # Default dtype for state tensors in shared memory.
@@ -83,21 +83,27 @@ class WorkerSharedBuffers:
         Numpy dtype used for states and policies.
     """
 
-    def __init__(self, max_batch: int, state_dtype=np.float16, num_slots: int = 1):
+    def __init__(self, max_batch: int, state_dtype=np.float16, num_slots: int = 1,
+                 policy_dtype=np.float32):
         self.max_batch = max_batch
         self.state_dtype = np.dtype(state_dtype)
+        self.policy_dtype = np.dtype(policy_dtype)
         self.num_slots = max(1, num_slots)
         slot_stride = max_batch
+        self.num_planes = game_api.num_planes()
+        self.num_actions = game_api.num_actions()
 
-        state_elems = max_batch * NUM_PLANES * 8 * 8 * self.num_slots
-        policy_elems = max_batch * NUM_ACTIONS * self.num_slots
+        state_elems = max_batch * self.num_planes * game_api.board_h() * game_api.board_w() * self.num_slots
+        policy_elems = max_batch * self.num_actions * self.num_slots
         value_elems = max_batch * self.num_slots
 
         # mp.Array typecode: 'f' = float32, 'd' = float64, 'h' = float16
         # States can be float16 (binary board planes -- no precision loss).
-        # Policies MUST be float32 -- the GPU outputs float32 and converting
-        # to float16 during np.copyto is a major CPU bottleneck (~200 MB/s
-        # vs >1 GB/s for same-type memcpy).
+        # Policies may be float16 when the GPU server casts its softmax
+        # output to f16 BEFORE the D2H download -- then every copy in the
+        # pipeline is a same-dtype memcpy and the PCIe response shrinks 2x.
+        # (The old "always float32" rule existed because converting f32->f16
+        # during np.copyto is slow; producing f16 on the GPU avoids that.)
         if self.state_dtype == np.float16:
             state_tc = 'h'
         elif self.state_dtype == np.float32:
@@ -107,9 +113,25 @@ class WorkerSharedBuffers:
             state_tc = 'f'
             self.state_dtype = np.float32
 
+        if self.policy_dtype == np.float16:
+            policy_tc = 'h'
+        else:
+            policy_tc = 'f'
+            self.policy_dtype = np.float32
+
         self.request_states = mp.Array(state_tc, state_elems, lock=False)
-        self.response_policies = mp.Array('f', policy_elems, lock=False)  # always float32
+        self.response_policies = mp.Array(policy_tc, policy_elems, lock=False)
         self.response_values = mp.Array('f', value_elems, lock=False)
+
+    def close(self):
+        """Release the underlying shared-memory segments for this worker."""
+        for arr in (self.request_states, self.response_policies,
+                    self.response_values):
+            try:
+                if hasattr(arr, 'close'):
+                    arr.close()
+            except Exception:
+                pass
 
     # ── Numpy views (created per-process, not shared) ────────────────
     # Each slot is an independent, capacity-``max_batch`` segment so a worker
@@ -121,31 +143,31 @@ class WorkerSharedBuffers:
 
     def request_states_np(self, batch_size: int, slot: int = 0) -> np.ndarray:
         """Return a numpy view of the first *batch_size* rows of *slot*'s
-        request buffer, shaped ``(batch_size, NUM_PLANES, 8, 8)``."""
-        n_ppp = NUM_PLANES * 8 * 8  # elems per sample
+        request buffer, shaped ``(batch_size, num_planes, board_h, board_w)``."""
+        n_ppp = self.num_planes * game_api.board_h() * game_api.board_w()
         off = self._slot_off(slot, n_ppp)
         flat = np.frombuffer(
             _get_raw_array(self.request_states),
             dtype=self.state_dtype,
         )
         return flat[off:off + batch_size * n_ppp].reshape(
-            batch_size, NUM_PLANES, 8, 8
+            batch_size, self.num_planes, game_api.board_h(), game_api.board_w()
         )
 
     def response_policies_np(self, batch_size: int, slot: int = 0) -> np.ndarray:
         """Return a numpy view of the first *batch_size* rows of *slot*'s
-        policy buffer, shaped ``(batch_size, NUM_ACTIONS)``.
+policy buffer, shaped ``(batch_size, num_actions)``.
 
-        Always float32 -- the GPU outputs float32 and the buffer is always
-        float32 regardless of state_dtype.
+        Dtype matches the buffer's ``policy_dtype`` (float32 or float16).
         """
-        start = self._slot_off(slot, NUM_ACTIONS)
+        start = self._slot_off(slot, self.num_actions)
         flat = np.frombuffer(
-            _get_raw_array(self.response_policies), dtype=np.float32,
+            _get_raw_array(self.response_policies), dtype=self.policy_dtype,
         )
-        return flat[start:start + batch_size * NUM_ACTIONS].reshape(
-            batch_size, NUM_ACTIONS
+        return flat[start:start + batch_size * self.num_actions].reshape(
+            batch_size, self.num_actions
         )
+        
 
     def response_values_np(self, batch_size: int, slot: int = 0) -> np.ndarray:
         """Return a numpy view of the first *batch_size* elements of *slot*'s
@@ -166,10 +188,12 @@ class SharedMemoryTransport:
     """
 
     def __init__(self, num_workers: int, max_batch: int = 64,
-                 state_dtype=np.float16, num_slots: int = 1):
+                 state_dtype=np.float16, num_slots: int = 1,
+                 policy_dtype=np.float32):
         self.num_workers = num_workers
         self.max_batch = max_batch
         self.state_dtype = np.dtype(state_dtype)
+        self.policy_dtype = np.dtype(policy_dtype)
         self.num_slots = max(1, num_slots)
         self._buffers: Dict[int, WorkerSharedBuffers] = {}
 
@@ -177,7 +201,8 @@ class SharedMemoryTransport:
         """Allocate one ``WorkerSharedBuffers`` per worker."""
         for i in range(self.num_workers):
             self._buffers[i] = WorkerSharedBuffers(
-                self.max_batch, self.state_dtype, self.num_slots
+                self.max_batch, self.state_dtype, self.num_slots,
+                policy_dtype=self.policy_dtype
             )
 
     def get_worker_buffers(self, worker_id: int) -> WorkerSharedBuffers:
@@ -191,6 +216,15 @@ class SharedMemoryTransport:
     def get_all_worker_buffers(self) -> Dict[int, WorkerSharedBuffers]:
         """Return a dict mapping worker_id → buffers for the GPU server."""
         return dict(self._buffers)
+
+    def close(self):
+        """Release all shared-memory segments held by this transport."""
+        for buf in self._buffers.values():
+            try:
+                buf.close()
+            except Exception:
+                pass
+        self._buffers.clear()
 
     @staticmethod
     def write_states(buf: WorkerSharedBuffers, states: np.ndarray,
@@ -228,17 +262,20 @@ class SharedMemoryTransport:
 
     @staticmethod
     def read_states(buf: WorkerSharedBuffers, batch_size: int,
-                    slot: int = 0) -> np.ndarray:
+                    slot: int = 0, copy: bool = True) -> np.ndarray:
         """Read states from the request shared buffer for *slot*.
 
-        Returns a float32 array (the dtype the network expects).  When
-        the buffer is already float32, this is a fast same-type copy.
-        When the buffer is float16, a conversion is required (slower).
+        With ``copy=False`` a zero-copy *view* in the buffer's NATIVE dtype is
+        returned (float32 or float16) — only safe when the caller consumes it
+        before the worker reuses this slot (the synchronous request/response
+        protocol guarantees this).  The GPU server uploads f16 views directly
+        and casts to f32 on-device, halving PCIe input bytes.
+        With ``copy=True`` a float32 array is returned as before.
         """
         view = buf.request_states_np(batch_size, slot)
+        if not copy:
+            return view
         if buf.state_dtype == np.float32:
-            # Same dtype -- return a copy (safe, worker won't overwrite
-            # until we respond, but copy avoids any aliasing issues)
             return view.copy()
         # float16 -> float32 conversion (CPU-bound)
         return view.astype(np.float32)
@@ -246,10 +283,12 @@ class SharedMemoryTransport:
     @staticmethod
     def read_policies(buf: WorkerSharedBuffers, batch_size: int,
                       slot: int = 0) -> np.ndarray:
-        """Read policies from the response shared buffer for *slot* as float32.
+        """Read policies from the response shared buffer for *slot*.
 
-        Returns a copy so the caller owns the data before the server
-        overwrites the shared buffer on the next request.
+        Returns a copy in the buffer's own dtype (float32 or float16) — no
+        conversion.  Consumers gather only the handful of legal-move priors
+        they need, so f16 precision is fine and per-element conversion cost
+        is paid on ~35 values instead of 4672.
         """
         view = buf.response_policies_np(batch_size, slot)
         return view.copy()

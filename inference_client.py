@@ -36,11 +36,27 @@ Usage::
                              shared_buffers=transport.get_worker_buffers(0))
 """
 
+import time
+import queue
+import itertools
 import numpy as np
 import multiprocessing as mp
 from typing import Optional, List
 
+import game_api
 from shared_memory_transport import WorkerSharedBuffers, SharedMemoryTransport
+
+# How long to wait for a single inference response before giving up.  The GPU
+# server never silently drops a request in normal operation, so a timeout here
+# means something is genuinely wrong (crashed forward thread, OOM, dead
+# worker); raising is far better than blocking the worker forever.
+_RESPONSE_TIMEOUT_S = 120.0
+
+# Process-global request-id counter.  Multiple InferenceClients can share one
+# response queue (gating eval creates two: network 0 and network 1), so ids
+# MUST be unique across clients -- otherwise a response could cross clients and
+# hand one network the other's policy/value.
+_REQ_COUNTER = itertools.count(1)
 
 
 class InferenceClient:
@@ -221,8 +237,7 @@ class InferenceClient:
     # ── Internal ────────────────────────────────────────────────────────
 
     def _next_id(self):
-        self._req_counter += 1
-        return self._req_counter
+        return next(_REQ_COUNTER)
 
     def _wait_response(self, req_id):
         """Block until a response matching *req_id* arrives.
@@ -235,11 +250,36 @@ class InferenceClient:
         # Check cache for any previously received out-of-order response
         if req_id in self._response_cache:
             return self._response_cache.pop(req_id)
+        deadline = time.monotonic() + _RESPONSE_TIMEOUT_S
         while True:
-            resp = self.response_queue.get()
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                self._slot_by_req.pop(req_id, None)
+                self._batch_req_ids.discard(req_id)
+                raise TimeoutError(
+                    f"InferenceClient(worker={self.worker_id}, "
+                    f"net={self.network_id}) timed out after "
+                    f"{_RESPONSE_TIMEOUT_S:.0f}s waiting for response "
+                    f"{req_id}; the GPU inference server may have dropped the "
+                    f"request (check dropped_responses / forward_errors)."
+                )
+            try:
+                resp = self.response_queue.get(timeout=remaining)
+            except queue.Empty:
+                continue
             if resp is None:
                 # Server shutting down — return zeros
-                return np.zeros(4672, dtype=np.float32), 0.0
+                return np.zeros(game_api.num_actions(), dtype=np.float32), 0.0
+
+            # Error response from the server (e.g. a batch dropped because the
+            # forward pass raised).  Surface it instead of hanging forever.
+            if (isinstance(resp, tuple) and len(resp) == 3
+                    and isinstance(resp[0], str) and resp[0] == 'ERR'):
+                self._slot_by_req.pop(req_id, None)
+                self._batch_req_ids.discard(req_id)
+                raise RuntimeError(
+                    f"GPU inference server error for request {resp[1]}: {resp[2]}"
+                )
 
             if self._shared_buffers is not None and len(resp) == 2:
                 # ── Shared-memory response: (req_id, batch_size) ──
@@ -257,7 +297,9 @@ class InferenceClient:
                         self._batch_req_ids.discard(resp_id)
                         return policies, values
                     return policies[0], float(values[0])
-                # Out-of-order — cache it and keep waiting
+                # Out-of-order — cache it and keep waiting.  Pop the slot
+                # mapping too, otherwise _slot_by_req grows without bound.
+                self._slot_by_req.pop(resp_id, None)
                 if resp_id in self._batch_req_ids:
                     self._batch_req_ids.discard(resp_id)
                     self._response_cache[resp_id] = (policies, values)

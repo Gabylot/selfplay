@@ -1,4 +1,4 @@
-"""Self-play game generation and replay buffer for AlphaZero chess.
+"""Self-play game generation and replay buffer for AlphaZero.
 
 Parallel self-play:
   - ParallelSelfPlay manages a pool of worker processes.
@@ -14,14 +14,17 @@ old buffer files saved before this change.
 NOTE 2: when GPU inference is enabled (config.inference.use_gpu), gating eval
 (network A vs network B) is routed through the centralized dual-network GPU
 server via InferenceClient(network_id=0 / 1) instead of loading both networks
-onto CPU. Reference eval (network vs alpha-beta) also uses network_id=0 when
-GPU inference is active. This mirrors the self-play path and avoids the CPU
-fallback silently running whenever use_gpu is set.
+onto CPU. Reference eval (network vs reference player) also uses network_id=0
+when GPU inference is active. This mirrors the self-play path and avoids the
+CPU fallback silently running whenever use_gpu is set.
 
 NOTE 3: when GPU inference is enabled and ``config.inference.use_shared_memory``
 is True (default), per-worker shared-memory buffers are allocated to eliminate
 pickle/pipe overhead for state and policy/value arrays. Only ~100 bytes of
 metadata travel through the queue per inference request.
+
+All game-specific mechanics (chess, connect4, ...) are accessed through
+``game_api``; see game_api.py.
 """
 
 import numpy as np
@@ -34,6 +37,7 @@ import time
 import io
 import os
 
+import game_api
 from encoding import board_to_tensor, get_legal_move_mask, NUM_ACTIONS
 from network import AlphaZeroNet
 from mcts import MCTS
@@ -110,10 +114,18 @@ class ReplayBuffer:
         if not self.buffer:
             return
         n = len(self.buffer)
-        states   = np.stack([self.buffer[i][0] for i in range(n)])
-        policies = np.stack([self.buffer[i][1] for i in range(n)])
-        values   = np.array([self.buffer[i][2] for i in range(n)], dtype=np.float32)
-        masks    = np.stack([self.buffer[i][3] for i in range(n)])
+        # Emit in logical FIFO order (oldest first) so the circular write
+        # pointer can be reset to 0 on load and still overwrite the oldest
+        # positions first.  Without this the on-disk order is arbitrary once
+        # the buffer has wrapped, and reloading silently scrambles age order.
+        if n < self.max_size:
+            order = range(n)
+        else:
+            order = list(range(self._write_idx, n)) + list(range(0, self._write_idx))
+        states   = np.stack([self.buffer[i][0] for i in order])
+        policies = np.stack([self.buffer[i][1] for i in order])
+        values   = np.array([self.buffer[i][2] for i in order], dtype=np.float32)
+        masks    = np.stack([self.buffer[i][3] for i in order])
         np.savez_compressed(
             path,
             states=states, policies=policies, values=values, masks=masks,
@@ -145,9 +157,23 @@ class ReplayBuffer:
                 print(f"[WARN] {path} has no saved legal-move masks (old format). "
                       f"Filling with all-ones masks for {n} positions — these will "
                       f"train without masking until they age out of the buffer.")
-                masks = np.ones((n, NUM_ACTIONS), dtype=np.float32)
+                masks = np.ones((n, game_api.num_actions()), dtype=np.float32)
+            if n > max_size:
+                # Keep the most recent positions (saved oldest→newest).
+                print(f"[WARN] {path} holds {n} positions, exceeds max_size "
+                      f"{max_size}; keeping the most recent {max_size}.")
+                states   = states[-max_size:]
+                policies = policies[-max_size:]
+                values   = values[-max_size:]
+                masks    = masks[-max_size:]
+                n = max_size
             for i in range(n):
                 buf.buffer.append((states[i], policies[i], float(values[i]), masks[i]))
+            # Buffer[0] is now the oldest position and n <= max_size, so the
+            # circular write pointer restarts at 0 (overwrites oldest first
+            # once the buffer refills).  Note: appending directly above does
+            # not advance _write_idx, hence the explicit reset.
+            buf._write_idx       = 0
             buf.total_games      = int(data.get('total_games', n))
             buf.total_positions  = int(data.get('total_positions', n))
             return buf
@@ -430,14 +456,13 @@ def play_one_game(mcts_engine, max_game_length=150, adjudicate_material=True,
     # worker processes that play many games.
     reset_memo()
 
-    start_kind = "standard"
+    start = {}
     if fen:
-        board = chess.Board(fen)
-    elif start_pieces:
-        start_kind, board = _pick_start_board_kind(
-            start_pieces, randomize_colors=start_colors_random)
-    else:
-        board = chess.Board()
+        start['fen'] = fen
+    if start_pieces:
+        start['start_pieces'] = start_pieces
+        start['randomize_colors'] = start_colors_random
+    board, start_kind = game_api.new_state(start)
     game_states = []
     mcts_stats_list = []
     move_count = 0
@@ -447,13 +472,13 @@ def play_one_game(mcts_engine, max_game_length=150, adjudicate_material=True,
     base_num_simulations = getattr(mcts_engine, 'num_simulations', 0)
 
     # Original loop – stop only on automatic game‑overs (not claimable draws)
-    while not board.is_game_over() and not board.is_repetition(3) and move_count < max_game_length:
-        n_pieces = len(board.piece_map())
-        # Deeper simulation budget in sparse endgames (<= endgame_piece_gate
-        # pieces) so the tree can actually see a real mate leaf and the
-        # visit distribution peaks on the converting moves.  Leaves the
-        # middlegame on the normal budget.
-        if endgame_num_simulations > 0:
+    while (not game_api.is_terminal(board)
+           and not game_api.is_draw_claim(board)
+           and move_count < max_game_length):
+        n_pieces = game_api.piece_count(board)   # None for piece-less games
+        # Deeper simulation budget in sparse endgames (chess only;
+        # ``n_pieces`` is None for games without pieces).
+        if endgame_num_simulations > 0 and n_pieces is not None:
             mcts_engine.num_simulations = (endgame_num_simulations
                                            if n_pieces <= endgame_piece_gate
                                            else base_num_simulations)
@@ -470,7 +495,7 @@ def play_one_game(mcts_engine, max_game_length=150, adjudicate_material=True,
             # endgame, so there is no high-temperature opening stage: play
             # them at the fixed low temperature from move one.
             temp = temp_low
-        elif endgame_temperature is not None and n_pieces <= endgame_piece_gate:
+        elif endgame_temperature is not None and n_pieces is not None and n_pieces <= endgame_piece_gate:
             temp = endgame_temperature
         else:
             temp = get_temperature(move_count, temp_threshold, temp_high, temp_low)
@@ -481,19 +506,19 @@ def play_one_game(mcts_engine, max_game_length=150, adjudicate_material=True,
             if selected_move is None:
                 # This should never happen after fixing MCTS expansion (no claim_draw=True)
                 with open("mcts_empty_root.log", "a") as f:
-                    f.write(f"Empty root at move {move_count}: {board.fen()}\n"
-                            f"Legal moves: {[m.uci() for m in board.legal_moves]}\n"
+                    f.write(f"Empty root at move {move_count}: {game_api.describe(board)}\n"
+                            f"Legal moves: {[game_api.move_str(m) for m in game_api.legal_moves(board)]}\n"
                             f"Children after search: {len(root.children)}\n\n")
                 break
 
-        st = board_to_tensor(board)
-        cp = 1.0 if board.turn == chess.WHITE else -1.0
-        legal_mask = get_legal_move_mask(board)
+        st = game_api.encode(board)
+        cp = game_api.player_sign(board)
+        legal_mask = game_api.mask(board)
         game_states.append((st, visit_policy.copy(), cp, legal_mask))
         mcts_stats_list.append(stats)
 
         mcts_move_data = {
-            'selected_move': selected_move.uci(),
+            'selected_move': game_api.move_str(selected_move),
             'candidates':     move_candidates,
             # Augment the per-move snapshot with search-effort so the GUI's
             # "why this move?" panel can report how deep / how much MCTS ran.
@@ -501,73 +526,26 @@ def play_one_game(mcts_engine, max_game_length=150, adjudicate_material=True,
             'sims':           int(stats.get('num_simulations')
                                   or sum(c['N'] for c in move_candidates)),
         }
-        board.push(selected_move)
+        game_api.apply(board, selected_move)
         move_count += 1
         if on_move:
-            on_move(board.fen(), selected_move.uci(), move_count, mcts_move_data)
+            on_move(game_api.describe(board), game_api.move_str(selected_move), move_count, mcts_move_data)
 
         root = mcts_engine.recycle_tree(root, selected_move)
 
-    material_diff = material_point_difference(board, piece_values)
+    material_diff = None
+    mat_fn = getattr(game_api.get_game(), 'material_diff', None)
+    if mat_fn is not None:
+        material_diff = mat_fn(board, piece_values)
 
-    # Determine outcome and termination reason
-    if board.is_game_over(claim_draw=True):
-        r = board.result(claim_draw=True)
-        if r == "1-0":
-            outcome, termination = 1.0, "checkmate" if board.is_checkmate() else "other"
-        elif r == "0-1":
-            outcome, termination = -1.0, "checkmate" if board.is_checkmate() else "other"
-        else:
-            outcome = 0.0
-            if board.is_fivefold_repetition():
-                termination = "fivefold_repetition"
-            elif board.is_repetition(3):
-                termination = "repetition"
-            elif board.is_seventyfive_moves():
-                termination = "seventyfive_moves"
-            elif board.is_stalemate():
-                termination = "stalemate"
-            elif board.is_fifty_moves():
-                termination = "fifty_moves"
-            elif board.is_insufficient_material():
-                termination = "insufficient_material"
-            else:
-                # Only reachable if the game ended but none of the above apply
-                # (e.g., variant ending) – label generically
-                termination = "draw"
-    elif move_count >= max_game_length:
-        termination = "max_length"
-        if adjudicate_material:
-            outcome = adjudicate_by_material(board, piece_values,
-                                             graded=adjudicate_graded,
-                                             scaling=adjudicate_scaling)
-            if outcome > 0:
-                termination = "material_white"
-            elif outcome < 0:
-                termination = "material_black"
-    else:
-        # Fallback – should not happen normally (kept for safety)
-        outcome = 0.0
-        termination = "unknown"
-        with open("unknown_termination_log.txt", "a") as f:
-            f.write(f"UNKNOWN at move {move_count}: {board.fen()} | "
-                    f"halfmove_clock={board.halfmove_clock} | "
-                    f"can_claim_3fold={board.can_claim_threefold_repetition()} | "
-                    f"can_claim_50={board.can_claim_fifty_moves()} | "
-                    f"is_50={board.is_fifty_moves()} | "
-                    f"is_repetition(2)={board.is_repetition(2)} | "
-                    f"is_repetition(3)={board.is_repetition(3)} | "
-                    f"is_insufficient={board.is_insufficient_material()}\n")
-
-    # Build result string for display
-    if board.is_game_over(claim_draw=True):
-        result_str = board.result(claim_draw=True)
-    elif outcome > 0:
-        result_str = "1-0"
-    elif outcome < 0:
-        result_str = "0-1"
-    else:
-        result_str = "1/2-1/2"
+    # Determine outcome and termination reason via the game adapter.
+    _res = game_api.final_result(
+        board, move_count, max_game_length,
+        adjudicate_material=adjudicate_material, piece_values=piece_values,
+        adjudicate_graded=adjudicate_graded, adjudicate_scaling=adjudicate_scaling)
+    outcome = _res['outcome']
+    termination = _res['termination']
+    result_str = _res['result_str']
 
     game_data = [(s, p, outcome * pl, m) for s, p, pl, m in game_states]
     avg_depth = float(np.mean([s.get('avg_depth', 0) for s in mcts_stats_list])) if mcts_stats_list else 0.0
@@ -586,8 +564,10 @@ def play_one_game(mcts_engine, max_game_length=150, adjudicate_material=True,
 def self_play_game(network, config, on_move=None):
     # Use the forced-mate override for endgame conversion when enabled
     # (see forced_mate.py).  The proof search is gated to sparse boards
-    # (<= force_mate_gate_pieces pieces) and cheap (sub-ms).
-    force_mate = getattr(config.selfplay, 'force_mate', False)
+    # (<= force_mate_gate_pieces pieces) and cheap (sub-ms).  It is a
+    # chess-only feature, so it is disabled for other games.
+    force_mate = (getattr(config.selfplay, 'force_mate', False)
+                  and game_api.is_game('chess'))
     mcts_cls = ForceMateMCTS if force_mate else MCTS
     mcts_kwargs = {}
     if force_mate:
@@ -612,6 +592,8 @@ def self_play_game(network, config, on_move=None):
         adjudicate_graded=getattr(config.selfplay, 'adjudicate_graded', True),
         adjudicate_scaling=getattr(config.selfplay, 'adjudicate_scaling', 9.0),
         force_mate_in_one=getattr(config.mcts, 'force_mate_in_one', True),
+        inference_pipeline=getattr(config.inference, 'client_concurrency', 1)
+            if getattr(config, 'inference', None) else 1,
         **mcts_kwargs,
     )
     return play_one_game(
@@ -638,6 +620,112 @@ def self_play_game(network, config, on_move=None):
 # Worker process
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _game_result_str(state, move_count, max_game_length):
+    """Display result string for an eval match ('*' if the game lives on)."""
+    if game_api.is_terminal(state):
+        return game_api.final_result(
+            state, move_count, max_game_length)['result_str']
+    return '*'
+
+
+def _mcts_child_stats(engine, root, mv, topn=8):
+    return {
+        'selected_move': game_api.move_str(mv),
+        'candidates': [{'move': c['move'], 'N': c['N'], 'W': c['W'],
+                        'Q': c['Q'], 'P': c['P']}
+                       for c in engine.get_root_child_stats(root)[:topn]],
+    }
+
+
+def play_two_engine_match(engine_a, engine_b, a_is_first, max_game_length,
+                          temperature=0.1, on_move=None):
+    """Play one game between two MCTS engines of the active game.
+
+    Returns ``(state, move_count, result_str)``.  Each engine keeps its own
+    search-tree root; the opponent's cached root is invalidated after every
+    move (a position always changes sides).
+    """
+    state, _ = game_api.new_state()
+    move_count = 0
+    root_a = None
+    root_b = None
+    while not game_api.is_terminal(state) and move_count < max_game_length:
+        is_a = (game_api.player_parity(state) == 0) == a_is_first
+        engine = engine_a if is_a else engine_b
+        if is_a:
+            if root_a is None:
+                root_a = engine.get_root(state)
+            r = root_a
+        else:
+            if root_b is None:
+                root_b = engine.get_root(state)
+            r = root_b
+        engine.search(r)
+        _, mv = engine.select_move_with_temperature(r, temperature)
+        if mv is None:
+            break
+        ms = _mcts_child_stats(engine, r, mv)
+        game_api.apply(state, mv)
+        move_count += 1
+        if on_move:
+            on_move(game_api.describe(state), game_api.move_str(mv), move_count, ms)
+        if is_a:
+            root_a = engine.recycle_tree(r, mv)
+            root_b = None
+        else:
+            root_b = engine.recycle_tree(r, mv)
+            root_a = None
+    return state, move_count, _game_result_str(state, move_count, max_game_length)
+
+
+def play_engine_vs_reference(engine, that_first, max_game_length,
+                             temperature=0.1, depth=2, on_move=None):
+    """Play one game between an MCTS engine and the game's reference player.
+
+    Returns ``(state, move_count, result_str)``.
+    """
+    state, _ = game_api.new_state()
+    move_count = 0
+    root_net = None
+    while not game_api.is_terminal(state) and move_count < max_game_length:
+        net_turn = (game_api.player_parity(state) == 0) == that_first
+        if net_turn:
+            if root_net is None:
+                root_net = engine.get_root(state)
+            r = root_net
+            engine.search(r)
+            _, mv = engine.select_move_with_temperature(r, temperature)
+            if mv is None:
+                break
+            ms = _mcts_child_stats(engine, r, mv)
+            game_api.apply(state, mv)
+            move_count += 1
+            if on_move:
+                on_move(game_api.describe(state), game_api.move_str(mv), move_count, ms)
+            root_net = engine.recycle_tree(r, mv)
+        else:
+            mv = game_api.reference_move(state, depth=depth)
+            if mv is None:
+                break
+            game_api.apply(state, mv)
+            move_count += 1
+            if on_move:
+                on_move(game_api.describe(state), game_api.move_str(mv), move_count, None)
+            root_net = None
+    return state, move_count, _game_result_str(state, move_count, max_game_length)
+
+def _set_game_from_config_dict(config_dict):
+    """Make worker processes adopt the config's active game name."""
+    name = game_api.active_game_name()
+    if isinstance(config_dict, dict):
+        section = config_dict.get('game')
+        if isinstance(section, dict):
+            name = section.get('name', name)
+        elif isinstance(section, str):
+            name = section
+    game_api.set_game(name)
+
+
 def _worker_process(worker_id, task_queue, result_queue, config_dict, shutdown_event,
                     request_queue=None, response_queue=None, shared_buffers=None,
                     concurrency=1, selfplay_instances=None, eval_instance=None,
@@ -649,6 +737,7 @@ def _worker_process(worker_id, task_queue, result_queue, config_dict, shutdown_e
     concurrent games via ``_worker_loop_multi``, each with its own private
     GPU inference endpoint.
     """
+    _set_game_from_config_dict(config_dict)
     if max(1, int(games_per_worker or 1)) <= 1:
         _worker_loop_single(
             worker_id, task_queue, result_queue, config_dict, shutdown_event,
@@ -676,6 +765,7 @@ def _worker_loop_single(worker_id, task_queue, result_queue, config_dict, shutdo
     # Single-thread is faster for small batches and avoids oversubscription.
     torch.set_num_threads(1)
 
+    _set_game_from_config_dict(config_dict)
     config = Config(config_dict)
     pv = config.selfplay.piece_values
     piece_values = dict(pv) if hasattr(pv, 'items') else pv
@@ -712,7 +802,8 @@ def _worker_loop_single(worker_id, task_queue, result_queue, config_dict, shutdo
     # The forced-mate override is wired ONLY into the selfplay branch below
     # (force_mate=True).  Eval branches (gating / reference) keep it disabled
     # so they measure true strength.
-    force_mate_enabled = getattr(config.selfplay, 'force_mate', False)
+    force_mate_enabled = (getattr(config.selfplay, 'force_mate', False)
+                          and game_api.is_game('chess'))
 
     force_mate_in_one = getattr(config.mcts, 'force_mate_in_one', True)
 
@@ -741,6 +832,8 @@ def _worker_loop_single(worker_id, task_queue, result_queue, config_dict, shutdo
             adjudicate_graded=getattr(config.selfplay, 'adjudicate_graded', True),
             adjudicate_scaling=getattr(config.selfplay, 'adjudicate_scaling', 9.0),
             force_mate_in_one=force_mate_in_one,
+            inference_pipeline=getattr(config.inference, 'client_concurrency', 1)
+                if getattr(config, 'inference', None) else 1,
             **mcts_kwargs,
         )
 
@@ -751,172 +844,138 @@ def _worker_loop_single(worker_id, task_queue, result_queue, config_dict, shutdo
 
         t = task.get('type', 'selfplay')
 
-        if t == 'selfplay':
-            if inference_client is not None:
-                eng = mcts(inference_client, noise=True, force_mate=force_mate_enabled)
-            else:
-                load(net_a, task['weights'])
-                eng = mcts(net_a, noise=True, force_mate=force_mate_enabled)
+        try:
+            if t == 'selfplay':
+                if inference_client is not None:
+                    eng = mcts(inference_client, noise=True, force_mate=force_mate_enabled)
+                else:
+                    load(net_a, task['weights'])
+                    eng = mcts(net_a, noise=True, force_mate=force_mate_enabled)
 
-            result_queue.put({
-                'worker_id': worker_id, 'type': 'live_start',
-                'game_type': 'selfplay', 'match_info': None,
-            })
-            fens = []; ucis = []; mdata = []
-            def on_sp(fen, uci, mn, ms=None):
-                fens.append(fen); ucis.append(uci); mdata.append(ms)
                 result_queue.put({
-                    'worker_id': worker_id, 'type': 'live_move',
-                    'fen': fen, 'move': uci, 'move_number': mn, 'mcts_stats': ms,
+                    'worker_id': worker_id, 'type': 'live_start',
+                    'game_type': 'selfplay', 'match_info': None,
                 })
-            gd, gi = play_one_game(
-                eng, config.selfplay.max_game_length,
-                config.selfplay.adjudicate_material, piece_values,
-                config.selfplay.temperature_threshold,
-                config.selfplay.temperature_high, config.selfplay.temperature_low,
-                on_move=on_sp,
-                adjudicate_graded=getattr(config.selfplay, 'adjudicate_graded', True),
-                adjudicate_scaling=getattr(config.selfplay, 'adjudicate_scaling', 9.0),
-                endgame_temperature=getattr(config.selfplay, 'endgame_temperature', None),
-                endgame_piece_gate=getattr(config.selfplay, 'endgame_piece_gate', 6),
-                endgame_num_simulations=getattr(config.selfplay, 'endgame_num_simulations', 0),
-                fen=getattr(config.selfplay, 'start_fen', None),
-                start_pieces=getattr(config.selfplay, 'start_pieces', None),
-                start_colors_random=getattr(config.selfplay, 'start_colors_random', False),
-            )
-            result_queue.put({
-                'worker_id': worker_id, 'type': 'live_end',
-                'result': gi['result_str'], 'termination': gi['termination'],
-            })
-            result_queue.put({
-                'worker_id': worker_id, 'type': 'selfplay',
-                'game_data': [(s.tolist(), p.tolist(), float(v), m.tolist()) for s, p, v, m in gd],
-                'game_info': gi, 'fens': fens, 'moves': ucis, 'mcts_stats': mdata,
-            })
-
-        elif t == 'eval':
-            a_is_white = task['a_is_white']
-            eval_type = task['eval_type']
-            game_label = task.get('game_label', '')
-            fens = []; ucis = []; mdata = []
-
-            gt_label = 'gating' if eval_type == 'gating' else 'reference'
-            result_queue.put({
-                'worker_id': worker_id, 'type': 'live_start',
-                'game_type': gt_label, 'match_info': game_label,
-            })
-
-            def on_ev_live(fen, uci, mn, ms=None):
-                fens.append(fen); ucis.append(uci); mdata.append(ms)
+                fens = []; ucis = []; mdata = []
+                def on_sp(fen, uci, mn, ms=None):
+                    fens.append(fen); ucis.append(uci); mdata.append(ms)
+                    result_queue.put({
+                        'worker_id': worker_id, 'type': 'live_move',
+                        'fen': fen, 'move': uci, 'move_number': mn, 'mcts_stats': ms,
+                    })
+                gd, gi = play_one_game(
+                    eng, config.selfplay.max_game_length,
+                    config.selfplay.adjudicate_material, piece_values,
+                    config.selfplay.temperature_threshold,
+                    config.selfplay.temperature_high, config.selfplay.temperature_low,
+                    on_move=on_sp,
+                    adjudicate_graded=getattr(config.selfplay, 'adjudicate_graded', True),
+                    adjudicate_scaling=getattr(config.selfplay, 'adjudicate_scaling', 9.0),
+                    endgame_temperature=getattr(config.selfplay, 'endgame_temperature', None),
+                    endgame_piece_gate=getattr(config.selfplay, 'endgame_piece_gate', 6),
+                    endgame_num_simulations=getattr(config.selfplay, 'endgame_num_simulations', 0),
+                    fen=getattr(config.selfplay, 'start_fen', None),
+                    start_pieces=getattr(config.selfplay, 'start_pieces', None),
+                    start_colors_random=getattr(config.selfplay, 'start_colors_random', False),
+                )
                 result_queue.put({
-                    'worker_id': worker_id, 'type': 'live_move',
-                    'fen': fen, 'move': uci, 'move_number': mn, 'mcts_stats': ms,
+                    'worker_id': worker_id, 'type': 'live_end',
+                    'result': gi['result_str'], 'termination': gi['termination'],
+                })
+                result_queue.put({
+                    'worker_id': worker_id, 'type': 'selfplay',
+                    'game_data': [(s.tolist(), p.tolist(), float(v), m.tolist()) for s, p, v, m in gd],
+                    'game_info': gi, 'fens': fens, 'moves': ucis, 'mcts_stats': mdata,
                 })
 
-            if eval_type == 'gating':
-                # ── GPU path: route both nets through the dual-network server ──
+            elif t == 'eval':
+                a_is_white = task['a_is_white']
+                eval_type = task['eval_type']
+                game_label = task.get('game_label', '')
+                fens = []; ucis = []; mdata = []
+
+                gt_label = 'gating' if eval_type == 'gating' else 'reference'
+                result_queue.put({
+                    'worker_id': worker_id, 'type': 'live_start',
+                    'game_type': gt_label, 'match_info': game_label,
+                })
+
+                def on_ev_live(fen, uci, mn, ms=None):
+                    fens.append(fen); ucis.append(uci); mdata.append(ms)
+                    result_queue.put({
+                        'worker_id': worker_id, 'type': 'live_move',
+                        'fen': fen, 'move': uci, 'move_number': mn, 'mcts_stats': ms,
+                    })
+
+                if eval_type == 'gating':
+                    # ── GPU path: route both nets through the dual-network server ──
+                    if inference_client is not None:
+                        client_a = InferenceClient(worker_id, request_queue, response_queue, network_id=0,
+                                                   shared_buffers=shared_buffers, concurrency=concurrency)
+                        client_b = InferenceClient(worker_id, request_queue, response_queue, network_id=1,
+                                                   shared_buffers=shared_buffers, concurrency=concurrency)
+                        ea = mcts(client_a, False); eb = mcts(client_b, False)
+                    else:
+                        load(net_a, task['weights_a']); load(net_b, task['weights_b'])
+                        ea = mcts(net_a, False); eb = mcts(net_b, False)
+
+                    _state, _mc, game_result = play_two_engine_match(
+                        ea, eb, a_is_white, config.selfplay.max_game_length,
+                        on_move=on_ev_live)
+
+                else:  # reference
+                    # ── GPU path: network A via the GPU server (network_id=0) ──
+                    if inference_client is not None:
+                        client_a = InferenceClient(worker_id, request_queue, response_queue, network_id=0,
+                                                   shared_buffers=shared_buffers, concurrency=concurrency)
+                        ea = mcts(client_a, False)
+                    else:
+                        load(net_a, task['weights_a'])
+                        ea = mcts(net_a, False)
+
+                    _state, _mc, game_result = play_engine_vs_reference(
+                        ea, a_is_white, config.selfplay.max_game_length,
+                        depth=config.alpha_beta.depth, on_move=on_ev_live)
+
+                result_queue.put({
+                    'worker_id': worker_id, 'type': 'live_end',
+                    'result': game_result, 'termination': gt_label,
+                })
+                result_queue.put({
+                    'worker_id': worker_id, 'type': 'eval',
+                    'result': game_result, 'eval_type': eval_type,
+                    'a_is_white': a_is_white, 'game_label': game_label,
+                    'fens': fens, 'moves': ucis, 'mcts_stats': mdata,
+                })
+
+            elif t == 'profile':
+                num_profile_games = task.get('num_games', 3)
                 if inference_client is not None:
-                    client_a = InferenceClient(worker_id, request_queue, response_queue, network_id=0,
-                                               shared_buffers=shared_buffers, concurrency=concurrency)
-                    client_b = InferenceClient(worker_id, request_queue, response_queue, network_id=1,
-                                               shared_buffers=shared_buffers, concurrency=concurrency)
-                    ea = mcts(client_a, False); eb = mcts(client_b, False)
+                    eng = mcts(inference_client, noise=True)
                 else:
-                    load(net_a, task['weights_a']); load(net_b, task['weights_b'])
-                    ea = mcts(net_a, False); eb = mcts(net_b, False)
-
-                board = chess.Board(); mc = 0
-                root_a = None; root_b = None
-                while not board.is_game_over() and mc < config.selfplay.max_game_length:
-                    is_a = (board.turn == chess.WHITE) == a_is_white
-                    e = ea if is_a else eb
-                    if is_a:
-                        if root_a is None: root_a = e.get_root(board)
-                        r = root_a
-                    else:
-                        if root_b is None: root_b = e.get_root(board)
-                        r = root_b
-                    e.search(r)
-                    _, mv = e.select_move_with_temperature(r, 0.1)
-                    if mv is None: break
-                    ms = {
-                        'selected_move': mv.uci(),
-                        'candidates': [{'move': c['move'], 'N': c['N'], 'W': c['W'], 'Q': c['Q'], 'P': c['P']}
-                                       for c in e.get_root_child_stats(r)[:8]]
-                    }
-                    board.push(mv); mc += 1
-                    on_ev_live(board.fen(), mv.uci(), mc, ms)
-                    if is_a:
-                        root_a = e.recycle_tree(r, mv)
-                        root_b = None
-                    else:
-                        root_b = e.recycle_tree(r, mv)
-                        root_a = None
-                game_result = board.result() if board.is_game_over() else '*'
-
-            else:  # reference
-                sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-                from evaluation import alpha_beta_best_move
-
-                # ── GPU path: network A via the GPU server (network_id=0) ──
-                if inference_client is not None:
-                    client_a = InferenceClient(worker_id, request_queue, response_queue, network_id=0,
-                                               shared_buffers=shared_buffers, concurrency=concurrency)
-                    ea = mcts(client_a, False)
-                else:
-                    load(net_a, task['weights_a'])
-                    ea = mcts(net_a, False)
-
-                board = chess.Board(); mc = 0
-                root_net = None
-                while not board.is_game_over() and mc < config.selfplay.max_game_length:
-                    net_turn = (board.turn == chess.WHITE) == a_is_white
-                    if net_turn:
-                        if root_net is None: root_net = ea.get_root(board)
-                        r = root_net
-                        ea.search(r)
-                        _, mv = ea.select_move_with_temperature(r, 0.1)
-                        if mv is None: break
-                        ms = {
-                            'selected_move': mv.uci(),
-                            'candidates': [{'move': c['move'], 'N': c['N'], 'W': c['W'], 'Q': c['Q'], 'P': c['P']}
-                                           for c in ea.get_root_child_stats(r)[:8]]
-                        }
-                        board.push(mv); mc += 1
-                        on_ev_live(board.fen(), mv.uci(), mc, ms)
-                        root_net = ea.recycle_tree(r, mv)
-                    else:
-                        mv = alpha_beta_best_move(board, config.alpha_beta.depth)
-                        if mv is None: break
-                        board.push(mv); mc += 1
-                        on_ev_live(board.fen(), mv.uci(), mc, None)
-                        root_net = None
-                game_result = board.result() if board.is_game_over() else '*'
-
-            result_queue.put({
-                'worker_id': worker_id, 'type': 'live_end',
-                'result': game_result, 'termination': gt_label,
-            })
-            result_queue.put({
-                'worker_id': worker_id, 'type': 'eval',
-                'result': game_result, 'eval_type': eval_type,
-                'a_is_white': a_is_white, 'game_label': game_label,
-                'fens': fens, 'moves': ucis, 'mcts_stats': mdata,
-            })
-
-        elif t == 'profile':
-            num_profile_games = task.get('num_games', 3)
-            if inference_client is not None:
-                eng = mcts(inference_client, noise=True)
-            else:
-                load(net_a, task['weights'])
-                eng = mcts(net_a, noise=True)
-            from worker_cpu_profiler import profile_in_worker
-            summary = profile_in_worker(eng, config, piece_values, num_profile_games)
-            result_queue.put({
-                'worker_id': worker_id, 'type': 'profile_done',
-                'summary': summary,
-            })
+                    load(net_a, task['weights'])
+                    eng = mcts(net_a, noise=True)
+                from worker_cpu_profiler import profile_in_worker
+                summary = profile_in_worker(eng, config, piece_values, num_profile_games)
+                result_queue.put({
+                    'worker_id': worker_id, 'type': 'profile_done',
+                    'summary': summary,
+                })
+        except Exception:
+            # A crashed task used to kill the whole worker process silently,
+            # leaving the manager waiting forever for a result that never came.
+            # Report it and keep the loop alive so one bad game can't stall
+            # the whole training run.
+            import traceback
+            tb = traceback.format_exc()
+            print(f"[Worker {worker_id}] task '{t}' crashed:\n{tb}", flush=True)
+            try:
+                result_queue.put({
+                    'worker_id': worker_id, 'type': 'task_error',
+                    'task_type': t, 'error': tb,
+                })
+            except Exception:
+                pass
 
     result_queue.put({'worker_id': worker_id, 'done': True})
 
@@ -944,6 +1003,7 @@ def _worker_loop_multi(worker_id, task_queue, result_queue, config_dict, shutdow
 
     torch.set_num_threads(1)
 
+    _set_game_from_config_dict(config_dict)
     config = Config(config_dict)
     pv = config.selfplay.piece_values
     piece_values = dict(pv) if hasattr(pv, 'items') else pv
@@ -968,7 +1028,8 @@ def _worker_loop_multi(worker_id, task_queue, result_queue, config_dict, shutdow
         net.load_state_dict(torch.load(buf, map_location='cpu', weights_only=True))
         net.eval()
 
-    force_mate_enabled = getattr(config.selfplay, 'force_mate', False)
+    force_mate_enabled = (getattr(config.selfplay, 'force_mate', False)
+                          and game_api.is_game('chess'))
     force_mate_in_one = getattr(config.mcts, 'force_mate_in_one', True)
 
     def mcts(net, noise, force_mate=False):
@@ -995,6 +1056,8 @@ def _worker_loop_multi(worker_id, task_queue, result_queue, config_dict, shutdow
             adjudicate_graded=getattr(config.selfplay, 'adjudicate_graded', True),
             adjudicate_scaling=getattr(config.selfplay, 'adjudicate_scaling', 9.0),
             force_mate_in_one=force_mate_in_one,
+            inference_pipeline=getattr(config.inference, 'client_concurrency', 1)
+                if getattr(config, 'inference', None) else 1,
             **mcts_kwargs,
         )
 
@@ -1074,7 +1137,23 @@ def _worker_loop_multi(worker_id, task_queue, result_queue, config_dict, shutdow
                 continue
             if task is None:
                 break
-            run_selfplay_game(g, task, client)
+            try:
+                run_selfplay_game(g, task, client)
+            except Exception:
+                # A dead subgame thread used to vanish SILENTLY: the worker
+                # kept idling, the main process waited for results forever,
+                # and nothing anywhere said why.  Report and keep the loop
+                # alive so one bad game can't quietly kill throughput.
+                import traceback
+                tb = traceback.format_exc()
+                print(f"[Worker {worker_id}] subgame {g} crashed:\n{tb}", flush=True)
+                try:
+                    result_queue.put({
+                        'worker_id': worker_id, 'type': 'subgame_error',
+                        'sub': g, 'error': tb,
+                    })
+                except Exception:
+                    pass
 
     def run_eval(task):
         a_is_white = task['a_is_white']
@@ -1102,70 +1181,20 @@ def _worker_loop_multi(worker_id, task_queue, result_queue, config_dict, shutdow
                 load(net_a, task['weights_a']); load(net_b, task['weights_b'])
                 ea = mcts(net_a, False); eb = mcts(net_b, False)
 
-            board = chess.Board(); mc = 0
-            root_a = None; root_b = None
-            while not board.is_game_over() and mc < config.selfplay.max_game_length:
-                is_a = (board.turn == chess.WHITE) == a_is_white
-                e = ea if is_a else eb
-                if is_a:
-                    if root_a is None: root_a = e.get_root(board)
-                    r = root_a
-                else:
-                    if root_b is None: root_b = e.get_root(board)
-                    r = root_b
-                e.search(r)
-                _, mv = e.select_move_with_temperature(r, 0.1)
-                if mv is None: break
-                ms = {
-                    'selected_move': mv.uci(),
-                    'candidates': [{'move': c['move'], 'N': c['N'], 'W': c['W'], 'Q': c['Q'], 'P': c['P']}
-                                   for c in e.get_root_child_stats(r)[:8]]
-                }
-                board.push(mv); mc += 1
-                on_ev_live(board.fen(), mv.uci(), mc, ms)
-                if is_a:
-                    root_a = e.recycle_tree(r, mv)
-                    root_b = None
-                else:
-                    root_b = e.recycle_tree(r, mv)
-                    root_a = None
-            game_result = board.result() if board.is_game_over() else '*'
+            _state, _mc, game_result = play_two_engine_match(
+                ea, eb, a_is_white, config.selfplay.max_game_length,
+                on_move=on_ev_live)
 
         else:  # reference
-            sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-            from evaluation import alpha_beta_best_move
-
             if eval_client_a is not None:
                 ea = mcts(eval_client_a, False)
             else:
                 load(net_a, task['weights_a'])
                 ea = mcts(net_a, False)
 
-            board = chess.Board(); mc = 0
-            root_net = None
-            while not board.is_game_over() and mc < config.selfplay.max_game_length:
-                net_turn = (board.turn == chess.WHITE) == a_is_white
-                if net_turn:
-                    if root_net is None: root_net = ea.get_root(board)
-                    r = root_net
-                    ea.search(r)
-                    _, mv = ea.select_move_with_temperature(r, 0.1)
-                    if mv is None: break
-                    ms = {
-                        'selected_move': mv.uci(),
-                        'candidates': [{'move': c['move'], 'N': c['N'], 'W': c['W'], 'Q': c['Q'], 'P': c['P']}
-                                       for c in ea.get_root_child_stats(r)[:8]]
-                    }
-                    board.push(mv); mc += 1
-                    on_ev_live(board.fen(), mv.uci(), mc, ms)
-                    root_net = ea.recycle_tree(r, mv)
-                else:
-                    mv = alpha_beta_best_move(board, config.alpha_beta.depth)
-                    if mv is None: break
-                    board.push(mv); mc += 1
-                    on_ev_live(board.fen(), mv.uci(), mc, None)
-                    root_net = None
-            game_result = board.result() if board.is_game_over() else '*'
+            _state, _mc, game_result = play_engine_vs_reference(
+                ea, a_is_white, config.selfplay.max_game_length,
+                depth=config.alpha_beta.depth, on_move=on_ev_live)
 
         result_queue.put({
             'worker_id': worker_id, 'type': 'live_end',
@@ -1209,11 +1238,38 @@ def _worker_loop_multi(worker_id, task_queue, result_queue, config_dict, shutdow
             break
         t = task.get('type', 'selfplay')
         if t == 'selfplay':
-            jobs.put(task)
+            try:
+                jobs.put(task)
+            except Exception:
+                import traceback
+                print(f"[Worker {worker_id}] failed to queue selfplay task:\n"
+                      f"{traceback.format_exc()}", flush=True)
         elif t == 'eval':
-            run_eval(task)
+            try:
+                run_eval(task)
+            except Exception:
+                import traceback
+                tb = traceback.format_exc()
+                print(f"[Worker {worker_id}] eval task crashed:\n{tb}", flush=True)
+                try:
+                    result_queue.put({'worker_id': worker_id,
+                                      'type': 'task_error', 'task_type': t,
+                                      'error': tb})
+                except Exception:
+                    pass
         elif t == 'profile':
-            run_profile(task)
+            try:
+                run_profile(task)
+            except Exception:
+                import traceback
+                tb = traceback.format_exc()
+                print(f"[Worker {worker_id}] profile task crashed:\n{tb}", flush=True)
+                try:
+                    result_queue.put({'worker_id': worker_id,
+                                      'type': 'task_error', 'task_type': t,
+                                      'error': tb})
+                except Exception:
+                    pass
 
     for _ in range(G):
         try: jobs.put_nowait(None)
@@ -1274,6 +1330,8 @@ class ParallelSelfPlay:
                 state_dtype_str = getattr(inf_cfg, 'state_dtype', 'float16') if inf_cfg else 'float16'
                 import numpy as _np
                 state_dtype = _np.float16 if state_dtype_str == 'float16' else _np.float32
+                policy_dtype_str = getattr(inf_cfg, 'policy_dtype', 'float32') if inf_cfg else 'float32'
+                policy_dtype = _np.float16 if policy_dtype_str == 'float16' else _np.float32
                 if self._games_per_worker > 1:
                     # One private endpoint per concurrent game (+1 dedicated eval
                     # endpoint per worker).  Each endpoint only ever carries a single
@@ -1287,17 +1345,20 @@ class ParallelSelfPlay:
                         max_batch=per_ep_batch,
                         state_dtype=state_dtype,
                         num_slots=max(1, client_concurrency),
+                        policy_dtype=policy_dtype,
                     )
                     self._shared_transport.create_buffers()
                     print(f"[INFO] Shared-memory IPC enabled (multi-game): "
                           f"endpoints={num_ep}, max_batch/endpoint={per_ep_batch}, "
-                          f"dtype={state_dtype_str}, slots={client_concurrency}")
+                          f"dtype={state_dtype_str}, policy_dtype={policy_dtype_str}, "
+                          f"slots={client_concurrency}")
                 else:
                     self._shared_transport = SharedMemoryTransport(
                         num_workers=num_workers,
                         max_batch=max_batch,
                         state_dtype=state_dtype,
                         num_slots=max(1, client_concurrency),
+                        policy_dtype=policy_dtype,
                     )
                     self._shared_transport.create_buffers()
                     print(f"[INFO] Shared-memory IPC enabled "
@@ -1472,7 +1533,7 @@ class ParallelSelfPlay:
         for p in self._workers:
             p.join(timeout=10)
             if p.is_alive(): p.kill()
-        self._workers.clear(); self._task_qs.clear()
+        self._workers.clear()
 
         if self._use_gpu and self._gpu_server_process is not None:
             self._gpu_shutdown.set()
@@ -1488,6 +1549,30 @@ class ParallelSelfPlay:
                 except queue.Empty:
                     self._gpu_stats = None
             self._gpu_server_process = None
+
+        # Release IPC resources.  multiprocessing.Queue leaks a feeder thread
+        # and a pipe per queue (and mp.Array leaks a /dev/shm segment) until
+        # close() is called; without this a long-training run that restarts
+        # self-play leaks fds/shared memory until the process exits.
+        all_queues = []
+        if self._use_gpu:
+            all_queues.extend(self._response_qs.values())
+            all_queues.extend([self._request_q, self._weight_q])
+        all_queues.extend(self._task_qs)
+        all_queues.append(self._result_q)
+        for q in all_queues:
+            try: q.cancel_join_thread()
+            except Exception: pass
+            try: q.close()
+            except Exception: pass
+        self._task_qs.clear()
+
+        if self._shared_transport is not None:
+            try: self._shared_transport.close()
+            except Exception: pass
+            self._shared_transport = None
+        if self._use_gpu:
+            self._response_qs.clear()
 
     def get_gpu_stats(self):
         """Return the GPU server timing dict, or None if unavailable."""

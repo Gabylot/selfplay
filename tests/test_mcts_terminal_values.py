@@ -362,6 +362,35 @@ def test_get_terminal_value_directly():
     print("  PASS: _get_terminal_value(0-1) = -1.0 (White to move)")
 
 
+def test_adjudication_sign_side_to_move():
+    """Adjudication at max_game_length must follow the side-to-move
+    convention, not the raw white-perspective material score.
+
+    Regression: a Black-to-move node with White up material previously got a
+    sign-flipped (positive) terminal value.
+    """
+    # White up a queen, Black to move, not terminal.  max_game_length=0 forces
+    # the adjudication branch immediately.
+    board = chess.Board("4k3/8/8/8/8/8/8/3QK3 b - - 0 1")
+    assert not board.is_game_over(claim_draw=True)
+    mcts = MCTS(MockNetwork(), num_simulations=10,
+                dirichlet_alpha=0.0, dirichlet_epsilon=0.0,
+                max_game_length=0, adjudicate_material=True,
+                adjudicate_graded=True, adjudicate_scaling=9.0)
+
+    val_black = mcts._get_terminal_value(MCTSNode(board))
+    assert val_black < -0.1, (
+        f"Black-to-move node with White up material should be negative, got {val_black}"
+    )
+
+    board_w = chess.Board("4k3/8/8/8/8/8/8/3QK3 w - - 0 1")
+    val_white = mcts._get_terminal_value(MCTSNode(board_w))
+    assert val_white > 0.1, (
+        f"White-to-move node with White up material should be positive, got {val_white}"
+    )
+    print("  PASS: adjudication sign follows side-to-move")
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Main
 # ─────────────────────────────────────────────────────────────────────────────
@@ -387,6 +416,7 @@ if __name__ == "__main__":
         ("test_checkmate_value_sign", test_checkmate_value_sign),
         ("test_backprop_sign_flip", test_backprop_sign_flip),
         ("test_get_terminal_value_directly", test_get_terminal_value_directly),
+        ("test_adjudication_sign_side_to_move", test_adjudication_sign_side_to_move),
     ]
 
     passed = 0

@@ -1,5 +1,7 @@
 """Flask + SocketIO GUI server — updated for parallel workers and new push events."""
 
+import os
+import secrets
 from pathlib import Path
 from flask import Flask, render_template, jsonify, send_from_directory
 from flask_socketio import SocketIO
@@ -7,8 +9,20 @@ from stats import StatsLogger
 from gui.live_game import LiveGameState, set_expanded_worker
 
 app = Flask(__name__, template_folder=str(Path(__file__).parent/"templates"))
-app.config['SECRET_KEY'] = 'alphazero-chess'
-socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading')
+# A random per-process secret is fine for signing the session/socket cookie;
+# set ALPHAZERO_SECRET_KEY to keep sessions valid across restarts (e.g. when
+# running multiple GUI front-ends behind a proxy).
+app.config['SECRET_KEY'] = os.environ.get('ALPHAZERO_SECRET_KEY') or secrets.token_hex(32)
+
+# Default to same-origin only (the page is served by this same server, so
+# normal browser use is unaffected).  A `*` here let any website open a
+# SocketIO connection and read live game data / issue requests.  Override with
+# a comma-separated allow-list for cross-origin front-ends:
+#   set ALPHAZERO_CORS_ORIGINS=https://gui.example.com
+_cors_env = os.environ.get('ALPHAZERO_CORS_ORIGINS')
+_cors_origins = ([o.strip() for o in _cors_env.split(',') if o.strip()]
+                 if _cors_env else None)
+socketio = SocketIO(app, cors_allowed_origins=_cors_origins, async_mode='threading')
 
 _stats = None
 _config = None

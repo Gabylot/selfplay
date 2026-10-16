@@ -435,7 +435,7 @@ def profile_batch_sweep(network: AlphaZeroNet, num_simulations: int = 200,
 
 def profile_sims_sweep(network: AlphaZeroNet,
                        sim_values: List[int] = None,
-                       batch_size: int = 8) -> List[ProfileResult]:
+                       batch_size: int = 16) -> List[ProfileResult]:
     """Profile across different num_simulations values."""
     if sim_values is None:
         sim_values = [200, 400, 600, 800]
@@ -644,6 +644,7 @@ def profile_mcts_detail(config: Config, num_runs: int = 3, midgame: bool = False
     weight_q = None
     gpu_ready = None
     gpu_shutdown = None
+    gpu_stats_queue = None
 
     if use_gpu:
         from gpu_server import GPUInferenceServer
@@ -654,6 +655,7 @@ def profile_mcts_detail(config: Config, num_runs: int = 3, midgame: bool = False
         response_qs = {i: mp.Queue(maxsize=256) for i in range(num_workers)}
         gpu_ready = mp.Event()
         gpu_shutdown = mp.Event()
+        gpu_stats_queue = mp.Queue()
 
         # Create a temporary network just to serialize weights
         net = create_model_from_config(config)
@@ -671,6 +673,7 @@ def profile_mcts_detail(config: Config, num_runs: int = 3, midgame: bool = False
             weight_queue=weight_q,
             ready_event=gpu_ready,
             shutdown_event=gpu_shutdown,
+            stats_queue=gpu_stats_queue,
         )
         gpu_server_process = mp.Process(target=server.run, daemon=True)
         gpu_server_process.start()
@@ -848,6 +851,72 @@ def profile_mcts_detail(config: Config, num_runs: int = 3, midgame: bool = False
             gpu_server_process.join(timeout=5)
             if gpu_server_process.is_alive():
                 gpu_server_process.kill()
+
+            # Collect and print server-side timing breakdown
+            if gpu_stats_queue is not None:
+                s = None
+                try:
+                    s = gpu_stats_queue.get(timeout=5)
+                except Exception:
+                    pass
+                if s is not None:
+                    _print_server_stats(s)
+                else:
+                    print("\n  [GPU-Server] No stats received (server may not have drained)")
+
+
+def _print_server_stats(s: dict):
+    """Print the GPU server's internal timing breakdown."""
+    print(f"\n  {'='*70}")
+    print(f"  GPU-Server Internal Timing (shutdown report)")
+    print(f"  {'='*70}")
+
+    t = s.get('server_total', 0)
+    if t <= 0:
+        t = max(s.get('wait_time', 0) + s.get('gpu_forward_time', 0) + 1, 1)
+
+    rows = [
+        ('prewarm_time',      s.get('prewarm_time', 0)),
+        ('wait_time',         s.get('wait_time', 0)),
+        ('gpu_forward_time',  s.get('gpu_forward_time', 0)),
+        ('shm_read_time',     s.get('shm_read_time', 0)),
+        ('shm_write_time',    s.get('shm_write_time', 0)),
+        ('weight_drain_time', s.get('weight_drain_time', 0)),
+        ('weight_load_time',  s.get('weight_load_time', 0)),
+        ('aggregation_wait_time', s.get('aggregation_wait_time', 0)),
+    ]
+    # Show server_total wall time if reported
+    server_total = s.get('server_total', 0.0)
+    account_dur = max(server_total, t)
+
+    print(f"  {'Phase':<26}{'Seconds':>12}{'% Wall':>10}")
+    print(f"  {'-'*50}")
+    for name, val in rows:
+        pct = 100.0 * val / account_dur if account_dur > 0 else 0
+        print(f"  {name:<26}{val:>12.4f}{pct:>9.1f}%")
+
+    print(f"  {'-'*50}")
+    print(f"  {'server_wall':<26}{server_total:>12.4f}")
+    print(f"  {'total_requests':<26}{s.get('total_requests',0):>12}")
+    print(f"  {'aggregated_batches':<26}{s.get('aggregated_batches',0):>12}")
+    print(f"  {'aggregation_cycles':<26}{s.get('aggregation_cycles',0):>12}")
+    print(f"  {'samples_processed':<26}{s.get('samples_processed',0):>12}")
+
+    agg_cyc = s.get('aggregation_cycles', 0) or 1
+    batches = s.get('aggregated_batches', 0)
+    reqs = s.get('total_requests', 0) or 1
+    agg_wait = s.get('aggregation_wait_time', 0)
+    print(f"\n  Mean aggregation_wait per cycle: {agg_wait/agg_cyc*1000:.3f} ms")
+    print(f"  Samples per aggregated batch:    {s.get('samples_processed',0)/batches:.1f}" if batches else "")
+    print(f"  Requests per aggregation cycle:  {reqs/agg_cyc:.1f}")
+
+    # Estimate raw GPU compute cost per sample
+    fwd = s.get('gpu_forward_time', 0)
+    sp = s.get('samples_processed', 0)
+    if fwd > 0 and sp > 0:
+        print(f"\n  Estimated GPU forward throughput: {sp/fwd:.0f} samples/s")
+    if t > 0:
+        print(f"  Effective server throughput:        {sp/t:.0f} samples/s" if sp>0 else f"")
 
 
 def profile_mcts_game(config: Config, num_games: int = 1, midgame: bool = False):

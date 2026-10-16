@@ -22,6 +22,9 @@ def load_config(path: Optional[str] = None) -> dict:
     
     # Ensure all sections exist with defaults
     defaults = {
+        "game": {
+            "name": "chess",  # active game: "chess" or "connect4"
+        },
         "network": {
             "num_residual_blocks": 8,
             "num_filters": 64,
@@ -170,7 +173,12 @@ class Config:
                 setattr(self, key, value)
     
     def to_dict(self) -> dict:
-        return self._data.copy()
+        # Deep copy: the Config may be cached and shared across callers, so
+        # hand out a private copy of nested dicts.
+        def _deep(d):
+            return {k: _deep(v) if isinstance(v, dict) else v
+                    for k, v in d.items()}
+        return _deep(self._data)
     
     def get(self, key, default=None):
         """Dict-like get method."""
@@ -193,16 +201,45 @@ class Config:
         return f"Config({self._data})"
 
 
+# Cache of Config objects keyed by resolved config path.  get_config() is on
+# the hot path of every game_api dispatch (via active_game_name), and
+# load_config() re-reads + YAML-parses the whole file (~15 ms).  Callers that
+# pass overrides always get a fresh load (one-shot CLI entries); the bare
+# no-override path is cached per path.  Use reload_config() to force a refresh.
+_config_cache: Dict[str, Config] = {}
+
+# Precompute once: Path.resolve() hits the filesystem (~100+ us), which would
+# otherwise be paid on every cache hit.
+_DEFAULT_CONFIG_KEY = str(_find_config_path().resolve())
+
+
+def _config_cache_key(path: Optional[str]) -> str:
+    if path is None:
+        return _DEFAULT_CONFIG_KEY
+    return str(Path(path).resolve())
+
+
 def get_config(path: Optional[str] = None, overrides: Optional[Dict] = None) -> Config:
     """Load config and return as Config object.
-    
+
+    Results are cached per resolved path when no ``overrides`` are given
+    (repeated YAML parsing was measured at ~15 ms per call on the MCTS hot
+    path via game_api.active_game_name).
+
     Args:
         path: Path to YAML config file. None = default.
         overrides: Dict of overrides to apply (e.g. from CLI args).
-    
+
     Returns:
         Config object with attribute access.
     """
+    cacheable = not overrides
+    key = _config_cache_key(path)
+    if cacheable:
+        cached = _config_cache.get(key)
+        if cached is not None:
+            return cached
+
     data = load_config(path)
     if overrides:
         def deep_update(d, u):
@@ -212,4 +249,13 @@ def get_config(path: Optional[str] = None, overrides: Optional[Dict] = None) -> 
                 else:
                     d[k] = v
         deep_update(data, overrides)
-    return Config(data)
+    cfg = Config(data)
+    if cacheable:
+        _config_cache[key] = cfg
+    return cfg
+
+
+def reload_config(path: Optional[str] = None) -> Config:
+    """Force-reload the (no-override) config from disk and re-cache it."""
+    _config_cache.pop(_config_cache_key(path), None)
+    return get_config(path)

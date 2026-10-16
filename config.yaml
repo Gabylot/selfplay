@@ -1,5 +1,12 @@
 # AlphaZero Chess Engine Configuration
 
+# --- Game ---
+# Which game the pipeline plays.  "chess" (default) or "connect4".
+# The active game drives the network input/output dims, the state
+# encoding, the MCTS move API and the self-play outcome logic.
+game:
+  name: chess
+
 # --- Network Architecture ---
 network:
   num_residual_blocks: 8
@@ -10,18 +17,34 @@ network:
 
 # --- MCTS ---
 mcts:
-  num_simulations: 800       # Per move (tunable: 50-800)
+  num_simulations: 400       # Per move (tunable: 50-800)
   c_puct: 1.5                # PUCT exploration constant
   dirichlet_alpha: 0.25        # Dirichlet noise alpha
   dirichlet_epsilon: 0.3     # Weight of noise vs root prior
-  batch_size: 128               # Batch size for tree-parallel MCTS (1 = sequential, no virtual loss)
+  batch_size: 16               # Batch size for tree-parallel MCTS (1 = sequential, no virtual loss)
   c_virtual_loss: 0.5         # Virtual loss penalty for batch MCTS
   force_mate_in_one: false     # Force a one-hot policy for a root checkmate move (mate-in-1)
 
 # --- Self-Play ---
 selfplay:
   network_source: latest      # "latest" (always use newest network) or "gated_best"
-  max_game_length: 300        # Max half-moves before adjudication
+  num_workers: 12              # Worker processes (8 physical cores; >cores slows CPU-bound MCTS)
+  games_per_worker: 6          # Concurrent games per worker process (1 = one game at a time).
+                               # >1 gives each game its own private GPU inference endpoint, so the
+                               # worker overlaps one game's MCTS tree-walk with another game's GPU
+                               # round-trip (fills idle CPU) with NO visit-flattening penalty. The GUI
+                               # still shows only one game per worker, switching when that one ends.
+                               # More concurrent games = deeper in-flight supply for the GPU server,
+                               # so cross-worker aggregation builds large forward batches.
+  max_game_length: 180        # Max half-moves before adjudication
+  start_fen: null             # FEN to start every self-play game from (null = standard start)
+  start_pieces: null          # Start positions for self-play. Piece set = fresh
+                              # random legal board every game (case = color);
+                              # "standard" = normal start. Mix + weight entries
+                              # e.g. "standard:80,KQk:10,KRk:10". Overrides
+                              # start_fen.
+  start_colors_random: false   # Flip colour assignment per game for asymmetric
+                              # specs (e.g. "KQQk"): either side gets the queens.
   adjudicate_material: false   # When max length hit, judge by material instead of draw
   # Material values for adjudication
   piece_values:
@@ -33,6 +56,12 @@ selfplay:
   temperature_threshold: 20   # Move number to switch from high to low temperature
   temperature_high: 1.0
   temperature_low: 0.1
+  # Endgame tuning: applied when <= endgame_piece_gate pieces stay on the
+  # board (the "simple endgames" the net struggles to convert).  Uses its own
+  # temperature and a deeper sim budget without touching the middlegame.
+  endgame_temperature: 0.1
+  endgame_piece_gate: 1
+  endgame_num_simulations: 200
   adjudicate_graded: false     # use tanh grading instead of flat ±1
   adjudicate_scaling: 7.0     # queen = ~0.76, rook = ~0.51, pawn = ~0.11
   # Exact forced-mate override for endgame conversion.
@@ -59,12 +88,12 @@ training:
   momentum: 0.9
   weight_decay: 1e-4
   num_batches_per_step: 4    # Number of gradient steps per training session
-  checkpoint_interval: 200     # Save checkpoint every N training steps
+  checkpoint_interval: 2000     # Save checkpoint every N training steps
   training_steps_per_iteration: 10  # Games completed between training sessions
 
 # --- Evaluation ---
 evaluation:
-  eval_interval: 2000         # Run eval every N self-play games
+  eval_interval: 5000         # Run eval every N self-play games
   gate_games: 50              # Games for network-vs-network gating
   gate_win_threshold: 0.55    # Win rate needed to promote
   ref_opponent_games: 50      # Games vs alpha-beta reference
@@ -72,7 +101,7 @@ evaluation:
 
 # --- Alpha-Beta Reference Opponent ---
 alpha_beta:
-  depth: 4
+  depth: 1
   # Piece values for evaluation
   piece_values:
     P: 1
@@ -92,6 +121,9 @@ stats:
 tensorboard:
   enabled: true               # Enable TensorBoard logging
   log_dir: "runs"             # Directory for event files (relative to output/run_name)
+  auto_launch: true           # Auto-start TensorBoard when training starts
+  host: "127.0.0.1"
+  port: 6006
 
 # --- GUI ---
 gui:
@@ -111,10 +143,12 @@ tournament:
 inference:
   use_gpu: true              # true = centralized GPU inference server, false = CPU per-worker
   use_shared_memory: true    # true = shared-memory IPC (zero-copy), false = queue-based pickle
-  state_dtype: "float32"     # dtype for shared-memory buffers: "float32" (fast, no conversion) or "float16" (halves size)
-  max_batch: 512             # Max samples per GPU forward pass (aggregated across workers)
-  max_wait_ms: 2.0            # Max ms to wait before firing a partial batch
-  prewarm_batch_sizes: [1, 8, 16, 32, 64, 128, 256, 512]  # Batch sizes to pre-warm
+  state_dtype: "float32"     # dtype for shared-memory buffers: "float32" (fast, no conversion) or "float16" (halves size AND PCIe upload; server casts to f32 on-device)
+  policy_dtype: "float16"    # response policy dtype: GPU casts softmax to f16 before download (halves PCIe D2H); workers gather legal priors only
+  max_batch: 2048            # Max samples per GPU forward pass (aggregated across workers)
+  max_wait_ms: 12.0            # Max ms to wait before firing a partial batch
+  prewarm_batch_sizes: [1, 8, 16, 32, 64, 128, 256, 512, 1024, 2048]  # Batch sizes to pre-warm
+  client_concurrency: 2        # Num in-flight batches per worker. >1 pipelines requests (flag pending)
 
 # --- Main ---
 main:

@@ -13,24 +13,79 @@ Logs to SQLite database with separate tracking for:
 import sqlite3
 import time
 import json
+import threading
 from typing import Optional, List, Dict, Any
 from pathlib import Path
 
 
+class _LockedCursor:
+    """Cursor stand-in holding rows fetched while the connection lock was held.
+
+    The connection is shared between the training thread and the Flask/GUI
+    request threads, so results must be materialised before the lock is
+    released -- otherwise a concurrent write could invalidate the cursor
+    mid-fetch.
+    """
+
+    def __init__(self, rows):
+        self._rows = rows
+
+    def fetchall(self):
+        return list(self._rows)
+
+    def fetchone(self):
+        return self._rows[0] if self._rows else None
+
+
+class _LockedConnection:
+    """Serialises all access to a shared sqlite3 connection with an RLock."""
+
+    def __init__(self, lock, conn):
+        self._lock = lock
+        self._conn = conn
+
+    def execute(self, sql, params=()):
+        with self._lock:
+            cur = self._conn.execute(sql, params)
+            rows = cur.fetchall()
+        return _LockedCursor(rows)
+
+    def executescript(self, script):
+        with self._lock:
+            self._conn.executescript(script)
+
+    def commit(self):
+        with self._lock:
+            self._conn.commit()
+
+    def close(self):
+        with self._lock:
+            self._conn.close()
+
+
 class StatsLogger:
-    """SQLite-based statistics logger."""
-    
+    """SQLite-based statistics logger (thread-safe).
+
+    A single connection is shared across the training thread and the
+    Flask/SocketIO GUI threads, so every access is serialised behind an
+    ``RLock`` via ``_LockedConnection`` (``check_same_thread=False`` alone is
+    not sufficient -- the sqlite3 module is not thread-safe for concurrent
+    use of one connection).
+    """
+
     def __init__(self, db_path: str = "stats.db"):
         self.db_path = db_path
-        self.conn = sqlite3.connect(db_path, check_same_thread=False)
+        self._lock = threading.RLock()
+        self.conn = _LockedConnection(
+            self._lock,
+            sqlite3.connect(db_path, check_same_thread=False),
+        )
         self.conn.execute("PRAGMA journal_mode=WAL")  # Better concurrent read/write
         self._create_tables()
-    
+
     def _create_tables(self):
         """Create all necessary tables."""
-        cursor = self.conn.cursor()
-        
-        cursor.executescript("""
+        self.conn.executescript("""
             CREATE TABLE IF NOT EXISTS training_log (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 step INTEGER NOT NULL,

@@ -38,7 +38,9 @@ def _state_bytes(path: Path) -> bytes:
     bare state dicts.  The bytes are what workers load into their own
     AlphaZeroNet instances.
     """
-    ckpt = torch.load(str(path), map_location='cpu', weights_only=False)
+    # weights_only=True: tournament model paths are user-supplied, so never
+    # unpickle arbitrary objects from them.
+    ckpt = torch.load(str(path), map_location='cpu', weights_only=True)
     sd = ckpt.get('model_state_dict', ckpt) if isinstance(ckpt, dict) else ckpt
     buf = io.BytesIO()
     torch.save(sd, buf)

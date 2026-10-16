@@ -24,6 +24,7 @@ import torch
 import numpy as np
 
 from config import get_config
+import game_api
 from network import AlphaZeroNet, create_model_from_config, save_checkpoint, load_checkpoint
 from mcts import MCTS
 from selfplay import self_play_game, ReplayBuffer, ParallelSelfPlay
@@ -48,7 +49,7 @@ def _free_tensorboard_port(host, port):
     Leftover TensorBoard processes from a previous session keep the pinned
     port to themselves, so a freshly-launched one dies with ``Address already
     in use`` and the user keeps staring at the OLD run's data.  Only processes
-    whose command line mentions ``tensorboard`` are touched — anything else on
+    whose command line mentions ``tensorboard`` are touched -- anything else on
     the port is left alone.  (Windows only; on other platforms the caller just
     fails to bind.)"""
     import subprocess
@@ -149,6 +150,15 @@ def _dispatch_live_message(psp, worker_live_games, worker_live_game_ids,
     # per worker; only the currently-featured subgame reaches the GUI tile.
     sub = result.get('sub', 0)
 
+    if rtype in ('subgame_error', 'task_error'):
+        # A worker's subgame thread / task crashed.  Loud, visible failure beats
+        # the old silent-death that stalled training with no diagnostic.
+        kind = 'SUBGAME' if rtype == 'subgame_error' else 'TASK'
+        print(f"[Worker {wid}] {kind} ERROR (sub={sub}, "
+              f"type={result.get('task_type', '')}):\n"
+              f"{result.get('error', '')}", flush=True)
+        return True
+
     if rtype == 'live_start':
         # A game started on this worker.  If nothing is currently featured,
         # feature it; otherwise ignore (we show only one game per worker).
@@ -217,7 +227,7 @@ def run_training(config, gui_enabled=False, num_workers=None):
     stats_db_path = output_dir / config.stats.db_path
     stats = StatsLogger(str(stats_db_path))
 
-    # TensorBoard logger — created after checkpoint load so we can pass
+    # TensorBoard logger -- created after checkpoint load so we can pass
     # the resumed step as purge_step.  This makes TensorBoard discard any
     # events at or beyond the resumed step from previous event files,
     # preventing overlapping step ranges that make plots appear to restart.
@@ -251,14 +261,17 @@ def run_training(config, gui_enabled=False, num_workers=None):
     stats.log_config(step, config.to_dict())
 
     # GUI
-    if gui_enabled:
+    if gui_enabled and game_api.is_game('chess'):
         from gui.app import start_gui_server
         threading.Thread(
             target=start_gui_server,
             args=(stats, config, worker_live_games, eval_live_game),
             daemon=True,
         ).start()
-        print(f"[INFO] GUI → http://{config.gui.host}:{config.gui.port}")
+        print(f"[INFO] GUI -> http://{config.gui.host}:{config.gui.port}")
+    elif gui_enabled:
+        print("[WARN] GUI is chess-only; running without a board view for "
+              f"game '{game_api.active_game_name()}'")
 
     # Load checkpoint
     latest_ckpt = checkpoints_dir / "latest.pt"
@@ -280,7 +293,7 @@ def run_training(config, gui_enabled=False, num_workers=None):
         load_checkpoint(str(best_pt_path), best_network)
     else:
         best_network.load_state_dict(network.state_dict())
-        print(f"[INFO] No best.pt found — best_network initialised from latest checkpoint")
+        print(f"[INFO] No best.pt found -- best_network initialised from latest checkpoint")
 
     # Create TensorBoard logger now that we know the resumed step.
     # purge_step tells TensorBoard to discard any events at or beyond
@@ -290,14 +303,14 @@ def run_training(config, gui_enabled=False, num_workers=None):
                            initial_game_id=game_id)
     tb_proc = None
     if tb_enabled:
-        print(f"[INFO] TensorBoard logging → {tb_log_dir}  (resuming from step {step})")
+        print(f"[INFO] TensorBoard logging -> {tb_log_dir}  (resuming from step {step})")
         print(f"[INFO] Run: tensorboard --logdir {tb_log_dir}")
         if getattr(config.tensorboard, 'auto_launch', True):
             tb_host = getattr(config.tensorboard, 'host', '127.0.0.1')
             tb_port = int(getattr(config.tensorboard, 'port', 6006))
             tb_proc = _launch_tensorboard(tb_log_dir, tb_host, tb_port)
             if tb_proc is not None:
-                print(f"[INFO] TensorBoard auto-started → http://{tb_host}:{tb_port} "
+                print(f"[INFO] TensorBoard auto-started -> http://{tb_host}:{tb_port} "
                       f"(reload every 2s)")
     tb.log_config(step, config.to_dict())
 
@@ -308,11 +321,21 @@ def run_training(config, gui_enabled=False, num_workers=None):
         buffer = loaded_buffer
         print(f"[INFO] Loaded replay buffer: {len(buffer)} positions from {buffer.total_games} games")
 
-    print(f"\n{'='*60}\n  AlphaZero — step={step} games={game_id} workers={num_workers}\n{'='*60}\n")
+    print(f"\n{'='*60}\n  AlphaZero -- step={step} games={game_id} workers={num_workers}\n{'='*60}\n")
 
     psp = ParallelSelfPlay(config, num_workers=num_workers)
-    psp.start()
-    psp.push_selfplay(network)   # kick off first round
+    try:
+        psp.start()
+        psp.push_selfplay(network)   # kick off first round
+    except Exception:
+        # If startup fails (worker spawn, GPU server, ...) tear down whatever
+        # was already started instead of leaking worker processes.
+        print("[ERROR] Failed to start self-play workers -- shutting down")
+        try:
+            psp.stop()
+        except Exception:
+            pass
+        raise
 
     games_since_train = 0
     positions_since_train = 0   # track new positions added between training steps
@@ -327,7 +350,7 @@ def run_training(config, gui_enabled=False, num_workers=None):
     worker_feature = [None] * num_workers
     worker_active  = [set() for _ in range(num_workers)]
 
-    # Whole-training cumulative counters (all workers × all subgames) fed to
+    # Whole-training cumulative counters (all workers x all subgames) fed to
     # the GUI moves/sec meter so it counts real throughput, not just the
     # featured games shown in the tiles.
     global_stats = {'total_moves': 0, 'total_games': 0}
@@ -336,7 +359,7 @@ def run_training(config, gui_enabled=False, num_workers=None):
         while not _shutdown:
             result = psp.collect_one(timeout=300.0)
             if result is None:
-                print("[WARN] No result in 5 min — workers may be stuck")
+                print("[WARN] No result in 5 min -- workers may be stuck")
                 continue
             if result.get('done'):
                 continue
@@ -425,6 +448,7 @@ def run_training(config, gui_enabled=False, num_workers=None):
                     elif r.get('type') == 'selfplay' and not r.get('done'):
                         _pending_selfplay.append(r)
 
+                ld = None
                 for _ in range(config.training.num_batches_per_step):
                     if _shutdown: break
                     # Drain any new live messages between batches
@@ -454,7 +478,7 @@ def run_training(config, gui_enabled=False, num_workers=None):
                 # ── Push updated weights to the GPU inference server ──
                 # train_one_step() calls model.train() and updates weights via
                 # optimizer.step().  In GPU mode, workers use InferenceClient and
-                # never load per-task weights — the GPU server must be explicitly
+                # never load per-task weights -- the GPU server must be explicitly
                 # notified.  Without this, self-play between eval cycles uses
                 # stale weights, producing near-zero Q values.
                 network.eval()
@@ -523,7 +547,8 @@ def run_training(config, gui_enabled=False, num_workers=None):
                                          float(np.mean(np.abs(vs))))
 
                 # Checkpoint
-                if step % config.training.checkpoint_interval == 0:
+                ckpt_interval = int(getattr(config.training, 'checkpoint_interval', 0) or 0)
+                if ckpt_interval and step % ckpt_interval == 0:
                     ex = {'game_id':game_id,'eval_game_counter':eval_game_counter,
                           'best_elo':evaluator.best_elo,'ref_elo':evaluator.ref_elo}
                     cp = checkpoints_dir / f"step_{step}.pt"
@@ -533,7 +558,8 @@ def run_training(config, gui_enabled=False, num_workers=None):
                     buffer.save(str(buffer_path))
                     print(f"  Checkpoint: {cp}  Buffer: {len(buffer)} positions")
 
-                print(f"  [train] step={step} pol={ld['policy_loss']:.4f} val={ld['value_loss']:.4f}")
+                if ld is not None:
+                    print(f"  [train] step={step} pol={ld['policy_loss']:.4f} val={ld['value_loss']:.4f}")
 
             # ── Eval ──────────────────────────────────────────────────────
             if games_since_eval >= eval_interval and not _shutdown:
@@ -623,7 +649,7 @@ def run_training(config, gui_enabled=False, num_workers=None):
                         continue
 
                     if rt != 'eval':
-                        continue   # stray self-play result — discard
+                        continue   # stray self-play result -- discard
 
                     wid       = r['worker_id']
                     res       = r['result']
@@ -671,6 +697,7 @@ def run_training(config, gui_enabled=False, num_workers=None):
                 eval_game_counter += collected
 
                 # Gating decision
+                k = config.evaluation.elo_k_factor
                 total_g = gate_wins+gate_losses+gate_draws
                 if total_g > 0:
                     wr = (gate_wins + 0.5*gate_draws) / total_g
@@ -681,7 +708,6 @@ def run_training(config, gui_enabled=False, num_workers=None):
                         print(f"  [GATE] PROMOTED  win_rate={wr:.1%}  best.pt saved")
                     else:
                         print(f"  [GATE] not promoted  win_rate={wr:.1%}")
-                    k = config.evaluation.elo_k_factor
                     old_elo = evaluator.best_elo
                     evaluator.best_elo = old_elo + k*(wr - 0.5)
                     stats.log_promotion_attempt(step=step, promoted=promoted,
@@ -719,7 +745,7 @@ def run_training(config, gui_enabled=False, num_workers=None):
                     tb.log_elo(new_ne,"alpha_beta_ref",step,
                                total_r,ref_wins,ref_losses,ref_draws)
 
-                print(f"  === EVAL DONE — resuming self-play ===\n")
+                print(f"  === EVAL DONE -- resuming self-play ===\n")
                 # Resume self-play: push tasks to all workers
                 psp.push_selfplay(network)
 
@@ -840,6 +866,11 @@ def _print_benchmark_report(timers, total_wall, games, total_moves, total_sims,
               f"Avg batch size: "
               f"{gpu_stats.get('samples_processed', 0) / max(1, gpu_stats.get('aggregated_batches', 0)):.1f}")
         print(f"  Aggregation wait time: {gpu_stats.get('aggregation_wait_time', 0):.3f}s")
+        npt = max(1, gpu_stats.get('n_passes_timed', 0))
+        print(f"  Per-pass avg (n={gpu_stats.get('n_passes_timed', 0)}): "
+              f"H2D {1000*gpu_stats.get('t_h2d', 0)/npt:.2f}ms  "
+              f"fwd {1000*gpu_stats.get('t_fwd', 0)/npt:.2f}ms  "
+              f"D2H {1000*gpu_stats.get('t_d2h', 0)/npt:.2f}ms")
 
     # ── Worker CPU phase breakdown ──
     if worker_phases:
@@ -925,9 +956,9 @@ def run_benchmark(config, num_workers=None, num_games=10, profile_games=3):
         print(f"[INFO] Loading checkpoint: {latest_ckpt}")
         load_checkpoint(str(latest_ckpt), network)
     else:
-        print(f"[WARN] No checkpoint found at {latest_ckpt} — using random weights")
+        print(f"[WARN] No checkpoint found at {latest_ckpt} -- using random weights")
 
-    # Replay buffer load (read-only — never written back)
+    # Replay buffer load (read-only -- never written back)
     buffer_path = checkpoints_dir / "replay_buffer.npz"
     loaded_buffer = ReplayBuffer.load(str(buffer_path), max_size=config.buffer.max_size)
     if loaded_buffer is not None:
@@ -959,7 +990,7 @@ def run_benchmark(config, num_workers=None, num_games=10, profile_games=3):
             result = psp.collect_one(timeout=300.0)
             timers.wait += time.perf_counter() - t_wait
             if result is None:
-                print("[WARN] No result in 5 min — workers may be stuck")
+                print("[WARN] No result in 5 min -- workers may be stuck")
                 continue
             if result.get('done'):
                 continue
@@ -980,7 +1011,7 @@ def run_benchmark(config, num_workers=None, num_games=10, profile_games=3):
                           np.array(m, dtype=np.float32)) for s, p, v, m in raw]
             timers.deserialize += time.perf_counter() - t_ds
 
-            # Bookkeeping (counts + print only — no buffer.add_game, no stats logging)
+            # Bookkeeping (counts + print only -- no buffer.add_game, no stats logging)
             t_bk = time.perf_counter()
             games_done += 1
             total_moves += game_info['length']
@@ -1039,7 +1070,7 @@ def run_benchmark(config, num_workers=None, num_games=10, profile_games=3):
     wall_total = time.perf_counter() - wall_start
     _print_benchmark_report(timers, wall_total, games_done, total_moves,
                             total_sims, gpu_stats, worker_phases)
-    print("[Benchmark] Done. Read-only — no checkpoints, stats.db, or buffer writes occurred.")
+    print("[Benchmark] Done. Read-only -- no checkpoints, stats.db, or buffer writes occurred.")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1048,10 +1079,8 @@ def run_benchmark(config, num_workers=None, num_games=10, profile_games=3):
 
 def run_sanity_check(config):
     print("\n" + "="*60 + "\n  SANITY CHECK\n" + "="*60)
-    from encoding import board_to_tensor, get_legal_move_mask
+    game_api.set_game(getattr(getattr(config, 'game', None), 'name', 'chess'))
     from training import train_one_step, create_optimizer
-    from evaluation import alpha_beta_best_move
-    import chess
 
     ov = {'network':{'num_residual_blocks':2,'num_filters':16,
                      'num_policy_channels':8,'num_value_channels':8,'value_fc_size':32},
@@ -1064,22 +1093,23 @@ def run_sanity_check(config):
     lc = get_config(path=None, overrides=ov)
     dev = torch.device("cpu")
     net = create_model_from_config(lc)
-    board = chess.Board()
-    t = board_to_tensor(board)
+    state, _ = game_api.new_state()
+    t = game_api.encode(state)
     print(f"Tensor: {t.shape}")
-    m = get_legal_move_mask(board); print(f"Mask sum: {m.sum():.0f}")
+    m = game_api.mask(state); print(f"Mask sum: {m.sum():.0f}")
     me = MCTS(net, num_simulations=10, c_puct=1.5)
-    root = me.get_root(board)
+    root = me.get_root(state)
     vp,bm,st = me.search(root)
-    print(f"MCTS best: {bm}  depth: {st['avg_depth']:.2f}")
+    print(f"MCTS best: {game_api.move_str(bm)}  depth: {st['avg_depth']:.2f}")
     gd,gi = self_play_game(net, lc)
     print(f"Game: {gi['termination']} | {gi['result_str']} | {gi['length']} moves")
     buf = ReplayBuffer(1000); buf.add_game(gd)
     opt = create_optimizer(net)
     ld  = train_one_step(net, opt, buf, 8, dev)
     print(f"Loss: pol={ld['policy_loss']:.4f} val={ld['value_loss']:.4f}")
-    mv = alpha_beta_best_move(board, 2)
-    print(f"Alpha-beta: {mv}")
+    state2, _ = game_api.new_state()
+    mv = game_api.reference_move(state2, depth=2)
+    print(f"Reference: {game_api.move_str(mv)}")
     print("="*60 + "\n  SANITY CHECK PASSED\n" + "="*60)
 
 
@@ -1117,7 +1147,7 @@ def run_tournament_mode(config, gui_enabled=True, model_dir=None, models=None,
 
     schedule = build_schedule(config, players)
     tournament = Tournament(config, players, schedule)
-    print(f"[INFO] System: {tournament.system} — "
+    print(f"[INFO] System: {tournament.system} -- "
           f"players={len(players)} games={tournament.total_planned}")
 
     # Dedicated tournament board (separate socket namespace).
@@ -1133,7 +1163,7 @@ def run_tournament_mode(config, gui_enabled=True, model_dir=None, models=None,
             kwargs={'tournament': tournament},
             daemon=True,
         ).start()
-        print(f"[INFO] Tournament GUI → http://{config.gui.host}:{config.gui.port}/tournament")
+        print(f"[INFO] Tournament GUI -> http://{config.gui.host}:{config.gui.port}/tournament")
 
     def _cb(t, result):
         print(f"    => {result}")
@@ -1151,6 +1181,10 @@ def run_tournament_mode(config, gui_enabled=True, model_dir=None, models=None,
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("mode", choices=["train","gui","evaluate","sanity","benchmark","tournament"])
+    parser.add_argument("--game", type=str, default=None,
+                        choices=game_api.list_games(),
+                        help=f"Game to play/train: {', '.join(game_api.list_games())} "
+                             "(overrides config.game.name)")
     parser.add_argument("--gui",      action="store_true")
     parser.add_argument("--config",   type=str, default=None)
     parser.add_argument("--sims",     type=int, default=None)
@@ -1203,6 +1237,7 @@ def main():
             parser.error(f"--pieces: {exc}")
 
     ov = {}
+    if args.game:    ov.setdefault('game',{})['name']=args.game
     if args.sims:     ov.setdefault('mcts',{})['num_simulations']=args.sims
     if args.blocks:   ov.setdefault('network',{})['num_residual_blocks']=args.blocks
     if args.filters:  ov.setdefault('network',{})['num_filters']=args.filters
@@ -1214,6 +1249,12 @@ def main():
     if args.games_per_pair:  ov.setdefault('tournament',{})['games_per_pair']=args.games_per_pair
     if args.swiss_rounds:    ov.setdefault('tournament',{})['swiss_rounds']=args.swiss_rounds
     config = get_config(path=args.config, overrides=ov if ov else None)
+
+    # Adopt the active game globally in this process (workers get it from the
+    # pickled config dict; the GPU server from the Config object it is given).
+    _game_section = getattr(config, 'game', None)
+    game_api.set_game(getattr(_game_section, 'name', 'chess'))
+    print(f"[INFO] Game: {game_api.active_game_name()}")
 
     signal.signal(signal.SIGINT,  signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)

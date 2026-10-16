@@ -72,10 +72,10 @@ class RustMCTS:
         L.mcts_rs_get_w.restype = ctypes.c_double
         L.mcts_rs_get_policy.argtypes = [ctypes.c_int]
         L.mcts_rs_get_policy.restype = ctypes.c_float
-        L.mcts_rs_children.argtypes = [ctypes.c_int, ctypes.POINTER(ctypes.c_int),
-                                       ctypes.c_size_t]
-        L.mcts_rs_children.restype = ctypes.c_int
-        L.mcts_rs_recycle.argtypes = [ctypes.c_int]
+        # Without argtypes ctypes cannot convert the numpy float passed by
+        # _add_dirichlet_noise (noise[i] is np.float64) and raises TypeError.
+        L.mcts_rs_set_policy.argtypes = [ctypes.c_int, ctypes.c_float]
+        L.mcts_rs_set_policy.restype = None
         L.mcts_rs_reset()
 
     # ── mirror helpers ──────────────────────────────────────────────────────

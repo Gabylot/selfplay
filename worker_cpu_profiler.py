@@ -170,37 +170,71 @@ class WorkerProfiler:
         setattr(cls, attr_name, wrapper)
 
     def _patch_legal_moves_iter(self):
-        LegalGen = chess.LegalMoveGenerator
-        orig_iter = LegalGen.__iter__
+        """Time legal-move generation.
+
+        Supports both backends:
+
+        * Real ``python-chess`` -- exposes a lazy ``LegalMoveGenerator``
+          whose ``__iter__``/``__len__`` are the hot path.
+        * The fast ``chess.py`` shim -- ``legal_moves`` / ``legal_moves_raw``
+          are list-returning properties (MCTS uses ``legal_moves_raw``).
+        """
         timer = self.timers['chess_legal_moves']
-        self._board_originals['legal_moves_iter'] = orig_iter
 
-        def timed_iter(self_gen):
-            t0 = time.perf_counter()
-            result = orig_iter(self_gen)
-            timer.record(time.perf_counter() - t0)
-            return result
+        if hasattr(chess, 'LegalMoveGenerator'):
+            # Real python-chess: patch the generator's dunders.
+            LegalGen = chess.LegalMoveGenerator
+            orig_iter = LegalGen.__iter__
+            self._board_originals['legal_moves_iter'] = orig_iter
 
-        LegalGen.__iter__ = timed_iter
-
-        if hasattr(LegalGen, '__len__'):
-            orig_len = LegalGen.__len__
-            self._board_originals['legal_moves_len'] = orig_len
-
-            def timed_len(self_gen):
+            def timed_iter(self_gen):
                 t0 = time.perf_counter()
-                result = orig_len(self_gen)
+                result = orig_iter(self_gen)
                 timer.record(time.perf_counter() - t0)
                 return result
 
-            LegalGen.__len__ = timed_len
+            LegalGen.__iter__ = timed_iter
+
+            if hasattr(LegalGen, '__len__'):
+                orig_len = LegalGen.__len__
+                self._board_originals['legal_moves_len'] = orig_len
+
+                def timed_len(self_gen):
+                    t0 = time.perf_counter()
+                    result = orig_len(self_gen)
+                    timer.record(time.perf_counter() - t0)
+                    return result
+
+                LegalGen.__len__ = timed_len
+        else:
+            # Fast chess.py shim: legal moves are materialised by properties.
+            Board = chess.Board
+            for prop_name in ('legal_moves_raw', 'legal_moves'):
+                orig_prop = Board.__dict__.get(prop_name)
+                if orig_prop is None:
+                    continue
+                orig_getter = orig_prop.fget
+                self._board_originals[prop_name] = orig_prop
+
+                def make_timed_getter(getter):
+                    def timed_getter(self_or_board):
+                        t0 = time.perf_counter()
+                        result = getter(self_or_board)
+                        timer.record(time.perf_counter() - t0)
+                        return result
+                    return timed_getter
+
+                setattr(Board, prop_name,
+                        property(make_timed_getter(orig_getter)))
 
     def _detach_chess(self):
         Board = chess.Board
         for attr_name, original in self._board_originals.items():
-            if attr_name == 'legal_moves_iter':
+            if (attr_name == 'legal_moves_iter'
+                    and hasattr(chess, 'LegalMoveGenerator')):
                 chess.LegalMoveGenerator.__iter__ = original
-            elif attr_name == 'legal_moves_len':
+            elif (attr_name == 'legal_moves_len'
+                    and hasattr(chess, 'LegalMoveGenerator')):
                 chess.LegalMoveGenerator.__len__ = original
             else:
                 setattr(Board, attr_name, original)

@@ -5,8 +5,11 @@ A minimal AlphaZero-style chess engine that learns purely through self-play, sta
 ## Quick Start
 
 ### Prerequisites
-- Python 3.10+
-- Dependencies: `pip install python-chess torch numpy flask flask-socketio pyyaml`
+- Python 3.10+ (developed against 3.12)
+- Dependencies: `pip install -r requirements.txt`
+  (`torch` must be installed for your accelerator — e.g. the ROCm/CUDA wheel — separately)
+- Optional: a Rust toolchain + `maturin` to build the `fastchess` encoding
+  extension and the `mcts_rs` search engine (pure-Python fallbacks exist).
 
 ### Run Sanity Check
 ```bash
@@ -50,16 +53,25 @@ python main.py train --run-name my_experiment
 
 ## Architecture
 
-### Board Encoding (18 planes, 8×8×18)
+The engine is game-agnostic: all board rules go through `game_api.py`, which
+selects a game implementation from `games/` (currently `chess.py` and
+`connect4.py`).  The numbers below are for chess (the default game).
+
+### Board Encoding (119 planes, 8×8×119)
 | Planes | Description |
 |--------|-------------|
 | 0–5 | White P, N, B, R, Q, K |
 | 6–11 | Black P, N, B, R, Q, K |
-| 12 | Side to move |
-| 13–16 | Castling rights (WK, WQ, BK, BQ) |
-| 17 | En passant square |
+| 12–13 | Repetition (current / two-fold), full-board |
+| 14 | Side to move |
+| 15–18 | Castling rights (WK, WQ, BK, BQ) |
+| 19 | En passant square |
+| 20–118 | Auxiliary/history planes (see `games/chess.py`) |
 
-### Move Encoding (8×8×73 = 5,851 actions)
+Encoding is accelerated by the Rust `fastchess` extension when available, with
+a pure-Python fallback.
+
+### Move Encoding (8×8×73 = 4,672 actions)
 - Planes 0–55: Queen-like moves (8 directions × 7 distances)
 - Planes 56–63: Knight moves (8 offsets)
 - Planes 64–72: Underpromotions (N/B/R × forward/forward-left/forward-right)
@@ -67,7 +79,7 @@ python main.py train --run-name my_experiment
 
 ### Network
 - Small ResNet: configurable residual blocks (default 4) and filters (default 64)
-- Policy head: outputs 5,851 move probabilities
+- Policy head: outputs 4,672 move probabilities
 - Value head: outputs scalar in [-1, 1] (expected game outcome)
 - Random initialization — no pretraining
 
@@ -134,10 +146,19 @@ Auto-refreshes every 2 seconds via polling.
 ```
 ├── config.yaml        # All hyperparameters
 ├── config.py          # Config loading with CLI overrides
-├── encoding.py        # Board encoding (18 planes) + move encoding (8×8×73)
+├── game_api.py        # Game-agnostic rules/encoding dispatch
+├── games/             # Per-game implementations (chess.py, connect4.py)
+├── encoding.py        # Board/move encoding helpers (119 planes for chess)
 ├── network.py         # Dual-head ResNet (PyTorch)
 ├── mcts.py            # PUCT MCTS with Dirichlet noise
-├── selfplay.py        # Self-play game generation + replay buffer
+├── forced_mate.py     # Exact forced-mate proof override for endgames
+├── rust_mcts.py       # Python wrapper around the optional mcts_rs engine
+├── mcts_rs/           # Rust MCTS engine (Cargo project)
+├── fastchess/         # Rust encoding extension (built with maturin)
+├── selfplay.py        # Self-play + parallel workers + replay buffer
+├── gpu_server.py      # Batched GPU inference server
+├── inference_client.py# Client to the GPU inference server
+├── shared_memory_transport.py # Zero-copy IPC buffers
 ├── training.py        # Training loop (policy + value loss)
 ├── evaluation.py      # Gating + alpha-beta reference + Elo tracking
 ├── stats.py           # SQLite persistence for all metrics

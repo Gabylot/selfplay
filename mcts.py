@@ -1,15 +1,19 @@
-"""Monte Carlo Tree Search with PUCT selection for AlphaZero chess.
+"""Monte Carlo Tree Search with PUCT selection for AlphaZero games.
 
 Implements the AlphaZero PUCT variant with optional batched inference:
 - Each node tracks: visit count N, total value W, mean value Q, prior P
 - Dirichlet noise at root for exploration
 - Temperature-based move selection
 - Virtual loss for tree-parallel batched inference (batch_size > 1)
-- Lazy board construction: child boards are only copied+pushe'd on first
-  access, saving ~24% CPU by avoiding copies for never-visited children.
-- Cached ``is_game_over`` and terminal value on each node to eliminate
-  redundant python-chess calls during repeated leaf evaluations.
+- Lazy state construction: child boards/states are only copied+push'ed on
+  first access, saving ~24% CPU by avoiding copies for never-visited
+  children.
+- Cached terminal status and value on each node to eliminate redundant
+  game-state queries during repeated leaf evaluations.
 - **NEW**: respects `max_game_length` with configurable adjudication.
+
+The search drives whatever game is active in ``game_api`` (chess or
+connect4); none of the board-specific calls here are game-aware.
 """
 
 import math
@@ -18,6 +22,7 @@ import numpy as np
 import chess
 from typing import Optional, Tuple, List, Dict
 
+import game_api
 from encoding import (
     board_to_tensor, get_legal_move_mask, get_legal_move_mask_from_moves,
     move_to_policy_index, policy_index_to_move, NUM_ACTIONS
@@ -180,7 +185,8 @@ class MCTS:
                  piece_values: Optional[dict] = None,
                  adjudicate_graded: bool = True,
                  adjudicate_scaling: float = 9.0,
-                 force_mate_in_one: bool = True):
+                 force_mate_in_one: bool = True,
+                 inference_pipeline: int = 1):
         """
         Args:
             network: The neural network for position evaluation
@@ -213,14 +219,24 @@ class MCTS:
         self.adjudicate_scaling = adjudicate_scaling
         self.force_mate_in_one = force_mate_in_one
 
+        # Async inference pipelining: number of leaf-batches kept in flight so
+        # tree work (selection / expansion / backprop) overlaps the network
+        # round-trip.  Only active when batch_size > 1 AND the injected
+        # "network" exposes the async API (predict_batch_async + wait_result),
+        # i.e. the GPU InferenceClient.  Values > 1 change WHEN leaves are
+        # collected (a later batch is gathered while an earlier one is in
+        # flight), which slightly alters search dynamics — comparable to
+        # increasing batch_size — but the per-leaf math is unchanged.
+        self.inference_pipeline = max(1, int(inference_pipeline))
+
         # Profiling: when True, search() collects per-phase timing into stats['profiling']
         self.profile = False
 
-    def get_root(self, board: chess.Board) -> MCTSNode:
-        """Create a root node for the given board (eagerly stores the board)."""
+    def get_root(self, board) -> MCTSNode:
+        """Create a root node for the given game state (eagerly stored)."""
         return MCTSNode(board.copy())
 
-    def recycle_tree(self, root: MCTSNode, move: chess.Move) -> Optional[MCTSNode]:
+    def recycle_tree(self, root: MCTSNode, move) -> Optional[MCTSNode]:
         """Promote the child of `root` that corresponds to `move` to a new root.
 
         Instead of discarding the entire search tree after each move, this
@@ -228,49 +244,46 @@ class MCTS:
         its subtree (expanded children, Q values, visit counts) for the
         next search.
 
-        The promoted node's parent pointer is cleared and its board is
+        The promoted node's parent pointer is cleared and its state is
         eagerly materialized (since the parent relationship is severed).
 
         Args:
             root: The current root node (already searched)
-            move: The move that was selected (can be ``chess.Move`` or ``FastMove``)
+            move: The move that was selected
 
         Returns:
             The promoted child as a new root, or None if the child
             wasn't found.
         """
-        # Compare by raw attributes to handle both FastMove and Move objects.
-        move_from = move.from_square
-        move_to = move.to_square
-        move_promo = move.promotion
+        # Compare through the game's canonical move key so any move object
+        # (chess.Move, FastMove, or a bare connect4 column int) works.
+        selected_key = game_api.move_key(move)
+        b = root.board
 
         for action_idx, child in root.children.items():
-            child_move = child.move
-            if (child_move.from_square == move_from and
-                child_move.to_square == move_to and
-                child_move.promotion == move_promo):
-                # Detach from parent
-                child.parent = None
+            if game_api.move_key(child.move) != selected_key:
+                continue
+            # Detach from parent
+            child.parent = None
 
-                # Eagerly materialize the board since parent relationship is gone
-                if not child._board_ready:
-                    # Use root's board (already materialized) to construct child board
-                    b = root.board.copy(stack=True)
-                    b.push(move)
-                    child._board = b
-                    child._board_ready = True
+            # Eagerly materialize the state since the parent is gone
+            if not child._board_ready:
+                nb = b.copy(stack=True)
+                game_api.apply(nb, move)
+                child._board = nb
+                child._board_ready = True
 
-                # Reset depth since this is now a root node
-                child.depth = 0
+            # Reset depth since this is now a root node
+            child.depth = 0
 
-                # Clear visit_count (backward-compat duplicate of N).
-                # N/W/Q are intentionally kept so the next search
-                # benefits from accumulated visit information.
-                child.visit_count = 0
-                child._checkmate_child_cached = False
-                child._checkmate_child_move = None
+            # Clear visit_count (backward-compat duplicate of N).
+            # N/W/Q are intentionally kept so the next search
+            # benefits from accumulated visit information.
+            child.visit_count = 0
+            child._checkmate_child_cached = False
+            child._checkmate_child_move = None
 
-                return child
+            return child
 
         return None
 
@@ -327,35 +340,117 @@ class MCTS:
         if self.batch_size > 1:
             # Batched mode: collect leaves, evaluate in batch, backprop
             target_new_sims = max(0, self.num_simulations - root.N)
-            while sims_done < target_new_sims:
-                # Determine batch size for this iteration
-                bs = min(self.batch_size, target_new_sims - sims_done)
 
-                # Collect leaf nodes via selection with virtual loss.
-                leaf_depth_pairs = self._collect_batch(root, bs)
+            use_pipeline = (self.inference_pipeline > 1
+                            and hasattr(self.network, 'predict_batch_async')
+                            and hasattr(self.network, 'wait_result'))
 
-                if not leaf_depth_pairs:
-                    break
+            if not use_pipeline:
+                while sims_done < target_new_sims:
+                    # Determine batch size for this iteration
+                    bs = min(self.batch_size, target_new_sims - sims_done)
 
-                leaf_nodes = [ld[0] for ld in leaf_depth_pairs]
+                    # Collect leaf nodes via selection with virtual loss.
+                    leaf_depth_pairs = self._collect_batch(root, bs)
 
-                # Evaluate all leaves in a single batch network call
-                t0 = time.perf_counter() if pf else 0
-                values = self._evaluate_batch(leaf_nodes)
-                if pf:
-                    pf['network_batch_predict'] += time.perf_counter() - t0
-                    pf['network_batch_calls'] += 1
+                    if not leaf_depth_pairs:
+                        break
 
-                # Backpropagate each leaf, removing virtual losses
-                for (leaf, depth), value in zip(leaf_depth_pairs, values):
+                    leaf_nodes = [ld[0] for ld in leaf_depth_pairs]
+
+                    # Evaluate all leaves in a single batch network call
                     t0 = time.perf_counter() if pf else 0
-                    self._backpropagate_with_virtual_loss(leaf, value)
+                    values = self._evaluate_batch(leaf_nodes)
                     if pf:
-                        pf['backprop_total'] += time.perf_counter() - t0
-                    max_depth = max(max_depth, depth)
-                    total_depth += depth
+                        pf['network_batch_predict'] += time.perf_counter() - t0
+                        pf['network_batch_calls'] += 1
 
-                sims_done += len(leaf_nodes)
+                    # Backpropagate each leaf, removing virtual losses
+                    for (leaf, depth), value in zip(leaf_depth_pairs, values):
+                        t0 = time.perf_counter() if pf else 0
+                        self._backpropagate_with_virtual_loss(leaf, value)
+                        if pf:
+                            pf['backprop_total'] += time.perf_counter() - t0
+                        max_depth = max(max_depth, depth)
+                        total_depth += depth
+
+                    sims_done += len(leaf_nodes)
+            else:
+                # ── Pipelined batched mode ──
+                # Keep up to `inference_pipeline` batches in flight so tree
+                # work overlaps the network round-trip.  While batch k is on
+                # the GPU we already collect + dispatch batch k+1; results
+                # are applied strictly in submission order (FIFO).
+                from collections import deque
+                inflight: deque = deque()   # (req_id|None, pairs, tv, ex_idx, ex_nodes, ids)
+                outstanding = 0             # leaves dispatched but not applied
+
+                while True:
+                    # Top the pipeline up.
+                    while (len(inflight) < self.inference_pipeline
+                           and sims_done + outstanding < target_new_sims):
+                        bs = min(self.batch_size,
+                                 target_new_sims - sims_done - outstanding)
+
+                        inflight_ids: set = set()
+                        for entry in inflight:
+                            inflight_ids.update(entry[5])
+
+                        pairs = self._collect_batch(root, bs,
+                                                    excluded_ids=inflight_ids)
+                        if not pairs:
+                            break
+
+                        leaf_nodes = [ld[0] for ld in pairs]
+                        tv, ex_idx, ex_nodes = self._split_terminal_leaves(leaf_nodes)
+
+                        if ex_nodes:
+                            states = np.stack(
+                                [game_api.encode(n.board) for n in ex_nodes],
+                                axis=0)
+                            t0 = time.perf_counter() if pf else 0
+                            req_id = self.network.predict_batch_async(states)
+                            if pf:
+                                pf['collection_vl_mgmt'] += time.perf_counter() - t0
+                        else:
+                            req_id = None
+
+                        pair_ids = {id(n) for n in leaf_nodes}
+                        inflight.append((req_id, pairs, tv, ex_idx,
+                                         ex_nodes, pair_ids))
+                        outstanding += len(pairs)
+
+                    if not inflight:
+                        break
+
+                    # Apply the oldest batch's results (FIFO keeps VL bookkeeping
+                    # consistent with collection order).
+                    (req_id, pairs, tv, ex_idx,
+                     ex_nodes, pair_ids) = inflight.popleft()
+                    outstanding -= len(pairs)
+
+                    t0 = time.perf_counter() if pf else 0
+                    if req_id is not None:
+                        policies, vals = self.network.wait_result(req_id)
+                        values = self._apply_network_results(
+                            [ld[0] for ld in pairs], tv, ex_idx, ex_nodes,
+                            policies, vals)
+                    else:
+                        values = [tv.get(i, 0.0) for i in range(len(pairs))]
+                    if pf:
+                        pf['network_batch_predict'] += time.perf_counter() - t0
+                        pf['network_batch_calls'] += 1
+
+                    # Backpropagate each leaf, removing virtual losses
+                    for (leaf, depth), value in zip(pairs, values):
+                        t0 = time.perf_counter() if pf else 0
+                        self._backpropagate_with_virtual_loss(leaf, value)
+                        if pf:
+                            pf['backprop_total'] += time.perf_counter() - t0
+                        max_depth = max(max_depth, depth)
+                        total_depth += depth
+
+                    sims_done += len(pairs)
         else:
             # Sequential mode (original behavior, no virtual loss overhead)
             remaining = max(0, self.num_simulations - root.N)
@@ -445,7 +540,8 @@ class MCTS:
 
         return best_child
 
-    def _collect_batch(self, root: MCTSNode, batch_size: int) -> List[Tuple[MCTSNode, int]]:
+    def _collect_batch(self, root: MCTSNode, batch_size: int,
+                       excluded_ids: Optional[set] = None) -> List[Tuple[MCTSNode, int]]:
         """Run batch_size selections, applying virtual loss along each path.
 
         Each selection traverses from root to a leaf, incrementing virtual_loss
@@ -461,6 +557,11 @@ class MCTS:
            would create duplicate children on the second call)
         3. Double-backprop of values from the same leaf
 
+        ``excluded_ids`` additionally lists ``id(node)`` values of leaves that
+        are already dispatched but not yet applied (async pipelining); those
+        are treated as duplicates too, so a later batch never selects a leaf
+        whose evaluation is still in flight.
+
         If the tree is exhausted and every path leads to already-selected
         leaves, fewer than ``batch_size`` leaves may be returned. The caller
         must handle this (``search()`` uses ``len(leaf_nodes)`` for the
@@ -469,6 +570,7 @@ class MCTS:
         Args:
             root: Root node
             batch_size: Target number of leaf nodes to collect
+            excluded_ids: Optional set of node ids currently in flight
 
         Returns:
             List of ``(leaf_node, depth)`` tuples where depth is the number
@@ -476,9 +578,13 @@ class MCTS:
             regardless of tree recycling). May be shorter than batch_size.
         """
         leaves = []
-        selected_leaf_ids: set = set()
+        selected_leaf_ids: set = set(excluded_ids) if excluded_ids else set()
 
-        for _ in range(batch_size):
+        attempts = 0
+        max_attempts = batch_size * 4 + 8  # guard against pathological loops
+
+        while len(leaves) < batch_size and attempts < max_attempts:
+            attempts += 1
             node = root
             path: list = []  # nodes we applied VL to (for rollback if duplicate)
 
@@ -489,9 +595,10 @@ class MCTS:
                 path.append(node)
                 node = self._select_child(node)
 
-            # If this leaf was already selected earlier in this batch, roll back
-            # and skip.  (``virtual_loss`` on the leaf itself hasn't been
-            # incremented yet, so we check ``selected_leaf_ids`` rather than VL.)
+            # If this leaf was already selected earlier in this batch (or is
+            # in flight from an earlier batch), roll back and skip.
+            #  (``virtual_loss`` on the leaf itself hasn't been incremented
+            #   yet, so we check ids rather than VL.)
             if id(node) in selected_leaf_ids:
                 # Undo virtual losses applied to interior nodes along the path
                 for n in path:
@@ -510,15 +617,13 @@ class MCTS:
 
         return leaves
 
-    def _evaluate_batch(self, leaf_nodes: List[MCTSNode]) -> List[float]:
-        """Evaluate a batch of leaf nodes.
+    def _split_terminal_leaves(self, leaf_nodes: List[MCTSNode]):
+        """Classify a batch of leaves into terminal vs expandable.
 
-        Terminal nodes are those where the game is over, a threefold repetition
-        has occurred, the 50-move rule has been exceeded, **or** the maximum
-        game length has been reached (adjudicated according to config).
-
-        Non-terminal, unexpanded leaves are stacked and evaluated in one
-        batched network call.
+        Terminal leaves get their value computed locally (cached); expandable
+        leaves need one network evaluation each.  Returns
+        ``(terminal_values, expandable_indices, expandable_nodes)`` where
+        ``terminal_values`` maps leaf index -> value.
         """
         terminal_values = {}
         expandable_indices = []
@@ -527,12 +632,7 @@ class MCTS:
         for i, node in enumerate(leaf_nodes):
             # ---- Terminal check: ACTUAL game-ending + max_length ----
             if node._game_over_cached is None:
-                node._game_over_cached = (
-                    node.board.is_game_over() or
-                    node.board.is_repetition(3) or
-                    node.board.is_fifty_moves() or
-                    node.board.ply() >= self.max_game_length          # <-- NEW
-                )
+                node._game_over_cached = self._is_terminal_state(node)
 
             if node._game_over_cached:
                 terminal_values[i] = self._get_terminal_value(node)
@@ -543,23 +643,45 @@ class MCTS:
                 # Node is expanded but terminal (should not happen normally)
                 terminal_values[i] = self._get_terminal_value(node)
 
-        # ---- Batched network evaluation for expandable leaves ----
+        return terminal_values, expandable_indices, expandable_nodes
+
+    def _apply_network_results(self, leaf_nodes, terminal_values,
+                               expandable_indices, expandable_nodes,
+                               policies_batch, values_batch) -> List[float]:
+        """Expand leaves from network outputs; return values aligned to leaves."""
         if expandable_nodes:
-            states_list = [board_to_tensor(n.board) for n in expandable_nodes]
-            states_batch = np.stack(states_list, axis=0)
-
-            policies_batch, values_batch = self.network.predictBatch(states_batch)
-
-            for idx, node in enumerate(expandable_nodes):
-                self._expand_node_with_data(node, policies_batch[idx], values_batch[idx])
-                terminal_values[expandable_indices[idx]] = float(values_batch[idx])
+            for k, node in enumerate(expandable_nodes):
+                self._expand_node_with_data(node, policies_batch[k],
+                                            float(values_batch[k]))
+                terminal_values[expandable_indices[k]] = float(values_batch[k])
 
         # Reconstruct results in the original leaf order
-        results = []
-        for i in range(len(leaf_nodes)):
-            results.append(terminal_values.get(i, 0.0))
+        return [terminal_values.get(i, 0.0) for i in range(len(leaf_nodes))]
 
-        return results
+    def _evaluate_batch(self, leaf_nodes: List[MCTSNode]) -> List[float]:
+        """Evaluate a batch of leaf nodes synchronously.
+
+        Terminal nodes are those where the game is over, a threefold repetition
+        has occurred, the 50-move rule has been exceeded, **or** the maximum
+        game length has been reached (adjudicated according to config).
+
+        Non-terminal, unexpanded leaves are stacked and evaluated in one
+        batched network call.
+        """
+        terminal_values, expandable_indices, expandable_nodes = \
+            self._split_terminal_leaves(leaf_nodes)
+
+        # ---- Batched network evaluation for expandable leaves ----
+        policies_batch = values_batch = None
+        if expandable_nodes:
+            states_list = [game_api.encode(n.board) for n in expandable_nodes]
+            states_batch = np.stack(states_list, axis=0)
+            policies_batch, values_batch = self.network.predictBatch(states_batch)
+
+        return self._apply_network_results(
+            leaf_nodes, terminal_values,
+            expandable_indices, expandable_nodes,
+            policies_batch, values_batch)
 
     def _expand_node(self, node: MCTSNode) -> float:
         """Expand a node using the network. Returns the value estimate.
@@ -568,24 +690,67 @@ class MCTS:
         ``is_game_over()`` calls.
         """
         if node._game_over_cached is None:
-            node._game_over_cached = (
-                node.board.is_game_over() or
-                node.board.is_repetition(3) or
-                node.board.is_fifty_moves() or
-                node.board.ply() >= self.max_game_length
-            )
+            node._game_over_cached = self._is_terminal_state(node)
         if node._game_over_cached:
             return self._get_terminal_value(node)
 
         # Get network prediction
-        state = board_to_tensor(node.board)
+        state = game_api.encode(node.board)
         policy, value = self.network.predict(state)
 
         # Delegates to the optimized expansion using raw FastMove objects
         return self._expand_node_with_data(node, policy, value)
 
+    def _is_terminal_state(self, node) -> bool:
+        """Whether the node is terminal inside the search tree.
+
+        Matches the original chess behavior: actually game over, threefold
+        repetition, fifty-move rule (chess only), or max-game-length.
+        """
+        b = node.board
+        return (game_api.is_terminal(b)
+                or game_api.is_draw_claim(b)
+                or game_api.is_fifty_moves(b)
+                or game_api.state_ply(b) >= self.max_game_length)
+
     def _expand_node_with_data(self, node: MCTSNode,
                                 policy: np.ndarray, value: float) -> float:
+        """Expand a node using precomputed policy and value.
+
+        The chess backend provides an optimized fast path over raw
+        FastMove objects (legacy).  Other games fall back to the generic
+        per-move index path, which is all the game API needs.
+        """
+        if not hasattr(node.board, "legal_moves_raw"):
+            return self._expand_node_generic(node, policy, value)
+        return self._expand_node_chess_raw(node, policy, value)
+
+    def _expand_node_generic(self, node: MCTSNode,
+                             policy: np.ndarray, value: float) -> float:
+        """Generic expansion via the game API (connect4 and friends)."""
+        b = node.board
+        moves = list(game_api.legal_moves(b))
+        if not moves:
+            return 0.0
+
+        indices = [game_api.to_index(b, m) for m in moves]
+        legal = policy[np.asarray(indices, dtype=np.intp)]
+        legal_sum = float(legal.sum())
+        if legal_sum > 0:
+            priors = legal / legal_sum
+        else:
+            priors = np.full(len(indices), 1.0 / len(indices),
+                             dtype=np.float32)
+
+        for move, action_idx, prior in zip(moves, indices, priors):
+            child = MCTSNode.new_child(node, move, float(prior))
+            node.children[action_idx] = child
+
+        node.is_expanded = True
+        return float(value)
+
+    def _expand_node_chess_raw(self, node: MCTSNode,
+                               policy: np.ndarray, value: float) -> float:
         """Expand a node using precomputed policy and value.
 
         Uses the raw FastMove list (``board.legal_moves_raw``) to avoid
@@ -668,34 +833,33 @@ class MCTS:
             return node._terminal_value_cached
 
         # ── Case 1: actually over (checkmate, stalemate, etc.) ──
-        result = node.board.result()
-        if result != "*":
-            if result == "1-0":
-                val = 1.0 if node.board.turn == chess.WHITE else -1.0
-            elif result == "0-1":
-                val = -1.0 if node.board.turn == chess.WHITE else 1.0
-            else:
-                val = 0.0
-            node._terminal_value_cached = val
-            return val
+        tv = game_api.terminal_value(node.board)
+        if tv is not None:
+            node._terminal_value_cached = tv
+            return tv
 
         # ── Case 2: hit max game length (adjudicate) ──
-        if node.board.ply() >= self.max_game_length:
+        if game_api.state_ply(node.board) >= self.max_game_length:
             if self.adjudicate_material:
-                val = adjudicate_by_material(
+                # ``adjudicate_value`` returns a WHITE-perspective material
+                # advantage (see games/chess.py), but the tree convention
+                # (terminal_value / _backpropagate) is side-to-move.  Convert
+                # so a Black-to-move node does not get a sign-flipped value.
+                val = game_api.adjudicate_value(
                     node.board,
-                    self.piece_values,
+                    piece_values=self.piece_values,
                     graded=self.adjudicate_graded,
                     scaling=self.adjudicate_scaling
                 )
+                val *= game_api.player_sign(node.board)
             else:
                 val = 0.0
             node._terminal_value_cached = val
             return val
 
         # ── Case 3: claimable draws (repetition, 50-move) ──
-        # board.result() (no claim_draw) returns "*" for these,
-        # so they fall through to here.  0.0 is the correct value.
+        # terminal_value() returns None for these, so they fall through to
+        # here.  0.0 is the correct value.
         node._terminal_value_cached = 0.0
         return 0.0
 
@@ -801,16 +965,17 @@ class MCTS:
             visit_policy: (4672,) normalized visit distribution
             best_move: Selected move (most visited)
         """
-        visit_policy = np.zeros(NUM_ACTIONS, dtype=np.float32)
+        visit_policy = np.zeros(game_api.num_actions(), dtype=np.float32)
 
         if not root.children:
             # No children -- return empty
             return visit_policy, None
 
-        # Force checkmate move if MCTS found one (mate-in-one override)
-        checkmate_move = self._find_checkmate_child(root) if self.force_mate_in_one else None
+        # Force checkmate move if MCTS found one (mate-in-one override, chess only)
+        checkmate_move = (self._find_checkmate_child(root)
+                          if self.force_mate_in_one and game_api.is_game("chess") else None)
         if checkmate_move is not None:
-            idx = move_to_policy_index(checkmate_move, root.board)
+            idx = game_api.to_index(root.board, checkmate_move)
             visit_policy[idx] = 1.0
             return visit_policy, checkmate_move
 
@@ -828,7 +993,7 @@ class MCTS:
 
         # Find the move with most visits for greedy selection
         best_idx = int(np.argmax(visit_policy))
-        best_move = policy_index_to_move(best_idx, root.board)
+        best_move = game_api.index_to_move(root.board, best_idx)
 
         return visit_probs, best_move
 
@@ -847,7 +1012,7 @@ class MCTS:
         for action_idx, child in root.children.items():
             if child.N > 0:
                 stats.append({
-                    'move': child.move.uci() if child.move else None,
+                    'move': game_api.move_str(child.move) if child.move else None,
                     'N': child.N,
                     'W': child.W,
                     'Q': child.Q,
@@ -866,15 +1031,16 @@ class MCTS:
             visit_policy: (4672,) visit distribution
             move: Selected move
         """
-        visit_policy = np.zeros(NUM_ACTIONS, dtype=np.float32)
+        visit_policy = np.zeros(game_api.num_actions(), dtype=np.float32)
 
         if not root.children:
             return visit_policy, None
 
-        # Force checkmate move if MCTS found one (mate-in-one override)
-        checkmate_move = self._find_checkmate_child(root) if self.force_mate_in_one else None
+        # Force checkmate move if MCTS found one (mate-in-one override, chess only)
+        checkmate_move = (self._find_checkmate_child(root)
+                          if self.force_mate_in_one and game_api.is_game("chess") else None)
         if checkmate_move is not None:
-            idx = move_to_policy_index(checkmate_move, root.board)
+            idx = game_api.to_index(root.board, checkmate_move)
             visit_policy[idx] = 1.0
             return visit_policy, checkmate_move
 
@@ -891,7 +1057,7 @@ class MCTS:
             # Greedy selection
             best_idx = max(visit_counts, key=visit_counts.get)
             visit_policy[best_idx] = 1.0
-            move = policy_index_to_move(best_idx, root.board)
+            move = game_api.index_to_move(root.board, best_idx)
         else:
             # Sample proportionally to visit_count^(1/temperature)
             indices = list(visit_counts.keys())
@@ -906,7 +1072,7 @@ class MCTS:
             chosen_idx = indices[chosen]
 
             visit_policy[chosen_idx] = 1.0
-            move = policy_index_to_move(chosen_idx, root.board)
+            move = game_api.index_to_move(root.board, chosen_idx)
 
             # Also store the full normalized visit distribution
             for idx in indices:

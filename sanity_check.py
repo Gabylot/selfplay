@@ -116,12 +116,13 @@ def main():
     buffer = ReplayBuffer(max_size=1000)
     buffer.add_game(game_data)
     assert len(buffer) == len(game_data), f"Buffer size mismatch: {len(buffer)} != {len(game_data)}"
-    states, policies, values = buffer.sample_batch(8)
+    states, policies, values, masks = buffer.sample_batch(8)
     assert states.shape[0] > 0, "Empty batch"
     assert states.shape[1:] == (NUM_PLANES, 8, 8), f"State shape wrong: {states.shape}"
     assert policies.shape[1] == 4672, f"Policy shape wrong: {policies.shape}"
+    assert masks.shape == policies.shape, f"Mask shape wrong: {masks.shape}"
     print(f"  Buffer size: {len(buffer)}")
-    print(f"  Sampled batch: states={states.shape}, policies={policies.shape}, values={values.shape}")
+    print(f"  Sampled batch: states={states.shape}, policies={policies.shape}, values={values.shape}, masks={masks.shape}")
     dist = buffer.get_outcome_distribution()
     print(f"  Outcome distribution: {dist}")
     print("  Replay buffer OK")

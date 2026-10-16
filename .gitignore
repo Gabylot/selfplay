@@ -1,3 +1,20 @@
-__pycache__/*
-gui/__pycache__/*
+__pycache__/
+**/__pycache__/
+*.pyc
 output/default/checkpoints/*
+output/*/runs/*
+output/*
+chess_rust/*
+fastchess/*
+shakmaty/*
+Syzygy/*
+
+# ROCm/ComfyUI runtime environment (~GBs, must never be committed)
+rocm/
+# Rust build output
+mcts_rs/target/
+**/target/
+
+# Logs and profiler artifacts
+*.log
+*.prof
