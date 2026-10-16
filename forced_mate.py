@@ -28,6 +28,7 @@ import chess
 from typing import Optional
 
 from mcts import MCTS, NUM_ACTIONS, move_to_policy_index
+from rust_mcts import RustMCTS
 
 
 # Per-thread memo for the forced-mate proof search.  Worker processes run one
@@ -104,18 +105,20 @@ def forced_mate(board: chess.Board, plies: int) -> Optional[chess.Move]:
     return None
 
 
-class ForceMateMCTS(MCTS):
-    """MCTS whose move selection is overridden by an exact forced-mate proof.
+class ForceMateMixin:
+    """Overrides MCTS move selection with an exact forced-mate proof.
 
-    Only active on sparse boards (<= ``min_pieces_gate`` pieces).  When a
-    forced mate within ``max_force_plies`` exists, the forcing move is
-    returned with a one-hot policy instead of the MCTS visit distribution.
-    Otherwise falls back to the base MCTS behavior.
-
-    Attributes:
-        forced: total number of times the override fired.
-        forced_log: list of ``(move, plies, fen)`` tuples for diagnostics.
+    Engine-agnostic: works with either ``mcts.MCTS`` or ``rust_mcts.RustMCTS``
+    as the next class in the MRO.  Only active on sparse boards (<=
+    ``min_pieces_gate`` pieces).  When a forced mate within ``max_force_plies``
+    exists, the forcing move is returned with a one-hot policy instead of the
+    MCTS visit distribution.
     """
+
+    max_force_plies = 5
+    min_pieces_gate = 8
+    deep_plies = 9
+    deep_gate_pieces = 4
 
     def __init__(self, *args, max_force_plies: int = 5,
                  min_pieces_gate: int = 8,
@@ -149,3 +152,11 @@ class ForceMateMCTS(MCTS):
                     self.forced_log.append((fm, plies, b.fen()))
                     return vp, fm
         return super().select_move_with_temperature(root, temperature)
+
+
+class ForceMateMCTS(ForceMateMixin, MCTS):
+    """``mcts.MCTS`` with the exact forced-mate selection override."""
+
+
+class ForceMateRustMCTS(ForceMateMixin, RustMCTS):
+    """``rust_mcts.RustMCTS`` with the exact forced-mate selection override."""

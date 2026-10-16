@@ -343,6 +343,22 @@ def run_training(config, gui_enabled=False, num_workers=None):
     train_interval    = config.training.training_steps_per_iteration
     eval_interval     = config.evaluation.eval_interval
 
+    # ── Training-schedule settings ──
+    # target_replay_ratio > 0: size each training session by the number of NEW
+    # positions that arrived, so every position is trained on ~ratio times no
+    # matter how bursty game completion is.  0 / missing: fixed
+    # num_batches_per_step per session (old behavior).
+    _tcfg = config.training
+    train_batch_size   = int(_tcfg.batch_size)
+    target_replay_ratio = float(getattr(_tcfg, 'target_replay_ratio', 0) or 0)
+    max_batches_per_step = int(getattr(_tcfg, 'max_batches_per_step', 64) or 64)
+    fixed_batches_per_step = int(_tcfg.num_batches_per_step)
+    ckpt_interval = int(getattr(_tcfg, 'checkpoint_interval', 0) or 0)
+    # Checkpoint trigger is "crossed a multiple of ckpt_interval", because with
+    # a variable number of batches per session `step % interval == 0` would be
+    # skipped over most of the time.
+    last_ckpt_step = step
+
     # Per-worker live game tracking for real-time updates
     worker_live_game_ids = [0] * num_workers
     # Feature one game per worker: worker_feature[wid] = subgame ordinal shown;
@@ -354,6 +370,63 @@ def run_training(config, gui_enabled=False, num_workers=None):
     # the GUI moves/sec meter so it counts real throughput, not just the
     # featured games shown in the tiles.
     global_stats = {'total_moves': 0, 'total_games': 0}
+
+    def ingest_selfplay(r):
+        """Handle one finished self-play game right away: add it to the
+        buffer, log it, and hand the worker its next task.  Called both from
+        the main loop and from the drain loops inside a training session, so
+        workers are never left idle waiting for training to finish."""
+        nonlocal game_id, games_since_train, games_since_eval, positions_since_train
+
+        wid = r['worker_id']
+        gi  = r['game_info']
+        game_data = [(np.array(s, dtype=np.float32),
+                      np.array(p, dtype=np.float32),
+                      float(v),
+                      np.array(m, dtype=np.float32)) for s, p, v, m in r['game_data']]
+
+        positions_since_train += gi['num_positions']
+        buffer.add_game(game_data)
+        game_id           += 1
+        games_since_train += 1
+        games_since_eval  += 1
+
+        # GUI tile already updated via live_start/live_move/live_end messages.
+        stats.log_game(game_id=game_id, step=step,
+                       result=gi['result'], result_str=gi['result_str'],
+                       length=gi['length'], termination=gi['termination'],
+                       avg_mcts_depth=gi['avg_mcts_depth'],
+                       num_positions=gi['num_positions'],
+                       material_diff=gi.get('material_diff', 0))
+        tb.log_game(game_id=game_id, step=step,
+                    result=gi['result'], result_str=gi['result_str'],
+                    length=gi['length'], termination=gi['termination'],
+                    avg_mcts_depth=gi['avg_mcts_depth'],
+                    num_positions=gi['num_positions'],
+                    material_diff=gi.get('material_diff', 0))
+        stats.log_mcts_stats(game_id=game_id, step=step,
+                             avg_tree_depth=gi['avg_mcts_depth'],
+                             avg_sims_per_move=config.mcts.num_simulations)
+        tb.log_mcts_stats(game_id=game_id, step=step,
+                          avg_tree_depth=gi['avg_mcts_depth'],
+                          avg_sims_per_move=config.mcts.num_simulations)
+
+        print(f"  [W{wid}] Game {game_id}: {gi['termination']:18s} | "
+              f"{gi['result_str']} | {gi['length']} moves | buf={len(buffer)}")
+
+        # Push next self-play task to this worker immediately.  In GPU mode the
+        # inference server already holds the weights (see push_weights_to_gpu),
+        # so the task carries none; serializing + pickling the whole state_dict
+        # for every finished game was pure overhead.
+        task = {'type': 'selfplay'}
+        if not use_gpu:
+            wbuf = io.BytesIO()
+            torch.save(network.state_dict(), wbuf)
+            task['weights'] = wbuf.getvalue()
+        try:
+            psp._task_qs[wid].put_nowait(task)
+        except Exception:
+            pass
 
     try:
         while not _shutdown:
@@ -374,94 +447,60 @@ def run_training(config, gui_enabled=False, num_workers=None):
             if result.get('type') != 'selfplay':
                 continue
 
-            wid = result['worker_id']
-
-            # Deserialise
-            raw       = result['game_data']
-            game_data = [(np.array(s,dtype=np.float32),
-                        np.array(p,dtype=np.float32),
-                        float(v),
-                        np.array(m,dtype=np.float32)) for s,p,v,m in raw]
-            game_info = result['game_info']
-            fens      = result.get('fens', [])
-            moves     = result.get('moves', [])
-            mcts_s    = result.get('mcts_stats', [])
-
-            positions_since_train += game_info['num_positions']   # track new data
-            buffer.add_game(game_data)
-            game_id          += 1
-            games_since_train += 1
-            games_since_eval  += 1
-
-            # GUI tile already updated via live_start/live_move/live_end messages.
-            # No need to update LiveGameState again here since the live messages
-            # already did the incremental updates.
-
-            # Stats
-            stats.log_game(game_id=game_id, step=step,
-                           result=game_info['result'], result_str=game_info['result_str'],
-                           length=game_info['length'], termination=game_info['termination'],
-                           avg_mcts_depth=game_info['avg_mcts_depth'],
-                           num_positions=game_info['num_positions'],
-                           material_diff=game_info.get('material_diff', 0))
-            tb.log_game(game_id=game_id, step=step,
-                        result=game_info['result'], result_str=game_info['result_str'],
-                        length=game_info['length'], termination=game_info['termination'],
-                        avg_mcts_depth=game_info['avg_mcts_depth'],
-                        num_positions=game_info['num_positions'],
-                        material_diff=game_info.get('material_diff', 0))
-            stats.log_mcts_stats(game_id=game_id, step=step,
-                                 avg_tree_depth=game_info['avg_mcts_depth'],
-                                 avg_sims_per_move=config.mcts.num_simulations)
-            tb.log_mcts_stats(game_id=game_id, step=step,
-                              avg_tree_depth=game_info['avg_mcts_depth'],
-                              avg_sims_per_move=config.mcts.num_simulations)
-
-            print(f"  [W{wid}] Game {game_id}: {game_info['termination']:18s} | "
-                  f"{game_info['result_str']} | {game_info['length']} moves | buf={len(buffer)}")
-
-            # ── Push next self-play task to this worker immediately ──
-            import torch as _torch, io as _io
-            buf2 = _io.BytesIO()
-            _torch.save(network.state_dict(), buf2)
-            wb = buf2.getvalue()
-            try: psp._task_qs[wid].put_nowait({'type':'selfplay','weights':wb})
-            except: pass
+            ingest_selfplay(result)
 
             # ── Training ──
             if (games_since_train >= train_interval
-                    and len(buffer) >= int(config.training.batch_size)):
+                    and len(buffer) >= train_batch_size):
+                cycle_games     = games_since_train
+                cycle_positions = positions_since_train
                 games_since_train = 0
-
-                # Log how many new positions arrived since the last training step
-                print(f"[Cycle] Added {positions_since_train} positions, buffer size now {len(buffer)}")
                 positions_since_train = 0
+
+                # Number of gradient steps for this session.
+                if target_replay_ratio > 0:
+                    n_batches = int(round(target_replay_ratio * cycle_positions
+                                          / train_batch_size))
+                    n_batches = max(1, min(max_batches_per_step, n_batches))
+                else:
+                    n_batches = fixed_batches_per_step
+                n_samples = n_batches * train_batch_size
+
+                print(f"[Cycle] {cycle_games} games (total {game_id}), "
+                      f"+{cycle_positions} positions "
+                      f"({cycle_positions / max(1, cycle_games):.0f}/game), "
+                      f"buffer={len(buffer)}, batches={n_batches}, "
+                      f"replay_ratio={n_samples / max(1, cycle_positions):.2f}")
 
                 # Drain live GUI messages BEFORE and BETWEEN training batches
                 # so the browser stays in sync instead of showing a burst later.
-                _pending_selfplay = []
-                for r in psp.collect_available():
-                    if _dispatch_live_message(psp, worker_live_games, worker_live_game_ids,
-                                              worker_feature, worker_active, step, r,
-                                              global_stats):
-                        pass
-                    elif r.get('type') == 'selfplay' and not r.get('done'):
-                        _pending_selfplay.append(r)
-
-                ld = None
-                for _ in range(config.training.num_batches_per_step):
-                    if _shutdown: break
-                    # Drain any new live messages between batches
+                # Finished self-play games are ingested right away (so their
+                # workers get a new task immediately instead of idling until
+                # training ends).
+                def _drain_pending():
                     for r in psp.collect_available():
                         if _dispatch_live_message(psp, worker_live_games, worker_live_game_ids,
                                                   worker_feature, worker_active, step, r,
                                                   global_stats):
-                            pass
-                        elif r.get('type') == 'selfplay' and not r.get('done'):
-                            _pending_selfplay.append(r)
+                            continue
+                        if r.get('type') == 'selfplay' and not r.get('done'):
+                            ingest_selfplay(r)
+
+                _drain_pending()
+
+                ld = None
+                t_samp_sum = t_step_sum = 0.0
+                n_done = 0
+                for _ in range(n_batches):
+                    if _shutdown: break
+                    # Drain any new live messages / finished games between batches
+                    _drain_pending()
 
                     ld = train_one_step(network, optimizer, buffer,
-                                        int(config.training.batch_size), device)
+                                        train_batch_size, device)
+                    t_samp_sum += ld.get('t_sample', 0.0)
+                    t_step_sum += ld.get('t_total', 0.0)
+                    n_done += 1
                     step += 1
                     stats.log_training_step(step=step,
                                             policy_loss=ld['policy_loss'],
@@ -484,48 +523,6 @@ def run_training(config, gui_enabled=False, num_workers=None):
                 network.eval()
                 psp.push_weights_to_gpu(network)
 
-                # ── Handle self-play results that arrived while training ──
-                for pr in _pending_selfplay:
-                    pw   = pr['worker_id']
-                    praw = pr['game_data']
-                    pgi  = pr['game_info']
-                    pgd  = [(np.array(s,dtype=np.float32),
-                            np.array(p,dtype=np.float32),
-                            float(v),
-                            np.array(m,dtype=np.float32)) for s,p,v,m in praw]
-                    positions_since_train += pgi['num_positions']   # track pending games too
-                    buffer.add_game(pgd)
-                    game_id          += 1
-                    games_since_train += 1
-                    games_since_eval  += 1
-
-                    stats.log_game(game_id=game_id, step=step,
-                                   result=pgi['result'], result_str=pgi['result_str'],
-                                   length=pgi['length'], termination=pgi['termination'],
-                                   avg_mcts_depth=pgi['avg_mcts_depth'],
-                                   num_positions=pgi['num_positions'],
-                                   material_diff=pgi.get('material_diff', 0))
-                    tb.log_game(game_id=game_id, step=step,
-                                result=pgi['result'], result_str=pgi['result_str'],
-                                length=pgi['length'], termination=pgi['termination'],
-                                avg_mcts_depth=pgi['avg_mcts_depth'],
-                                num_positions=pgi['num_positions'],
-                                material_diff=pgi.get('material_diff', 0))
-                    stats.log_mcts_stats(game_id=game_id, step=step,
-                                         avg_tree_depth=pgi['avg_mcts_depth'],
-                                         avg_sims_per_move=config.mcts.num_simulations)
-                    tb.log_mcts_stats(game_id=game_id, step=step,
-                                      avg_tree_depth=pgi['avg_mcts_depth'],
-                                      avg_sims_per_move=config.mcts.num_simulations)
-
-                    print(f"  [W{pw}] Game {game_id}: {pgi['termination']:18s} | "
-                          f"{pgi['result_str']} | {pgi['length']} moves | buf={len(buffer)}")
-
-                    import torch as _torch2, io as _io2
-                    _b = _io2.BytesIO(); _torch2.save(network.state_dict(), _b); _wb2 = _b.getvalue()
-                    try: psp._task_qs[pw].put_nowait({'type':'selfplay','weights':_wb2})
-                    except: pass
-
                 # Buffer / confidence stats
                 od = buffer.get_outcome_distribution()
                 stats.log_buffer_stats(step=step, buffer_size=len(buffer),
@@ -535,9 +532,7 @@ def run_training(config, gui_enabled=False, num_workers=None):
                                     white_wins=od['white_wins'],
                                     black_wins=od['black_wins'], draws=od['draws'])
                 if len(buffer) > 0:
-                    n   = min(50, len(buffer))
-                    ix  = np.random.choice(len(buffer), size=n, replace=False)
-                    sts = np.array([buffer.buffer[i][0] for i in ix])
+                    sts = buffer.sample_states(50)
                     ps, vs = network.predictBatch(sts)
                     stats.log_network_stats(step,
                                             float(np.mean(np.max(ps,axis=1))),
@@ -546,9 +541,10 @@ def run_training(config, gui_enabled=False, num_workers=None):
                                          float(np.mean(np.max(ps,axis=1))),
                                          float(np.mean(np.abs(vs))))
 
-                # Checkpoint
-                ckpt_interval = int(getattr(config.training, 'checkpoint_interval', 0) or 0)
-                if ckpt_interval and step % ckpt_interval == 0:
+                # Checkpoint (triggered when step crosses a multiple of the
+                # interval, since n_batches varies per session)
+                if ckpt_interval and (step // ckpt_interval) > (last_ckpt_step // ckpt_interval):
+                    last_ckpt_step = step
                     ex = {'game_id':game_id,'eval_game_counter':eval_game_counter,
                           'best_elo':evaluator.best_elo,'ref_elo':evaluator.ref_elo}
                     cp = checkpoints_dir / f"step_{step}.pt"
@@ -559,7 +555,9 @@ def run_training(config, gui_enabled=False, num_workers=None):
                     print(f"  Checkpoint: {cp}  Buffer: {len(buffer)} positions")
 
                 if ld is not None:
-                    print(f"  [train] step={step} pol={ld['policy_loss']:.4f} val={ld['value_loss']:.4f}")
+                    print(f"  [train] step={step} pol={ld['policy_loss']:.4f} val={ld['value_loss']:.4f} "
+                          f"| avg/batch: sample={1000*t_samp_sum/max(1,n_done):.0f}ms "
+                          f"total={1000*t_step_sum/max(1,n_done):.0f}ms")
 
             # ── Eval ──────────────────────────────────────────────────────
             if games_since_eval >= eval_interval and not _shutdown:

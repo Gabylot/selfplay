@@ -26,12 +26,13 @@ Public driving surface (subset of ``mcts.MCTS``):
 
 import os
 import ctypes
+import weakref
 
 import numpy as np
 import chess
 
 import game_api
-from encoding import (NUM_ACTIONS, board_to_tensor, move_to_policy_index)
+from encoding import board_to_tensor, move_to_policy_index
 
 
 _DEFAULT_DLL = os.path.join(os.path.dirname(os.path.abspath(__file__)),
@@ -49,12 +50,19 @@ class _RNode:
     a Python handle; the arena owns everything else.
     """
 
-    __slots__ = ('rs_id', '_eng', '_children')
+    __slots__ = ('rs_id', '_eng_ref', '_children')
 
     def __init__(self, eng, rs_id):
-        self._eng = eng
+        # Weak back-reference: the engine owns its _RNodes, so a strong ref
+        # here would form a cycle and stop the engine (and its arena) from
+        # being freed promptly between games.
+        self._eng_ref = weakref.ref(eng)
         self.rs_id = rs_id
         self._children = None
+
+    @property
+    def _eng(self):
+        return self._eng_ref()
 
     @property
     def children(self):
@@ -99,14 +107,15 @@ class RustMCTS:
         self._lib = ctypes.CDLL(dll_path or _DEFAULT_DLL)
         self._bind()
 
-        # Per-search Python-side caches (cleared on reset()).
+        # Per-engine arena handle (allows several engines per process/thread).
+        self._h = self._lib.mcts_rs_new_arena()
+
+        # Per-search Python-side caches (bounded per game).
         self._boards = {}     # rs_id -> chess.Board
         self._moves = {}      # rs_id -> move object (FastMove / chess.Move)
         self._rnodes = {}     # rs_id -> _RNode
         self._terminal = {}   # rs_id -> bool
         self._tvalue = {}     # rs_id -> float
-
-        self._reset()
 
     # ── FFI ─────────────────────────────────────────────────────────────────
     def _bind(self):
@@ -115,6 +124,11 @@ class RustMCTS:
                                 ctypes.c_longlong, ctypes.c_size_t)
         pi, pf = ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_float)
         L.mcts_rs_init()
+        L.mcts_rs_new_arena.restype = ci
+        L.mcts_rs_use_arena.argtypes = [ci]
+        L.mcts_rs_use_arena.restype = None
+        L.mcts_rs_free_arena.argtypes = [ci]
+        L.mcts_rs_free_arena.restype = None
         L.mcts_rs_root.restype = ci
         L.mcts_rs_reset.restype = None
         L.mcts_rs_expand_batch.argtypes = [ci, pi, pf, csz, pi]
@@ -129,6 +143,8 @@ class RustMCTS:
         L.mcts_rs_children2.restype = ci
         L.mcts_rs_select_batch.argtypes = [ci, cf, ci, pi, csz, pi]
         L.mcts_rs_select_batch.restype = ci
+        L.mcts_rs_select_batch_ex.argtypes = [ci, cf, ci, pi, csz, pi, pi, csz]
+        L.mcts_rs_select_batch_ex.restype = ci
         L.mcts_rs_backprop.argtypes = [ci, cd]
         L.mcts_rs_get_n.argtypes = [ci]
         L.mcts_rs_get_n.restype = cll
@@ -136,18 +152,31 @@ class RustMCTS:
         L.mcts_rs_get_w.restype = cd
         L.mcts_rs_get_policy.argtypes = [ci]
         L.mcts_rs_get_policy.restype = cf
+        L.mcts_rs_get_policy_orig.argtypes = [ci]
+        L.mcts_rs_get_policy_orig.restype = cf
         L.mcts_rs_set_policy.argtypes = [ci, cf]
         L.mcts_rs_set_policy.restype = None
         L.mcts_rs_recycle.argtypes = [ci]
         L.mcts_rs_recycle.restype = None
 
-    def _reset(self):
-        self._lib.mcts_rs_reset()
-        self._boards.clear()
-        self._moves.clear()
-        self._rnodes.clear()
-        self._terminal.clear()
-        self._tvalue.clear()
+    def _use(self):
+        """Select this engine's arena on the calling thread."""
+        self._lib.mcts_rs_use_arena(self._h)
+
+    def close(self):
+        """Release this engine's arena back to the pool."""
+        if getattr(self, '_h', None) is not None:
+            try:
+                self._lib.mcts_rs_free_arena(self._h)
+            except Exception:
+                pass
+            self._h = None
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
 
     # ── board / move lookups ────────────────────────────────────────────────
     def board_of(self, rs_id):
@@ -228,11 +257,13 @@ class RustMCTS:
 
     # ── public API (mirrors MCTS) ───────────────────────────────────────────
     def get_root(self, board):
+        self._use()
         rs = self._lib.mcts_rs_root()
         self._boards[rs] = board.copy()
         return self._rnode(rs)
 
     def recycle_tree(self, root, move):
+        self._use()
         child = self._child_for_move(root, move)
         if child is None:
             return None
@@ -261,27 +292,35 @@ class RustMCTS:
 
     def search(self, root):
         """Run MCTS from root. Returns (visit_policy, best_move, stats)."""
+        self._use()
         if not root.is_expanded:
             self._expand_node(root.rs_id)
 
         self._add_dirichlet_noise(root)
 
         target_new = max(0, self.num_simulations - self._N(root.rs_id))
-        sims = 0
-        total_depth = 0
-        max_depth = 0
-        while sims < target_new:
-            bs = min(self.batch_size, target_new - sims)
-            leaves = self._batch_select(root.rs_id, bs)
-            if not leaves:
-                break
-            values = self._evaluate_batch([rs for rs, _d in leaves])
-            for (rs, depth), value in zip(leaves, values):
-                self._lib.mcts_rs_backprop(rs, float(value))
-                if depth > max_depth:
-                    max_depth = depth
-                total_depth += depth
-            sims += len(leaves)
+        use_pipeline = (self.inference_pipeline > 1
+                        and hasattr(self.network, 'predict_batch_async')
+                        and hasattr(self.network, 'wait_result'))
+
+        if self.batch_size > 1 and use_pipeline:
+            sims, total_depth, max_depth = self._run_pipelined(root.rs_id, target_new)
+        else:
+            sims = 0
+            total_depth = 0
+            max_depth = 0
+            while sims < target_new:
+                bs = min(self.batch_size, target_new - sims)
+                leaves = self._batch_select(root.rs_id, bs)
+                if not leaves:
+                    break
+                values = self._evaluate_batch([rs for rs, _d in leaves])
+                for (rs, depth), value in zip(leaves, values):
+                    self._lib.mcts_rs_backprop(rs, float(value))
+                    if depth > max_depth:
+                        max_depth = depth
+                    total_depth += depth
+                sims += len(leaves)
 
         visit_policy, best_move = self._get_visit_policy(root)
         stats = {
@@ -291,11 +330,78 @@ class RustMCTS:
         }
         return visit_policy, best_move, stats
 
-    def _batch_select(self, rs_id, batch_size):
+    def _run_pipelined(self, root_id, target_new):
+        """Async-inference batched search (mirrors MCTS's pipelined mode).
+
+        Keeps up to ``inference_pipeline`` evaluation batches in flight so tree
+        work (selection + backprop of older batches) overlaps the network
+        round-trip.  Results are applied strictly in submission order (FIFO),
+        which keeps virtual-loss bookkeeping consistent with collection order.
+        """
+        from collections import deque
+        P = max(1, self.inference_pipeline)
+        inflight = deque()      # (req_id, leaves, tv, ex_idx, ex_nodes, ids)
+        outstanding = 0         # leaves dispatched but not yet applied
+        sims = 0
+        total_depth = 0
+        max_depth = 0
+
+        while True:
+            # Top the pipeline up.
+            while len(inflight) < P and sims + outstanding < target_new:
+                bs = min(self.batch_size, target_new - sims - outstanding)
+                excluded = set()
+                for entry in inflight:
+                    excluded.update(entry[5])
+                leaves = self._batch_select(root_id, bs, exclude=excluded)
+                if not leaves:
+                    break
+
+                tv, ex_idx, ex_nodes = self._split_leaves(leaves)
+                if ex_nodes:
+                    states = np.stack(
+                        [board_to_tensor(self.board_of(rs)) for rs in ex_nodes],
+                        axis=0)
+                    req_id = self.network.predict_batch_async(states)
+                else:
+                    req_id = None
+                ids = {rs for rs, _d in leaves}
+                inflight.append((req_id, leaves, tv, ex_idx, ex_nodes, ids))
+                outstanding += len(leaves)
+
+            if not inflight:
+                break
+
+            req_id, leaves, tv, ex_idx, ex_nodes, _ids = inflight.popleft()
+            outstanding -= len(leaves)
+
+            if req_id is not None:
+                policies, vals = self.network.wait_result(req_id)
+                values = self._apply_network_results(
+                    leaves, tv, ex_idx, ex_nodes, policies, vals)
+            else:
+                values = [tv.get(i, 0.0) for i in range(len(leaves))]
+
+            for (rs, depth), value in zip(leaves, values):
+                self._lib.mcts_rs_backprop(rs, float(value))
+                if depth > max_depth:
+                    max_depth = depth
+                total_depth += depth
+            sims += len(leaves)
+
+        return sims, total_depth, max_depth
+
+    def _batch_select(self, rs_id, batch_size, exclude=None):
         arr = (ctypes.c_int * batch_size)()
         depths = (ctypes.c_int * batch_size)()
-        n = self._lib.mcts_rs_select_batch(
-            rs_id, self.c_puct, batch_size, arr, batch_size, depths)
+        if exclude:
+            ex = (ctypes.c_int * len(exclude))(*exclude)
+            n = self._lib.mcts_rs_select_batch_ex(
+                rs_id, self.c_puct, batch_size, arr, batch_size, depths,
+                ex, len(exclude))
+        else:
+            n = self._lib.mcts_rs_select_batch(
+                rs_id, self.c_puct, batch_size, arr, batch_size, depths)
         return [(int(arr[i]), int(depths[i])) for i in range(n)]
 
     # ── expansion / evaluation ──────────────────────────────────────────────
@@ -359,28 +465,44 @@ class RustMCTS:
             self._moves[rid] = valid_moves[k]
         return 0.0
 
-    def _evaluate_batch(self, leaf_rs_ids):
-        values = [0.0] * len(leaf_rs_ids)
-        expandable = []          # (index, rs_id)
-        for i, rs in enumerate(leaf_rs_ids):
+    def _split_leaves(self, leaves):
+        """Classify selected leaves into terminal vs expandable.
+
+        Mirrors ``mcts.MCTS._split_terminal_leaves``.  Returns
+        ``(terminal_values, expandable_idx, expandable_rs)`` where
+        ``terminal_values`` maps a leaf index to its value.
+        """
+        tv = {}
+        ex_idx = []
+        ex_rs = []
+        for i, (rs, _d) in enumerate(leaves):
             if self._is_terminal(rs):
-                values[i] = self._get_terminal_value(rs)
+                tv[i] = self._get_terminal_value(rs)
             elif not self._lib.mcts_rs_is_expanded(rs):
-                expandable.append((i, rs))
+                ex_idx.append(i)
+                ex_rs.append(rs)
             else:
-                values[i] = self._get_terminal_value(rs)
+                tv[i] = self._get_terminal_value(rs)
+        return tv, ex_idx, ex_rs
 
-        if expandable:
+    def _apply_network_results(self, leaves, tv, ex_idx, ex_rs, policies, vals):
+        """Expand leaves with network outputs; return values in leaf order."""
+        policies = np.asarray(policies, dtype=np.float32)
+        for k, rs in enumerate(ex_rs):
+            self._expand_with_data(rs, policies[k], float(vals[k]))
+            tv[ex_idx[k]] = float(vals[k])
+        return [tv.get(i, 0.0) for i in range(len(leaves))]
+
+    def _evaluate_batch(self, leaf_rs_ids):
+        leaves = [(rs, 0) for rs in leaf_rs_ids]
+        tv, ex_idx, ex_rs = self._split_leaves(leaves)
+        if ex_rs:
             states = np.stack(
-                [board_to_tensor(self.board_of(rs)) for _i, rs in expandable],
-                axis=0)
+                [board_to_tensor(self.board_of(rs)) for rs in ex_rs], axis=0)
             policies, vals = self.network.predictBatch(states)
-            policies = np.asarray(policies, dtype=np.float32)
-            for k, (i, rs) in enumerate(expandable):
-                self._expand_with_data(rs, policies[k], float(vals[k]))
-                values[i] = float(vals[k])
-
-        return values
+            return self._apply_network_results(
+                leaves, tv, ex_idx, ex_rs, policies, vals)
+        return [tv.get(i, 0.0) for i in range(len(leaves))]
 
     def _add_dirichlet_noise(self, root):
         if self.dirichlet_alpha <= 0 or self.dirichlet_epsilon <= 0:
@@ -390,16 +512,23 @@ class RustMCTS:
             return
         noise = np.random.dirichlet([self.dirichlet_alpha] * len(children))
         for i, child in enumerate(children.values()):
-            orig = float(self._lib.mcts_rs_get_policy(child.rs_id))
+            orig = float(self._lib.mcts_rs_get_policy_orig(child.rs_id))
             newp = (1 - self.dirichlet_epsilon) * orig + self.dirichlet_epsilon * noise[i]
             self._lib.mcts_rs_set_policy(child.rs_id, newp)
 
     # ── move selection / stats (reads from arena) ───────────────────────────
     def _get_visit_policy(self, root):
         children = root.children
-        visit_policy = np.zeros(NUM_ACTIONS, dtype=np.float32)
+        visit_policy = np.zeros(game_api.num_actions(), dtype=np.float32)
         if not children:
             return visit_policy, None
+
+        if self.force_mate_in_one and game_api.is_game("chess"):
+            mate_move = self._find_checkmate_child(root)
+            if mate_move is not None:
+                visit_policy[game_api.to_index(root.board, mate_move)] = 1.0
+                return visit_policy, mate_move
+
         total = 0
         best_idx = None
         best_n = -1
@@ -414,28 +543,59 @@ class RustMCTS:
             return visit_policy, None
         return visit_policy / total, self._moves.get(children[best_idx].rs_id)
 
+    def _find_checkmate_child(self, root):
+        """Return a root child move that delivers checkmate (or None).
+
+        Mirrors ``mcts.MCTS._find_checkmate_child`` so the mate-in-one
+        override produces identical targets.
+        """
+        for child in root.children.values():
+            if self._N(child.rs_id) > 0 and self.board_of(child.rs_id).is_checkmate():
+                return self._moves.get(child.rs_id)
+        return None
+
     def select_move_with_temperature(self, root, temperature):
-        """Same contract as MCTS.select_move_with_temperature."""
+        """Same contract as MCTS.select_move_with_temperature.
+
+        - A root checkmate move wins outright (when ``force_mate_in_one``).
+        - Greedy (``temperature < 1e-8``): one-hot on the most-visited child.
+        - Otherwise: sample proportionally to ``N ** (1/T)`` for the chosen
+          move, but return the *full normalised visit distribution* as the
+          policy target (matches MCTS).
+        """
+        self._use()
+        visit_policy = np.zeros(game_api.num_actions(), dtype=np.float32)
         children = root.children
-        visit_policy = np.zeros(NUM_ACTIONS, dtype=np.float32)
         if not children:
             return visit_policy, None
+
+        if self.force_mate_in_one and game_api.is_game("chess"):
+            mate_move = self._find_checkmate_child(root)
+            if mate_move is not None:
+                visit_policy[game_api.to_index(root.board, mate_move)] = 1.0
+                return visit_policy, mate_move
+
         counts = {a: self._N(c.rs_id) for a, c in children.items()}
         total = sum(counts.values())
         if total == 0:
             return visit_policy, None
+
         if temperature < 1e-8:
             best_idx = max(counts, key=counts.get)
-        else:
-            idxs = list(counts.keys())
-            c = np.array([counts[i] for i in idxs], dtype=np.float64)
-            probs = c ** (1.0 / temperature)
-            probs = probs / probs.sum()
-            best_idx = idxs[int(np.random.choice(len(idxs), p=probs))]
-        visit_policy[best_idx] = 1.0
-        return visit_policy, self._moves.get(children[best_idx].rs_id)
+            visit_policy[best_idx] = 1.0
+            return visit_policy, self._moves.get(children[best_idx].rs_id)
+
+        idxs = list(counts.keys())
+        c = np.array([counts[i] for i in idxs], dtype=np.float64)
+        probs = c ** (1.0 / temperature)
+        probs = probs / probs.sum()
+        chosen_idx = idxs[int(np.random.choice(len(idxs), p=probs))]
+        for idx in idxs:
+            visit_policy[idx] = counts[idx] / total
+        return visit_policy, self._moves.get(children[chosen_idx].rs_id)
 
     def get_root_child_stats(self, root):
+        self._use()
         stats = []
         for a, child in root.children.items():
             n = self._N(child.rs_id)

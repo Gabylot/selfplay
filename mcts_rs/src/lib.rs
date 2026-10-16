@@ -13,7 +13,8 @@
 //!
 //! Exposed as a `cdylib` and driven from Python via `ctypes`.
 
-use std::sync::{Mutex, OnceLock};
+use std::cell::{Cell, RefCell};
+use std::sync::Mutex;
 
 const NONE: i32 = -1;
 
@@ -36,22 +37,66 @@ struct Arena {
     nodes: Vec<Node>,
     // children[node] = list of (child_node_id). Node index == its own id.
     children: Vec<Vec<i32>>,
-    // This arena is single-threaded per process (one worker per process), so we
-    // stash a per-search scratch buffer to avoid allocation churn.
+    // Per-search scratch buffers to avoid allocation churn.
     scratch_selected: Vec<i32>,
     scratch_path: Vec<i32>,
 }
 
-fn arena() -> &'static Mutex<Arena> {
-    static ARENA: OnceLock<Mutex<Arena>> = OnceLock::new();
-    ARENA.get_or_init(|| {
-        Mutex::new(Arena {
+impl Arena {
+    fn new() -> Self {
+        Arena {
             nodes: Vec::new(),
             children: Vec::new(),
             scratch_selected: Vec::with_capacity(4096),
             scratch_path: Vec::with_capacity(128),
-        })
-    })
+        }
+    }
+    fn clear(&mut self) {
+        self.nodes.clear();
+        self.children.clear();
+        self.scratch_selected.clear();
+        self.scratch_path.clear();
+    }
+}
+
+// Arenas are addressed by a small integer handle so several engines can coexist
+// in one process/thread (e.g. gating eval runs engine A vs engine B).  The
+// handle list only changes on engine create/destroy; the hot path reads the
+// calling thread's current arena pointer directly (no lock).
+static ARENAS: Mutex<Vec<&'static Mutex<Arena>>> = Mutex::new(Vec::new());
+
+thread_local! {
+    static CUR: Cell<*const Mutex<Arena>> = const { Cell::new(std::ptr::null()) };
+    static FREE: RefCell<Vec<i32>> = const { RefCell::new(Vec::new()) };
+}
+
+fn arena_at(h: i32) -> Option<&'static Mutex<Arena>> {
+    let v = ARENAS.lock().unwrap();
+    if h >= 0 && (h as usize) < v.len() {
+        Some(v[h as usize])
+    } else {
+        None
+    }
+}
+
+fn ensure_default() -> &'static Mutex<Arena> {
+    let mut v = ARENAS.lock().unwrap();
+    if v.is_empty() {
+        v.push(Box::leak(Box::new(Mutex::new(Arena::new()))));
+    }
+    v[0]
+}
+
+/// The calling thread's current arena (falls back to a default slot for the
+/// low-level test driver, which never calls `mcts_rs_new_arena`).
+fn arena() -> &'static Mutex<Arena> {
+    let p = CUR.with(|c| c.get());
+    if p.is_null() {
+        let a = ensure_default();
+        CUR.with(|c| c.set(a as *const _));
+        return a;
+    }
+    unsafe { &*p }
 }
 
 fn create_node(a: &mut Arena, parent: i32, policy: f32) -> i32 {
@@ -104,15 +149,55 @@ pub extern "C" fn mcts_rs_init() {
     let _ = arena();
 }
 
+/// Allocate (or recycle) an arena handle for a new engine instance.  Returns a
+/// non-negative handle to pass to `mcts_rs_use_arena` / `mcts_rs_free_arena`.
+#[no_mangle]
+pub extern "C" fn mcts_rs_new_arena() -> i32 {
+    if let Some(h) = FREE.with(|f| f.borrow_mut().pop()) {
+        if let Some(a) = arena_at(h) {
+            a.lock().unwrap().clear();
+        }
+        if let Some(a) = arena_at(h) {
+            CUR.with(|c| c.set(a as *const _));
+        }
+        return h;
+    }
+    let leaked: &'static Mutex<Arena> = Box::leak(Box::new(Mutex::new(Arena::new())));
+    let mut v = ARENAS.lock().unwrap();
+    let h = v.len() as i32;
+    v.push(leaked);
+    CUR.with(|c| c.set(leaked as *const _));
+    h
+}
+
+/// Make `handle` the calling thread's current arena for subsequent calls.
+#[no_mangle]
+pub extern "C" fn mcts_rs_use_arena(handle: i32) {
+    if let Some(a) = arena_at(handle) {
+        CUR.with(|c| c.set(a as *const _));
+    }
+}
+
+/// Return an arena to the free list (cleared on next reuse).
+#[no_mangle]
+pub extern "C" fn mcts_rs_free_arena(handle: i32) {
+    if let Some(a) = arena_at(handle) {
+        a.lock().unwrap().clear();
+    }
+    FREE.with(|f| {
+        let mut f = f.borrow_mut();
+        if !f.contains(&handle) {
+            f.push(handle);
+        }
+    });
+}
+
 /// Reset the arena (drop all nodes). Useful between games if a worker reuses
 /// the module.
 #[no_mangle]
 pub extern "C" fn mcts_rs_reset() {
     let mut a = arena().lock().unwrap();
-    a.nodes.clear();
-    a.children.clear();
-    a.scratch_selected.clear();
-    a.scratch_path.clear();
+    a.clear();
 }
 
 /// Create the root node for a search. Returns its id.
@@ -161,6 +246,17 @@ pub extern "C" fn mcts_rs_get_policy(node: i32) -> f32 {
     }
 }
 
+/// Read a node's untouched prior (for Dirichlet noise / recycling).
+#[no_mangle]
+pub extern "C" fn mcts_rs_get_policy_orig(node: i32) -> f32 {
+    let a = arena().lock().unwrap();
+    if node >= 0 && (node as usize) < a.nodes.len() {
+        a.nodes[node as usize].policy_orig
+    } else {
+        f32::NAN
+    }
+}
+
 /// Read back and pop a node's children as ids into `out`. Returns count.
 #[no_mangle]
 pub extern "C" fn mcts_rs_children(node: i32, out: *mut i32, max_out: usize) -> i32 {
@@ -189,6 +285,44 @@ pub extern "C" fn mcts_rs_select_batch(
     out_depths: *mut i32,
 ) -> i32 {
     let mut a = arena().lock().unwrap();
+    select_batch_impl(&mut a, root, c_puct, batch_size, out_leaves, max_out,
+                      out_depths, &[])
+}
+
+/// Like `mcts_rs_select_batch`, but never selects a node whose id appears in
+/// `exclude` (used by the async inference pipeline to avoid dispatching the
+/// same leaf twice while an earlier batch is still in flight).
+#[no_mangle]
+pub extern "C" fn mcts_rs_select_batch_ex(
+    root: i32,
+    c_puct: f32,
+    batch_size: i32,
+    out_leaves: *mut i32,
+    max_out: usize,
+    out_depths: *mut i32,
+    exclude: *const i32,
+    exclude_count: usize,
+) -> i32 {
+    let excl = if exclude.is_null() || exclude_count == 0 {
+        Vec::new()
+    } else {
+        unsafe { std::slice::from_raw_parts(exclude, exclude_count).to_vec() }
+    };
+    let mut a = arena().lock().unwrap();
+    select_batch_impl(&mut a, root, c_puct, batch_size, out_leaves, max_out,
+                      out_depths, &excl)
+}
+
+fn select_batch_impl(
+    a: &mut Arena,
+    root: i32,
+    c_puct: f32,
+    batch_size: i32,
+    out_leaves: *mut i32,
+    max_out: usize,
+    out_depths: *mut i32,
+    exclude: &[i32],
+) -> i32 {
     if root < 0 || root as usize >= a.nodes.len() {
         return 0;
     }
@@ -225,9 +359,10 @@ pub extern "C" fn mcts_rs_select_batch(
             node = next;
         }
 
-        // dedup: if this leaf was already selected in this batch, roll back
-        // the virtual losses we applied to interior nodes and retry.
-        if a.scratch_selected.contains(&node) {
+        // dedup: if this leaf was already selected in this batch (or is
+        // excluded), roll back the virtual losses we applied to interior
+        // nodes and retry.
+        if a.scratch_selected.contains(&node) || exclude.contains(&node) {
             let path = std::mem::take(&mut a.scratch_path);
             for n in &path {
                 a.nodes[*n as usize].virtual_loss =

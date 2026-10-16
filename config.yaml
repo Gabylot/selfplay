@@ -9,19 +9,19 @@ game:
 
 # --- Network Architecture ---
 network:
-  num_residual_blocks: 8
-  num_filters: 64
-  num_policy_channels: 64
-  num_value_channels: 1
-  value_fc_size: 128
+  num_residual_blocks: 2
+  num_filters: 32
+  num_policy_channels: 32
+  num_value_channels: 8
+  value_fc_size: 64
 
 # --- MCTS ---
 mcts:
-  num_simulations: 400       # Per move (tunable: 50-800)
+  num_simulations: 200       # Per move (tunable: 50-800)
   c_puct: 1.5                # PUCT exploration constant
   dirichlet_alpha: 0.25        # Dirichlet noise alpha
   dirichlet_epsilon: 0.3     # Weight of noise vs root prior
-  batch_size: 16               # Batch size for tree-parallel MCTS (1 = sequential, no virtual loss)
+  batch_size: 8               # Batch size for tree-parallel MCTS (1 = sequential, no virtual loss)
   c_virtual_loss: 0.5         # Virtual loss penalty for batch MCTS
   force_mate_in_one: false     # Force a one-hot policy for a root checkmate move (mate-in-1)
 
@@ -45,7 +45,7 @@ selfplay:
                               # start_fen.
   start_colors_random: false   # Flip colour assignment per game for asymmetric
                               # specs (e.g. "KQQk"): either side gets the queens.
-  adjudicate_material: false   # When max length hit, judge by material instead of draw
+  adjudicate_material: true   # When max length hit, judge by material instead of draw
   # Material values for adjudication
   piece_values:
     P: 1
@@ -62,8 +62,8 @@ selfplay:
   endgame_temperature: 0.1
   endgame_piece_gate: 1
   endgame_num_simulations: 200
-  adjudicate_graded: false     # use tanh grading instead of flat ±1
-  adjudicate_scaling: 7.0     # queen = ~0.76, rook = ~0.51, pawn = ~0.11
+  adjudicate_graded: true     # use tanh grading instead of flat ±1
+  adjudicate_scaling: 9.0     # queen = ~0.76, rook = ~0.51, pawn = ~0.11
   # Exact forced-mate override for endgame conversion.
   # When true, self-play move selection is overridden by a proof search
   # when a forced mate within force_mate_max_plies exists on a board
@@ -79,7 +79,7 @@ selfplay:
 
 # --- Replay Buffer ---
 buffer:
-  max_size: 50000            # Max positions in replay buffer
+  max_size: 200000            # Max positions in replay buffer
 
 # --- Training ---
 training:
@@ -87,9 +87,11 @@ training:
   learning_rate: 0.02
   momentum: 0.9
   weight_decay: 1e-4
-  num_batches_per_step: 4    # Number of gradient steps per training session
+  num_batches_per_step: 24    # Number of gradient steps per training session
   checkpoint_interval: 2000     # Save checkpoint every N training steps
   training_steps_per_iteration: 10  # Games completed between training sessions
+  target_replay_ratio: 8       # trains each new position ~8 times; 0 = fixed num_batches_per_step
+  max_batches_per_step: 64     # cap per session so a burst of games can't stall self-play
 
 # --- Evaluation ---
 evaluation:

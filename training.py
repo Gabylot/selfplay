@@ -9,7 +9,14 @@ NOTE: policy_loss_fn now receives a legal_move_mask for every sample so the
 softmax normalizes only over actually-legal moves in that position, instead
 of over the full 4672-action space (which wastes gradient signal modeling
 probabilities for moves that could never be played).
+
+NOTE: the replay buffer hands back compact arrays (states/policies float16,
+masks uint8).  They are uploaded in that compact form and converted to
+float32 on the device, which cuts host->device traffic by ~2.3x.  The four
+scalar results are fetched with a single device sync instead of four.
 """
+
+import time
 
 import torch
 import torch.nn as nn
@@ -76,19 +83,25 @@ def train_one_step(model: AlphaZeroNet, optimizer: torch.optim.Optimizer,
         grad_clip_norm: Max gradient norm for clipping (None to disable)
     
     Returns:
-        Dict with 'policy_loss', 'value_loss', 'total_loss', 'grad_norm' (all float scalars)
+        Dict with 'policy_loss', 'value_loss', 'total_loss', 'grad_norm'
+        (float scalars) plus timing: 't_sample' (seconds spent building the
+        batch on the CPU) and 't_total' (whole step incl. device sync).
     """
+    t_start = time.perf_counter()
     model.train()
     
     if device is None:
         device = next(model.parameters()).device
     
-    # Sample batch from replay buffer (now includes legal-move masks)
+    # Sample batch from replay buffer (includes legal-move masks).
     states, policies, values, masks = replay_buffer.sample_batch(batch_size)
-    states = torch.from_numpy(states).float().to(device)
-    policies = torch.from_numpy(policies).float().to(device)
-    values = torch.from_numpy(values).float().to(device)
-    masks = torch.from_numpy(masks).float().to(device)
+    t_sample = time.perf_counter() - t_start
+
+    # Upload in compact dtypes, convert to float32 on the device.
+    states = torch.from_numpy(states).to(device).float()
+    policies = torch.from_numpy(policies).to(device).float()
+    values = torch.from_numpy(values).to(device).float()
+    masks = torch.from_numpy(masks).to(device).float()
     
     # Forward pass
     policy_logits, value_pred = model(states)
@@ -102,17 +115,26 @@ def train_one_step(model: AlphaZeroNet, optimizer: torch.optim.Optimizer,
     optimizer.zero_grad()
     total_loss.backward()
 
-    grad_norm = None
     if grad_clip_norm is not None:
         grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip_norm)
+    else:
+        grad_norm = torch.zeros((), device=device)
 
     optimizer.step()
+
+    # One device sync for all four scalars (was four separate .item() calls).
+    p_f, v_f, t_f, g_f = torch.stack([
+        p_loss.detach().float(), v_loss.detach().float(),
+        total_loss.detach().float(), grad_norm.detach().float(),
+    ]).tolist()
     
     return {
-        'policy_loss': float(p_loss.item()),
-        'value_loss': float(v_loss.item()),
-        'total_loss': float(total_loss.item()),
-        'grad_norm': float(grad_norm.item()) if grad_norm is not None else 0.0,
+        'policy_loss': p_f,
+        'value_loss': v_f,
+        'total_loss': t_f,
+        'grad_norm': g_f,
+        't_sample': t_sample,
+        't_total': time.perf_counter() - t_start,
     }
 
 

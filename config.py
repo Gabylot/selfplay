@@ -40,6 +40,10 @@ def load_config(path: Optional[str] = None) -> dict:
             "batch_size": 8,
             "c_virtual_loss": 0.5,
             "force_mate_in_one": True,
+            # Use the Rust MCTS backend (rust_mcts.RustMCTS) for self-play.
+            # Same move-selection targets as the Python engine at ~2x speed;
+            # set false to force the pure-Python mcts.MCTS path.
+            "use_rust_engine": True,
         },
         "selfplay": {
             "network_source": "latest",

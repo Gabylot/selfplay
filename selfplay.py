@@ -23,6 +23,15 @@ is True (default), per-worker shared-memory buffers are allocated to eliminate
 pickle/pipe overhead for state and policy/value arrays. Only ~100 bytes of
 metadata travel through the queue per inference request.
 
+NOTE 4: the ReplayBuffer stores positions in preallocated numpy arrays
+(states/policies as float16, legal-move masks as uint8) instead of a Python
+list of float32 tuples.  That cuts memory per chess position from ~67 KB to
+~29 KB and makes ``sample_batch`` a few fancy-indexing copies instead of
+stacking ~3000 small arrays on every training step.  The arrays are
+allocated lazily from the shapes of the first game added, so any game
+(chess, connect4, ...) works.  float16 represents 0/1 planes and integer
+counters up to 2048 exactly; policy targets keep ~3 significant digits.
+
 All game-specific mechanics (chess, connect4, ...) are accessed through
 ``game_api``; see game_api.py.
 """
@@ -41,101 +50,201 @@ import game_api
 from encoding import board_to_tensor, get_legal_move_mask, NUM_ACTIONS
 from network import AlphaZeroNet
 from mcts import MCTS
+from rust_mcts import RustMCTS
 from inference_client import InferenceClient
 from shared_memory_transport import SharedMemoryTransport
-from forced_mate import ForceMateMCTS, reset_memo
+from forced_mate import ForceMateMCTS, ForceMateRustMCTS, reset_memo
+
+
+def _engine_classes(config, force_mate):
+    """Pick the MCTS backend classes for the given config.
+
+    Returns ``(plain_cls, force_mate_cls)``.  The Rust backend is used when
+    ``mcts.use_rust_engine`` is true (the default); it implements the same
+    public API as ``mcts.MCTS`` and produces identical move-selection targets
+    (verified by tests/test_engine_equivalence.py) at ~2x the search speed.
+    """
+    use_rust = getattr(getattr(config, 'mcts', None), 'use_rust_engine', True)
+    if use_rust:
+        return RustMCTS, ForceMateRustMCTS
+    return MCTS, ForceMateMCTS
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Replay Buffer
 # ─────────────────────────────────────────────────────────────────────────────
 
-class ReplayBuffer:
-    """FIFO replay buffer with O(1) random access.
+class _BufferView:
+    """Read-only list-like view over a ReplayBuffer.
 
-    Uses a plain ``list`` with manual size management instead of
-    ``collections.deque``.  ``deque`` does NOT support O(1) random
-    access — ``deque[i]`` is O(n/2) on average, which makes
-    ``sample_batch`` extremely slow for large buffers (100k positions).
-    A list gives true O(1) indexing.
+    Keeps legacy code that does ``buffer.buffer[i][0]`` / ``len(buffer.buffer)``
+    working.  Each item is a ``(state, policy, value, mask)`` tuple of float32
+    arrays (copies), so this is for occasional inspection, not hot paths.
     """
 
+    def __init__(self, rb):
+        self._rb = rb
+
+    def __len__(self):
+        return self._rb._size
+
+    def __getitem__(self, i):
+        rb = self._rb
+        n = rb._size
+        if isinstance(i, slice):
+            return [self[j] for j in range(*i.indices(n))]
+        i = int(i)
+        if i < 0:
+            i += n
+        if not 0 <= i < n:
+            raise IndexError(i)
+        return (rb._states[i].astype(np.float32),
+                rb._policies[i].astype(np.float32),
+                float(rb._values[i]),
+                rb._masks[i].astype(np.float32))
+
+
+class ReplayBuffer:
+    """FIFO (circular) replay buffer backed by preallocated numpy arrays.
+
+    Storage is allocated lazily on the first ``add_game`` from the shapes of
+    the first position, then reused forever; adding a game is a handful of
+    block copies and sampling a batch is four fancy-indexing copies.
+
+    Layout: physical slot ``i`` holds one position; ``_write_idx`` is the next
+    slot to write (the oldest position once the buffer is full).
+    """
+
+    STATE_DTYPE = np.float16
+    POLICY_DTYPE = np.float16
+    MASK_DTYPE = np.uint8
+
     def __init__(self, max_size=100000):
-        self.max_size = max_size
-        self.buffer = []          # list, not deque — O(1) random access
+        self.max_size = int(max_size)
+        self._states = None       # (max_size, *state_shape)  float16
+        self._policies = None     # (max_size, num_actions)   float16
+        self._masks = None        # (max_size, num_actions)   uint8
+        self._values = np.zeros(self.max_size, dtype=np.float32)
+        self._size = 0            # number of valid positions
         self._write_idx = 0       # circular write pointer
         self.total_games = 0
         self.total_positions = 0
+        self._rng = np.random.default_rng()
+
+    # ── allocation ──
+
+    def _alloc(self, state_shape, policy_shape, mask_shape):
+        self._states   = np.zeros((self.max_size,) + tuple(state_shape),  dtype=self.STATE_DTYPE)
+        self._policies = np.zeros((self.max_size,) + tuple(policy_shape), dtype=self.POLICY_DTYPE)
+        self._masks    = np.zeros((self.max_size,) + tuple(mask_shape),   dtype=self.MASK_DTYPE)
+
+    @property
+    def buffer(self):
+        """Legacy list-like view (see _BufferView)."""
+        return _BufferView(self)
+
+    # ── writing ──
 
     def add_game(self, game_data):
         """Add a completed game's positions to the buffer.
 
         game_data: list of (state, policy, value, legal_move_mask) tuples.
         """
-        for s, p, v, m in game_data:
-            if len(self.buffer) < self.max_size:
-                # Buffer not yet full — append
-                self.buffer.append((s, p, v, m))
-                self._write_idx = (self._write_idx + 1) % self.max_size
-            else:
-                # Buffer full — overwrite oldest (circular buffer)
-                self.buffer[self._write_idx] = (s, p, v, m)
-                self._write_idx = (self._write_idx + 1) % self.max_size
-            self.total_positions += 1
+        k_orig = len(game_data)
+        if k_orig:
+            if self._states is None:
+                s0, p0, _, m0 = game_data[0]
+                self._alloc(np.shape(s0), np.shape(p0), np.shape(m0))
+            gd = game_data[-self.max_size:] if k_orig > self.max_size else game_data
+            k = len(gd)
+            idx = (self._write_idx + np.arange(k)) % self.max_size
+            self._states[idx]   = np.stack([g[0] for g in gd])
+            self._policies[idx] = np.stack([g[1] for g in gd])
+            self._values[idx]   = np.fromiter((g[2] for g in gd), dtype=np.float32, count=k)
+            self._masks[idx]    = np.stack([g[3] for g in gd])
+            self._write_idx = (self._write_idx + k) % self.max_size
+            self._size = min(self.max_size, self._size + k)
+            self.total_positions += k_orig
         self.total_games += 1
 
-    def sample_batch(self, batch_size):
-        n = len(self.buffer)
-        ix = np.random.choice(n, size=min(batch_size, n), replace=False)
-        return (np.array([self.buffer[i][0] for i in ix]),
-                np.array([self.buffer[i][1] for i in ix]),
-                np.array([self.buffer[i][2] for i in ix], dtype=np.float32),
-                np.array([self.buffer[i][3] for i in ix], dtype=np.float32))
+    # ── reading ──
 
-    def __len__(self): return len(self.buffer)
+    def sample_batch(self, batch_size):
+        """Sample a batch without replacement.
+
+        Returns (states f16, policies f16, values f32, masks u8) numpy arrays;
+        the training step converts them to float32 on the device.
+        """
+        n = self._size
+        k = min(int(batch_size), n)
+        ix = self._rng.choice(n, size=k, replace=False)
+        ix.sort()   # sequential-ish memory access
+        return (self._states[ix],
+                self._policies[ix],
+                self._values[ix],
+                self._masks[ix])
+
+    def sample_states(self, n):
+        """Random sample of ``n`` states as a float32 array (for diagnostics)."""
+        k = min(int(n), self._size)
+        ix = self._rng.choice(self._size, size=k, replace=False)
+        return self._states[ix].astype(np.float32)
+
+    def __len__(self): return self._size
 
     def get_outcome_distribution(self):
-        if not self.buffer: return {'white_wins':0,'black_wins':0,'draws':0}
-        n  = min(1000, len(self.buffer))
-        ix = np.random.choice(len(self.buffer), size=n, replace=False)
-        ww=bw=dr=0
-        for i in ix:
-            v=self.buffer[i][2]
-            if v>0.5: ww+=1
-            elif v<-0.5: bw+=1
-            else: dr+=1
-        s=len(self.buffer)/n
+        if self._size == 0: return {'white_wins':0,'black_wins':0,'draws':0}
+        n  = min(1000, self._size)
+        ix = self._rng.choice(self._size, size=n, replace=False)
+        v  = self._values[ix]
+        ww = int((v > 0.5).sum())
+        bw = int((v < -0.5).sum())
+        dr = n - ww - bw
+        s  = self._size / n
         return {'white_wins':int(ww*s),'black_wins':int(bw*s),'draws':int(dr*s)}
 
     # ── Serialization ──
 
-    def save(self, path):
-        """Save buffer to a compressed .npz file."""
-        if not self.buffer:
+    def save(self, path, compress=False):
+        """Save buffer to an .npz file (written atomically).
+
+        ``compress=False`` (default) is much faster for multi-GB buffers;
+        pass True to trade save time for a smaller file.
+        """
+        if self._size == 0:
             return
-        n = len(self.buffer)
+        n = self._size
         # Emit in logical FIFO order (oldest first) so the circular write
-        # pointer can be reset to 0 on load and still overwrite the oldest
-        # positions first.  Without this the on-disk order is arbitrary once
-        # the buffer has wrapped, and reloading silently scrambles age order.
+        # pointer can be reset on load and still overwrite the oldest
+        # positions first.
         if n < self.max_size:
-            order = range(n)
+            states   = self._states[:n]
+            policies = self._policies[:n]
+            values   = self._values[:n]
+            masks    = self._masks[:n]
         else:
-            order = list(range(self._write_idx, n)) + list(range(0, self._write_idx))
-        states   = np.stack([self.buffer[i][0] for i in order])
-        policies = np.stack([self.buffer[i][1] for i in order])
-        values   = np.array([self.buffer[i][2] for i in order], dtype=np.float32)
-        masks    = np.stack([self.buffer[i][3] for i in order])
-        np.savez_compressed(
-            path,
+            w = self._write_idx
+            states   = np.concatenate((self._states[w:],   self._states[:w]))
+            policies = np.concatenate((self._policies[w:], self._policies[:w]))
+            values   = np.concatenate((self._values[w:],   self._values[:w]))
+            masks    = np.concatenate((self._masks[w:],    self._masks[:w]))
+        path = str(path)
+        tmp = path + ".tmp.npz"
+        saver = np.savez_compressed if compress else np.savez
+        saver(
+            tmp,
             states=states, policies=policies, values=values, masks=masks,
             total_games=self.total_games,
             total_positions=self.total_positions,
         )
+        os.replace(tmp, path)
 
     @classmethod
     def load(cls, path, max_size=100000):
         """Load buffer from a .npz file. Returns a new ReplayBuffer, or None on failure.
+
+        Accepts both the old float32 list-based format and the new compact
+        format (values are cast to the storage dtypes either way).
 
         Backward compatibility: buffers saved before legal-move masking was
         added won't have a 'masks' array. In that case we fill in all-ones
@@ -157,7 +266,7 @@ class ReplayBuffer:
                 print(f"[WARN] {path} has no saved legal-move masks (old format). "
                       f"Filling with all-ones masks for {n} positions — these will "
                       f"train without masking until they age out of the buffer.")
-                masks = np.ones((n, game_api.num_actions()), dtype=np.float32)
+                masks = np.ones((n, game_api.num_actions()), dtype=np.uint8)
             if n > max_size:
                 # Keep the most recent positions (saved oldest→newest).
                 print(f"[WARN] {path} holds {n} positions, exceeds max_size "
@@ -167,13 +276,16 @@ class ReplayBuffer:
                 values   = values[-max_size:]
                 masks    = masks[-max_size:]
                 n = max_size
-            for i in range(n):
-                buf.buffer.append((states[i], policies[i], float(values[i]), masks[i]))
-            # Buffer[0] is now the oldest position and n <= max_size, so the
-            # circular write pointer restarts at 0 (overwrites oldest first
-            # once the buffer refills).  Note: appending directly above does
-            # not advance _write_idx, hence the explicit reset.
-            buf._write_idx       = 0
+            if n > 0:
+                buf._alloc(states.shape[1:], policies.shape[1:], masks.shape[1:])
+                buf._states[:n]   = states
+                buf._policies[:n] = policies
+                buf._values[:n]   = values
+                buf._masks[:n]    = masks
+            # Slot 0 is now the oldest position; the next write goes to slot n
+            # (which wraps to 0 = the oldest once the buffer is full).
+            buf._size            = n
+            buf._write_idx       = n % buf.max_size
             buf.total_games      = int(data.get('total_games', n))
             buf.total_positions  = int(data.get('total_positions', n))
             return buf
@@ -568,7 +680,8 @@ def self_play_game(network, config, on_move=None):
     # chess-only feature, so it is disabled for other games.
     force_mate = (getattr(config.selfplay, 'force_mate', False)
                   and game_api.is_game('chess'))
-    mcts_cls = ForceMateMCTS if force_mate else MCTS
+    plain_cls, fm_cls = _engine_classes(config, force_mate)
+    mcts_cls = fm_cls if force_mate else plain_cls
     mcts_kwargs = {}
     if force_mate:
         mcts_kwargs = {
@@ -806,9 +919,10 @@ def _worker_loop_single(worker_id, task_queue, result_queue, config_dict, shutdo
                           and game_api.is_game('chess'))
 
     force_mate_in_one = getattr(config.mcts, 'force_mate_in_one', True)
+    _plain_cls, _fm_cls = _engine_classes(config, force_mate_enabled)
 
     def mcts(net, noise, force_mate=False):
-        cls = ForceMateMCTS if force_mate else MCTS
+        cls = _fm_cls if force_mate else _plain_cls
         mcts_kwargs = {}
         if force_mate:
             mcts_kwargs = {
@@ -1031,9 +1145,10 @@ def _worker_loop_multi(worker_id, task_queue, result_queue, config_dict, shutdow
     force_mate_enabled = (getattr(config.selfplay, 'force_mate', False)
                           and game_api.is_game('chess'))
     force_mate_in_one = getattr(config.mcts, 'force_mate_in_one', True)
+    _plain_cls, _fm_cls = _engine_classes(config, force_mate_enabled)
 
     def mcts(net, noise, force_mate=False):
-        cls = ForceMateMCTS if force_mate else MCTS
+        cls = _fm_cls if force_mate else _plain_cls
         mcts_kwargs = {}
         if force_mate:
             mcts_kwargs = {
