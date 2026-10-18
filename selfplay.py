@@ -32,6 +32,11 @@ allocated lazily from the shapes of the first game added, so any game
 (chess, connect4, ...) works.  float16 represents 0/1 planes and integer
 counters up to 2048 exactly; policy targets keep ~3 significant digits.
 
+NOTE 5 (memory): save()/load() never build full-size temporary copies of the
+buffer; in-flight games keep their positions as f16/u8; self-play workers do
+not retain per-move records (fens/moves/mcts stats are only sent as live
+messages, and the final 'selfplay' result carries empty lists for them).
+
 All game-specific mechanics (chess, connect4, ...) are accessed through
 ``game_api``; see game_api.py.
 """
@@ -208,32 +213,26 @@ class ReplayBuffer:
     def save(self, path, compress=False):
         """Save buffer to an .npz file (written atomically).
 
+        Slots are written in their PHYSICAL order together with the write
+        pointer (``write_idx``), so no reordered copy of the multi-GB arrays is
+        ever built in memory (the old version concatenated all four arrays,
+        i.e. a transient +100% of the buffer at every checkpoint).  ``load``
+        restores the age order from ``write_idx``.
+
         ``compress=False`` (default) is much faster for multi-GB buffers;
         pass True to trade save time for a smaller file.
         """
         if self._size == 0:
             return
         n = self._size
-        # Emit in logical FIFO order (oldest first) so the circular write
-        # pointer can be reset on load and still overwrite the oldest
-        # positions first.
-        if n < self.max_size:
-            states   = self._states[:n]
-            policies = self._policies[:n]
-            values   = self._values[:n]
-            masks    = self._masks[:n]
-        else:
-            w = self._write_idx
-            states   = np.concatenate((self._states[w:],   self._states[:w]))
-            policies = np.concatenate((self._policies[w:], self._policies[:w]))
-            values   = np.concatenate((self._values[w:],   self._values[:w]))
-            masks    = np.concatenate((self._masks[w:],    self._masks[:w]))
         path = str(path)
         tmp = path + ".tmp.npz"
         saver = np.savez_compressed if compress else np.savez
         saver(
             tmp,
-            states=states, policies=policies, values=values, masks=masks,
+            states=self._states[:n], policies=self._policies[:n],
+            values=self._values[:n], masks=self._masks[:n],
+            write_idx=self._write_idx,
             total_games=self.total_games,
             total_positions=self.total_positions,
         )
@@ -243,8 +242,11 @@ class ReplayBuffer:
     def load(cls, path, max_size=100000):
         """Load buffer from a .npz file. Returns a new ReplayBuffer, or None on failure.
 
-        Accepts both the old float32 list-based format and the new compact
-        format (values are cast to the storage dtypes either way).
+        Accepts the current format (physical slot order + ``write_idx``) and
+        older files (oldest-first, no ``write_idx``); float32 or compact
+        dtypes are both cast to the storage dtypes.  Arrays are staged one at
+        a time straight into the preallocated storage, so peak memory is the
+        final buffer plus ONE source array (not 2x the buffer).
 
         Backward compatibility: buffers saved before legal-move masking was
         added won't have a 'masks' array. In that case we fill in all-ones
@@ -256,38 +258,52 @@ class ReplayBuffer:
         try:
             data = np.load(path, allow_pickle=False)
             buf = cls(max_size=max_size)
-            states   = data['states']
-            policies = data['policies']
-            values   = data['values']
-            n = len(values)
-            if 'masks' in data:
-                masks = data['masks']
-            else:
+            max_size = buf.max_size
+            values = data['values']
+            n_saved = len(values)
+            buf.total_games     = int(data.get('total_games', n_saved))
+            buf.total_positions = int(data.get('total_positions', n_saved))
+            if n_saved == 0:
+                return buf
+
+            has_masks = 'masks' in data
+            if not has_masks:
                 print(f"[WARN] {path} has no saved legal-move masks (old format). "
-                      f"Filling with all-ones masks for {n} positions — these will "
+                      f"Filling with all-ones masks for {n_saved} positions — these will "
                       f"train without masking until they age out of the buffer.")
-                masks = np.ones((n, game_api.num_actions()), dtype=np.uint8)
-            if n > max_size:
-                # Keep the most recent positions (saved oldest→newest).
-                print(f"[WARN] {path} holds {n} positions, exceeds max_size "
-                      f"{max_size}; keeping the most recent {max_size}.")
-                states   = states[-max_size:]
-                policies = policies[-max_size:]
-                values   = values[-max_size:]
-                masks    = masks[-max_size:]
-                n = max_size
-            if n > 0:
-                buf._alloc(states.shape[1:], policies.shape[1:], masks.shape[1:])
-                buf._states[:n]   = states
-                buf._policies[:n] = policies
-                buf._values[:n]   = values
-                buf._masks[:n]    = masks
-            # Slot 0 is now the oldest position; the next write goes to slot n
-            # (which wraps to 0 = the oldest once the buffer is full).
-            buf._size            = n
-            buf._write_idx       = n % buf.max_size
-            buf.total_games      = int(data.get('total_games', n))
-            buf.total_positions  = int(data.get('total_positions', n))
+
+            # Age order: new files are in physical slot order with the write
+            # pointer ``w`` (oldest position = slot w once full); legacy files
+            # are already oldest-first (w = 0).
+            w = int(data['write_idx']) if 'write_idx' in data else 0
+            if n_saved > max_size or (n_saved < max_size and 0 < w < n_saved):
+                order = np.concatenate((np.arange(w, n_saved), np.arange(0, w)))
+                if n_saved > max_size:
+                    print(f"[WARN] {path} holds {n_saved} positions, exceeds max_size "
+                          f"{max_size}; keeping the most recent {max_size}.")
+                    order = order[-max_size:]
+                n = len(order)
+                buf._write_idx = n % max_size
+            else:
+                order = None
+                n = n_saved
+                buf._write_idx = (w % max_size) if n_saved == max_size else (n % max_size)
+
+            buf._values[:n] = values if order is None else values[order]
+            del values
+            for name, attr, dt in (('states',   '_states',   cls.STATE_DTYPE),
+                                   ('policies', '_policies', cls.POLICY_DTYPE),
+                                   ('masks',    '_masks',    cls.MASK_DTYPE)):
+                if name == 'masks' and not has_masks:
+                    full = np.zeros((max_size,) + buf._policies.shape[1:], dtype=dt)
+                    full[:n] = 1
+                else:
+                    arr = data[name]
+                    full = np.zeros((max_size,) + arr.shape[1:], dtype=dt)
+                    full[:n] = arr if order is None else arr[order]
+                    del arr
+                setattr(buf, attr, full)
+            buf._size = n
             return buf
         except Exception as e:
             print(f"[WARN] Could not load replay buffer from {path}: {e}")
@@ -626,7 +642,11 @@ def play_one_game(mcts_engine, max_game_length=150, adjudicate_material=True,
         st = game_api.encode(board)
         cp = game_api.player_sign(board)
         legal_mask = game_api.mask(board)
-        game_states.append((st, visit_policy.copy(), cp, legal_mask))
+        # Keep per-position data compact while the game runs (f16/u8 instead of
+        # f32: 29 KB instead of 67 KB per position, x ~90 positions x all
+        # concurrent games); the replay buffer stores these dtypes anyway.
+        game_states.append((st.astype(np.float16), visit_policy.astype(np.float16),
+                            cp, np.asarray(legal_mask).astype(np.uint8)))
         mcts_stats_list.append(stats)
 
         mcts_move_data = {
@@ -972,7 +992,8 @@ def _worker_loop_single(worker_id, task_queue, result_queue, config_dict, shutdo
                 })
                 fens = []; ucis = []; mdata = []
                 def on_sp(fen, uci, mn, ms=None):
-                    fens.append(fen); ucis.append(uci); mdata.append(ms)
+                    # Live messages already carry every move; don't also retain
+                    # them (~2 MB/game of dicts) or ship them again at game end.
                     result_queue.put({
                         'worker_id': worker_id, 'type': 'live_move',
                         'fen': fen, 'move': uci, 'move_number': mn, 'mcts_stats': ms,
@@ -998,7 +1019,13 @@ def _worker_loop_single(worker_id, task_queue, result_queue, config_dict, shutdo
                 })
                 result_queue.put({
                     'worker_id': worker_id, 'type': 'selfplay',
-                    'game_data': [(s.tolist(), p.tolist(), float(v), m.tolist()) for s, p, v, m in gd],
+                    # Send raw ndarrays (f16/u8) instead of .tolist() lists:
+                    # ~8x faster serialization, ~5x smaller IPC payload.
+                    'game_data': [(np.ascontiguousarray(s, dtype=np.float16),
+                                   np.ascontiguousarray(p, dtype=np.float16),
+                                   float(v),
+                                   np.ascontiguousarray(m, dtype=np.uint8))
+                                  for s, p, v, m in gd],
                     'game_info': gi, 'fens': fens, 'moves': ucis, 'mcts_stats': mdata,
                 })
 
@@ -1049,7 +1076,7 @@ def _worker_loop_single(worker_id, task_queue, result_queue, config_dict, shutdo
 
                     _state, _mc, game_result = play_engine_vs_reference(
                         ea, a_is_white, config.selfplay.max_game_length,
-                        depth=config.alpha_beta.depth, on_move=on_ev_live)
+                        depth=task.get('ref_depth', config.alpha_beta.depth), on_move=on_ev_live)
 
                 result_queue.put({
                     'worker_id': worker_id, 'type': 'live_end',
@@ -1214,7 +1241,8 @@ def _worker_loop_multi(worker_id, task_queue, result_queue, config_dict, shutdow
         })
         fens = []; ucis = []; mdata = []
         def on_sp(fen, uci, mn, ms=None):
-            fens.append(fen); ucis.append(uci); mdata.append(ms)
+            # Live messages already carry every move; don't also retain
+            # them (~2 MB/game of dicts) or ship them again at game end.
             result_queue.put({
                 'worker_id': worker_id, 'type': 'live_move', 'sub': g,
                 'fen': fen, 'move': uci, 'move_number': mn, 'mcts_stats': ms,
@@ -1240,7 +1268,13 @@ def _worker_loop_multi(worker_id, task_queue, result_queue, config_dict, shutdow
         })
         result_queue.put({
             'worker_id': worker_id, 'type': 'selfplay',
-            'game_data': [(s.tolist(), p.tolist(), float(v), m.tolist()) for s, p, v, m in gd],
+            # Send raw ndarrays (f16/u8) instead of .tolist() lists:
+            # ~8x faster serialization, ~5x smaller IPC payload.
+            'game_data': [(np.ascontiguousarray(s, dtype=np.float16),
+                          np.ascontiguousarray(p, dtype=np.float16),
+                          float(v),
+                          np.ascontiguousarray(m, dtype=np.uint8))
+                         for s, p, v, m in gd],
             'game_info': gi, 'fens': fens, 'moves': ucis, 'mcts_stats': mdata,
         })
 
@@ -1309,7 +1343,7 @@ def _worker_loop_multi(worker_id, task_queue, result_queue, config_dict, shutdow
 
             _state, _mc, game_result = play_engine_vs_reference(
                 ea, a_is_white, config.selfplay.max_game_length,
-                depth=config.alpha_beta.depth, on_move=on_ev_live)
+                depth=task.get('ref_depth', config.alpha_beta.depth), on_move=on_ev_live)
 
         result_queue.put({
             'worker_id': worker_id, 'type': 'live_end',

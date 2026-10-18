@@ -202,6 +202,12 @@ def _dispatch_live_message(psp, worker_live_games, worker_live_game_ids,
     return False
 
 
+def lr_for_games(games, base_lr, milestones, gamma):
+    """Step-decay learning rate as a function of total self-play games:
+    base_lr * gamma ** (number of milestones already passed)."""
+    return base_lr * (gamma ** sum(1 for mlst in milestones if games >= mlst))
+
+
 def run_training(config, gui_enabled=False, num_workers=None):
     global _shutdown
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -254,6 +260,9 @@ def run_training(config, gui_enabled=False, num_workers=None):
     )
 
     step = game_id = eval_game_counter = 0
+    # Alpha-beta reference depth; can grow during the run (evaluation.ref_depth_*).
+    ref_depth  = int(getattr(config.alpha_beta, 'depth', 1))
+    ref_streak = 0
     best_network = create_model_from_config(config)
     best_network.load_state_dict(network.state_dict())
     best_network.to(device)
@@ -283,6 +292,7 @@ def run_training(config, gui_enabled=False, num_workers=None):
         eval_game_counter= ckpt.get('eval_game_counter', 0)
         if 'best_elo' in ckpt: evaluator.best_elo = ckpt['best_elo']
         if 'ref_elo'  in ckpt: evaluator.ref_elo  = ckpt['ref_elo']
+        if 'ref_depth' in ckpt: ref_depth = max(ref_depth, int(ckpt['ref_depth']))
         print(f"[INFO] Resumed step={step} game={game_id}")
 
     # Load best network from disk (if available) so it survives restarts.
@@ -359,6 +369,23 @@ def run_training(config, gui_enabled=False, num_workers=None):
     # skipped over most of the time.
     last_ckpt_step = step
 
+    # ── Learning-rate schedule (by total self-play games; resume-safe) ──
+    base_lr      = float(_tcfg.learning_rate)
+    lr_milestones = sorted(int(x) for x in (getattr(_tcfg, 'lr_milestone_games', None) or []))
+    lr_gamma     = float(getattr(_tcfg, 'lr_gamma', 0.1))
+    if lr_milestones:
+        print(f"[INFO] LR schedule: {base_lr:g}, x{lr_gamma:g} at total games {lr_milestones}")
+
+    # ── Adaptive alpha-beta reference depth ──
+    _ecfg = config.evaluation
+    ref_adaptive      = bool(getattr(_ecfg, 'ref_depth_adaptive', False))
+    ref_threshold     = float(getattr(_ecfg, 'ref_depth_threshold', 0.55))
+    ref_depth_max     = int(getattr(_ecfg, 'ref_depth_max', 4))
+    ref_streak_needed = max(1, int(getattr(_ecfg, 'ref_depth_streak', 1)))
+    if ref_adaptive:
+        print(f"[INFO] Adaptive reference depth: start d={ref_depth}, +1 after "
+              f"{ref_streak_needed} eval(s) with win rate >= {ref_threshold:.0%}, max d={ref_depth_max}")
+
     # Per-worker live game tracking for real-time updates
     worker_live_game_ids = [0] * num_workers
     # Feature one game per worker: worker_feature[wid] = subgame ordinal shown;
@@ -380,10 +407,9 @@ def run_training(config, gui_enabled=False, num_workers=None):
 
         wid = r['worker_id']
         gi  = r['game_info']
-        game_data = [(np.array(s, dtype=np.float32),
-                      np.array(p, dtype=np.float32),
-                      float(v),
-                      np.array(m, dtype=np.float32)) for s, p, v, m in r['game_data']]
+        # Worker already ships f16/u8 ndarrays; buffer stores f16/u8 natively,
+        # so pass them straight through (no f32 round-trip).
+        game_data = [(s, p, float(v), m) for s, p, v, m in r['game_data']]
 
         positions_since_train += gi['num_positions']
         buffer.add_game(game_data)
@@ -466,7 +492,7 @@ def run_training(config, gui_enabled=False, num_workers=None):
                     n_batches = fixed_batches_per_step
                 n_samples = n_batches * train_batch_size
 
-                print(f"[Cycle] {cycle_games} games (total {game_id}), "
+                print(f"[Cycle] {cycle_games} games (total {game_id}, step {step}, lr={lr_for_games(game_id, base_lr, lr_milestones, lr_gamma):.0e}), "
                       f"+{cycle_positions} positions "
                       f"({cycle_positions / max(1, cycle_games):.0f}/game), "
                       f"buffer={len(buffer)}, batches={n_batches}, "
@@ -496,6 +522,9 @@ def run_training(config, gui_enabled=False, num_workers=None):
                     # Drain any new live messages / finished games between batches
                     _drain_pending()
 
+                    cur_lr = lr_for_games(game_id, base_lr, lr_milestones, lr_gamma)
+                    for _pg in optimizer.param_groups:
+                        _pg['lr'] = cur_lr
                     ld = train_one_step(network, optimizer, buffer,
                                         train_batch_size, device)
                     t_samp_sum += ld.get('t_sample', 0.0)
@@ -506,12 +535,12 @@ def run_training(config, gui_enabled=False, num_workers=None):
                                             policy_loss=ld['policy_loss'],
                                             value_loss=ld['value_loss'],
                                             total_loss=ld['total_loss'],
-                                            learning_rate=config.training.learning_rate)
+                                            learning_rate=cur_lr)
                     tb.log_training_step(step=step,
                                          policy_loss=ld['policy_loss'],
                                          value_loss=ld['value_loss'],
                                          total_loss=ld['total_loss'],
-                                         learning_rate=config.training.learning_rate,
+                                         learning_rate=cur_lr,
                                          grad_norm=ld['grad_norm'])
 
                 # ── Push updated weights to the GPU inference server ──
@@ -546,7 +575,7 @@ def run_training(config, gui_enabled=False, num_workers=None):
                 if ckpt_interval and (step // ckpt_interval) > (last_ckpt_step // ckpt_interval):
                     last_ckpt_step = step
                     ex = {'game_id':game_id,'eval_game_counter':eval_game_counter,
-                          'best_elo':evaluator.best_elo,'ref_elo':evaluator.ref_elo}
+                          'best_elo':evaluator.best_elo,'ref_elo':evaluator.ref_elo,'ref_depth':ref_depth}
                     cp = checkpoints_dir / f"step_{step}.pt"
                     save_checkpoint(network, optimizer, str(cp), step, extra=ex)
                     save_checkpoint(network, optimizer,
@@ -596,7 +625,7 @@ def run_training(config, gui_enabled=False, num_workers=None):
                 for gi in range(n_ref):
                     eval_tasks.append({
                         'type':'eval', 'eval_type':'reference',
-                        'weights_a': wb_latest, 'weights_b': None,
+                        'weights_a': wb_latest, 'weights_b': None, 'ref_depth': ref_depth,
                         'a_is_white': (gi % 2 == 0),
                         'game_label': f"Ref {gi+1}/{n_ref}",
                     })
@@ -727,7 +756,17 @@ def run_training(config, gui_enabled=False, num_workers=None):
                 total_r = ref_wins+ref_losses+ref_draws
                 if total_r > 0:
                     rwr = (ref_wins + 0.5*ref_draws) / total_r
-                    print(f"  [REF] win_rate={rwr:.1%}  {ref_wins}W/{ref_losses}L/{ref_draws}D")
+                    print(f"  [REF] depth={ref_depth} win_rate={rwr:.1%}  {ref_wins}W/{ref_losses}L/{ref_draws}D")
+                    if ref_adaptive:
+                        ref_streak = ref_streak + 1 if rwr >= ref_threshold else 0
+                        if ref_streak >= ref_streak_needed:
+                            if ref_depth < ref_depth_max:
+                                ref_depth += 1
+                                ref_streak = 0
+                                print(f"  [REF] win rate >= {ref_threshold:.0%} -> "
+                                      f"reference depth raised to {ref_depth}")
+                            else:
+                                print(f"  [REF] already at max reference depth {ref_depth_max}")
                     stats.log_evaluation(step=step, opponent="alpha_beta_ref",
                                          games_played=total_r,
                                          wins=ref_wins, losses=ref_losses,
@@ -751,7 +790,7 @@ def run_training(config, gui_enabled=False, num_workers=None):
         print("[INFO] Stopping workers…")
         psp.stop()
         ex = {'game_id':game_id,'eval_game_counter':eval_game_counter,
-              'best_elo':evaluator.best_elo,'ref_elo':evaluator.ref_elo}
+              'best_elo':evaluator.best_elo,'ref_elo':evaluator.ref_elo,'ref_depth':ref_depth}
         save_checkpoint(network, optimizer,
                         str(checkpoints_dir/"latest.pt"), step, extra=ex)
         buffer.save(str(buffer_path))
@@ -1003,10 +1042,8 @@ def run_benchmark(config, num_workers=None, num_games=10, profile_games=3):
 
             # Deserialise (exactly as run_training does)
             t_ds = time.perf_counter()
-            game_data = [(np.array(s, dtype=np.float32),
-                          np.array(p, dtype=np.float32),
-                          float(v),
-                          np.array(m, dtype=np.float32)) for s, p, v, m in raw]
+            # Worker already ships f16/u8 ndarrays; pass straight through.
+            game_data = [(s, p, float(v), m) for s, p, v, m in raw]
             timers.deserialize += time.perf_counter() - t_ds
 
             # Bookkeeping (counts + print only -- no buffer.add_game, no stats logging)

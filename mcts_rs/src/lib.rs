@@ -441,6 +441,32 @@ pub extern "C" fn mcts_rs_get_w(node: i32) -> f64 {
     }
 }
 
+/// Visit counts for all children of `root`, written into `out` (capped at
+/// `max_out`).  Returns the number written.  One FFI call replaces one call
+/// per child, which removes the per-move FFI overhead in visit-policy and
+/// stats computation.
+#[no_mangle]
+pub extern "C" fn mcts_rs_get_n_batch(
+    root: i32,
+    out: *mut i64,
+    max_out: usize,
+) -> i32 {
+    let a = arena().lock().unwrap();
+    if root < 0 || root as usize >= a.nodes.len() {
+        return 0;
+    }
+    let kids = &a.children[root as usize];
+    let n = kids.len().min(max_out);
+    for (i, &c) in kids.iter().take(n).enumerate() {
+        unsafe {
+            if !out.is_null() {
+                *out.add(i) = a.nodes[c as usize].n as i64;
+            }
+        }
+    }
+    n as i32
+}
+
 /// Return current node count in the arena.
 #[no_mangle]
 pub extern "C" fn mcts_rs_count() -> i64 {

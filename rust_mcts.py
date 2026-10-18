@@ -150,6 +150,10 @@ class RustMCTS:
         L.mcts_rs_get_n.restype = cll
         L.mcts_rs_get_w.argtypes = [ci]
         L.mcts_rs_get_w.restype = cd
+        # Batched visit-count read: one FFI call returns N for all children of
+        # a node (replaces one _N() call per child).
+        L.mcts_rs_get_n_batch.argtypes = [ci, ctypes.POINTER(ctypes.c_int64), csz]
+        L.mcts_rs_get_n_batch.restype = ci
         L.mcts_rs_get_policy.argtypes = [ci]
         L.mcts_rs_get_policy.restype = cf
         L.mcts_rs_get_policy_orig.argtypes = [ci]
@@ -219,6 +223,23 @@ class RustMCTS:
 
     def _W(self, rs_id):
         return float(self._lib.mcts_rs_get_w(rs_id))
+
+    def _N_batch(self, root):
+        """Visit counts for all children of ``root`` in a single FFI call.
+
+        Returns {action: N} — one FFI call instead of one per child.
+        """
+        children = root.children
+        if not children:
+            return {}
+        n_children = len(children)
+        out = (ctypes.c_int64 * n_children)()
+        got = self._lib.mcts_rs_get_n_batch(root.rs_id, out, n_children)
+        result = {}
+        child_items = list(children.items())
+        for i in range(got):
+            result[child_items[i][0]] = int(out[i])
+        return result
 
     # ── terminal handling (matches mcts.MCTS) ───────────────────────────────
     def _is_terminal(self, rs_id):
@@ -499,10 +520,18 @@ class RustMCTS:
         if ex_rs:
             states = np.stack(
                 [board_to_tensor(self.board_of(rs)) for rs in ex_rs], axis=0)
-            policies, vals = self.network.predictBatch(states)
+            policies, vals = self._predict_batch_network(states)
             return self._apply_network_results(
                 leaves, tv, ex_idx, ex_rs, policies, vals)
         return [tv.get(i, 0.0) for i in range(len(leaves))]
+
+    def _predict_batch_network(self, states):
+        """Run a batched forward pass, supporting both the CPU AlphaZeroNet
+        (``predictBatch``) and the GPU InferenceClient (``predict_batch``)."""
+        net = self.network
+        if hasattr(net, 'predict_batch'):
+            return net.predict_batch(states)
+        return net.predictBatch(states)
 
     def _add_dirichlet_noise(self, root):
         if self.dirichlet_alpha <= 0 or self.dirichlet_epsilon <= 0:
@@ -529,11 +558,11 @@ class RustMCTS:
                 visit_policy[game_api.to_index(root.board, mate_move)] = 1.0
                 return visit_policy, mate_move
 
+        counts = self._N_batch(root)
         total = 0
         best_idx = None
         best_n = -1
-        for a, child in children.items():
-            n = self._N(child.rs_id)
+        for a, n in counts.items():
             visit_policy[a] = n
             total += n
             if n > best_n:
@@ -575,7 +604,7 @@ class RustMCTS:
                 visit_policy[game_api.to_index(root.board, mate_move)] = 1.0
                 return visit_policy, mate_move
 
-        counts = {a: self._N(c.rs_id) for a, c in children.items()}
+        counts = self._N_batch(root)
         total = sum(counts.values())
         if total == 0:
             return visit_policy, None
@@ -597,8 +626,9 @@ class RustMCTS:
     def get_root_child_stats(self, root):
         self._use()
         stats = []
+        counts = self._N_batch(root)
         for a, child in root.children.items():
-            n = self._N(child.rs_id)
+            n = counts.get(a, 0)
             if n > 0:
                 m = self._moves.get(child.rs_id)
                 stats.append({
