@@ -160,10 +160,6 @@ def test_dirichlet_noise_uses_p_orig():
     root = mcts.get_root(board)
     mcts.search(root)
 
-    # Record P_orig for each child
-    p_orig_values = {idx: child.P_orig for idx, child in root.children.items()}
-    p_after_first = {idx: child.P for idx, child in root.children.items()}
-
     # After first search, P should differ from P_orig due to noise
     noise_was_applied = False
     for idx in root.children:
@@ -175,52 +171,63 @@ def test_dirichlet_noise_uses_p_orig():
     # Recycle and search again
     best_child = max(root.children.values(), key=lambda c: c.N)
     recycled = mcts.recycle_tree(root, best_child.move)
+    # Snapshot the recycled root's own children (tracked by identity -- the same
+    # policy index can denote different moves at a different ply).
+    p_orig_recycled = {id(c): c.P_orig for c in recycled.children.values()}
     mcts.search(recycled)
 
     # After second search on recycled root, P_orig should be unchanged
-    for idx, child in recycled.children.items():
-        if idx in p_orig_values:
-            assert child.P_orig == p_orig_values[idx], \
-                f"P_orig should not change across searches for child {idx}"
+    for child in recycled.children.values():
+        assert child.P_orig == p_orig_recycled[id(child)], \
+            "P_orig should not change across searches"
 
     print("  PASS: test_dirichlet_noise_uses_p_orig")
 
 
 def test_no_prior_distortion_over_multiple_recycles():
-    """Repeated noise application doesn't distort P away from P_orig.
+    """Re-applied Dirichlet noise re-anchors P to the untouched P_orig.
 
-    With the fix, P = (1-eps)*P_orig + eps*noise each time, so P always
-    stays within eps of P_orig. Without the fix, P would be repeatedly
-    blended with itself, causing exponential decay toward 0.
+    On every search, ``P = (1-eps)*P_orig + eps*noise`` where ``P_orig`` is the
+    node's ORIGINAL prior.  Hence (a) ``P_orig`` must never change, and (b)
+    re-running a search with the SAME noise draw must reproduce the SAME ``P``
+    -- proving the noise blends with ``P_orig``, not with the already-noised
+    ``P`` (the old bug decayed P toward the noise on each re-search).  Both
+    must hold across repeated tree recycles.
+
+    Nodes are tracked by identity: the same policy *index* denotes different
+    moves at different plies, so comparing priors by index across positions is
+    invalid.
     """
     eps = 0.25
     mcts = MCTS(MockNetwork(), num_simulations=10, dirichlet_alpha=0.3, dirichlet_epsilon=eps)
     board = chess.Board()
     root = mcts.get_root(board)
 
-    # Run 5 moves with recycling, tracking a specific child's P_orig
-    tracked_p_orig = None
-    for move_num in range(5):
+    for _ in range(5):
+        # Same seed => same noise draw => P must be reproduced exactly.
+        np.random.seed(12345)
         mcts.search(root)
+        p_first = {id(c): c.P for c in root.children.values()}
+        p_orig = {id(c): c.P_orig for c in root.children.values()}
+
+        np.random.seed(12345)
+        mcts.search(root)
+        for c in root.children.values():
+            assert c.P_orig == p_orig[id(c)], "P_orig must never change"
+            assert abs(c.P - p_first[id(c)]) < 1e-9, (
+                "re-applied noise must re-anchor to P_orig, not blend with "
+                "the already-noised P")
+
+        if not root.children:
+            break
         best_child = max(root.children.values(), key=lambda c: c.N)
         move = best_child.move
-
-        # Track the P_orig of all children at this level
-        if tracked_p_orig is None:
-            tracked_p_orig = {idx: c.P_orig for idx, c in root.children.items()}
-
         board.push(move)
-        root = mcts.recycle_tree(root, move)
-        if root is None:
+        new_root = mcts.recycle_tree(root, move)
+        if new_root is None:
             break
-
-    # After all recycling, P_orig should still equal the original values
-    if tracked_p_orig is not None and root is not None:
-        for idx, p_orig in tracked_p_orig.items():
-            if idx in root.children:
-                actual = root.children[idx].P_orig
-                assert abs(actual - p_orig) < 1e-10, \
-                    f"P_orig drifted: expected {p_orig}, got {actual}"
+        assert new_root is best_child
+        root = new_root
     print("  PASS: test_no_prior_distortion_over_multiple_recycles")
 
 

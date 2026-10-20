@@ -23,17 +23,17 @@ is True (default), per-worker shared-memory buffers are allocated to eliminate
 pickle/pipe overhead for state and policy/value arrays. Only ~100 bytes of
 metadata travel through the queue per inference request.
 
-NOTE 4: the ReplayBuffer stores positions in preallocated numpy arrays
-(states/policies as float16, legal-move masks as uint8) instead of a Python
-list of float32 tuples.  That cuts memory per chess position from ~67 KB to
-~29 KB and makes ``sample_batch`` a few fancy-indexing copies instead of
-stacking ~3000 small arrays on every training step.  The arrays are
-allocated lazily from the shapes of the first game added, so any game
-(chess, connect4, ...) works.  float16 represents 0/1 planes and integer
-counters up to 2048 exactly; policy targets keep ~3 significant digits.
+NOTE 4: the ReplayBuffer stores positions compactly in preallocated numpy
+arrays: states as bit-planes + one f16 scale per plane (every AlphaZero-style
+plane holds a single value), policies as sparse (index, f16) pairs, legal-move
+masks as packed bits -- ~2.7 KB per chess position instead of ~29 KB.  Batches
+are sampled in that compact form and expanded on the GPU
+(``training.decode_compact_batch``).  The arrays are allocated lazily from the
+shapes of the first game added, so any game (chess, connect4, ...) works; if a
+game's planes are not one-value-per-plane the states fall back to dense f16.
 
 NOTE 5 (memory): save()/load() never build full-size temporary copies of the
-buffer; in-flight games keep their positions as f16/u8; self-play workers do
+buffer (dense legacy files are converted chunk by chunk); in-flight games keep their positions as f16/u8; self-play workers do
 not retain per-move records (fens/moves/mcts stats are only sent as live
 messages, and the final 'selfplay' result carries empty lists for them).
 
@@ -52,7 +52,8 @@ import io
 import os
 
 import game_api
-from encoding import board_to_tensor, get_legal_move_mask, NUM_ACTIONS
+from encoding import (board_to_tensor, get_legal_move_mask, NUM_ACTIONS,
+                      FRAME_VERSION, FrameVersionError)
 from network import AlphaZeroNet
 from mcts import MCTS
 from rust_mcts import RustMCTS
@@ -79,12 +80,64 @@ def _engine_classes(config, force_mate):
 # Replay Buffer
 # ─────────────────────────────────────────────────────────────────────────────
 
+# ── compact storage codecs ───────────────────────────────────────────────────
+#
+# A chess position in the replay buffer used to cost ~29 KB (119x8x8 f16 state
+# + two dense 4672-wide f16/u8 rows).  Three observations make it ~2.7 KB:
+#   * states: every plane holds ONE value (0/1 piece & repetition planes,
+#     broadcast constants for colour / castling / clocks), so a plane is a
+#     64-bit mask plus one f16 scale -> 8 + 2 bytes per plane.
+#   * policies: a visit policy has <= (#legal moves) non-zeros (<= 218 in
+#     chess), so store (index, value) pairs.
+#   * legal-move masks: 1 bit per action.
+# All three are lossless w.r.t. what the buffer stored before (f16 states and
+# policies, 0/1 masks).
+
+def _pack_planes(states):
+    """(k, P, ...) -> (bits (k,P,ceil(cells/8)) u8, scale (k,P) f16, exact).
+
+    ``exact`` is True iff every plane takes at most one distinct non-zero
+    value (then ``bits * scale`` reproduces the f16 states bit-for-bit).
+    """
+    states = np.asarray(states)
+    k, P = states.shape[0], states.shape[1]
+    flat = states.reshape(k, P, -1)
+    nz = flat != 0
+    first = nz.argmax(axis=-1)
+    scale = np.take_along_axis(flat, first[..., None], axis=-1)[..., 0]
+    scale = np.where(nz.any(axis=-1), scale, 0).astype(np.float16)
+    exact = bool(np.array_equal(np.where(nz, scale[..., None], np.float16(0)),
+                                flat.astype(np.float16, copy=False)))
+    return np.packbits(nz, axis=-1), scale, exact
+
+
+def _unpack_planes(bits, scale, cells):
+    """Inverse of ``_pack_planes`` -> float32 (k, P, cells)."""
+    b = np.unpackbits(bits, axis=-1, count=cells)
+    return b.astype(np.float32) * scale.astype(np.float32)[..., None]
+
+
+def _pack_masks(masks):
+    return np.packbits(np.asarray(masks) != 0, axis=1)
+
+
+def _unpack_masks(bits, num_actions):
+    return np.unpackbits(bits, axis=1, count=num_actions)
+
+
+def _densify_policies(idx, val, num_actions):
+    """(k,K) index/value pairs (padding index == num_actions) -> (k,A) f32."""
+    d = np.zeros((len(idx), num_actions + 1), np.float32)
+    np.put_along_axis(d, idx.astype(np.int64), val.astype(np.float32), axis=1)
+    return d[:, :num_actions]
+
+
 class _BufferView:
     """Read-only list-like view over a ReplayBuffer.
 
     Keeps legacy code that does ``buffer.buffer[i][0]`` / ``len(buffer.buffer)``
     working.  Each item is a ``(state, policy, value, mask)`` tuple of float32
-    arrays (copies), so this is for occasional inspection, not hot paths.
+    arrays (decoded copies), so this is for occasional inspection, not hot paths.
     """
 
     def __init__(self, rb):
@@ -103,70 +156,185 @@ class _BufferView:
             i += n
         if not 0 <= i < n:
             raise IndexError(i)
-        return (rb._states[i].astype(np.float32),
-                rb._policies[i].astype(np.float32),
-                float(rb._values[i]),
-                rb._masks[i].astype(np.float32))
+        st, po, va, mk = rb._decode_rows(np.array([i]))
+        return (st[0], po[0], float(va[0]), mk[0].astype(np.float32))
+
+
+# On-disk buffer format version.  Bumped to 3 when the chess frame changed
+# (see encoding.FRAME_VERSION): older files store policy indices / states in
+# the previous frame and are refused by ReplayBuffer.load.
+_BUFFER_FMT = 3
 
 
 class ReplayBuffer:
-    """FIFO (circular) replay buffer backed by preallocated numpy arrays.
+    """FIFO (circular) replay buffer with compact, lossless storage.
 
     Storage is allocated lazily on the first ``add_game`` from the shapes of
-    the first position, then reused forever; adding a game is a handful of
-    block copies and sampling a batch is four fancy-indexing copies.
+    the first position, then reused forever.  Per position (chess):
+    bit-planes + per-plane scale for the state (1.2 KB), up to ``K`` sparse
+    (index, f16 value) pairs for the policy (0.9 KB), a packed legal-move mask
+    (0.6 KB) and the value -- about 2.7 KB instead of 29 KB.
+
+    If the first game's state planes are not "one value per plane" (some other
+    encoding), the buffer transparently falls back to dense f16 states and
+    still compacts policies and masks.
+
+    Training reads batches with ``sample_batch_compact`` (small arrays, decoded
+    on the GPU by ``training.decode_compact_batch``); ``sample_batch`` returns
+    the old dense arrays for anything else.
 
     Layout: physical slot ``i`` holds one position; ``_write_idx`` is the next
     slot to write (the oldest position once the buffer is full).
     """
 
-    STATE_DTYPE = np.float16
-    POLICY_DTYPE = np.float16
-    MASK_DTYPE = np.uint8
+    MAX_POLICY_SLOTS = 224    # >= max legal moves in chess (218): always exact there
 
-    def __init__(self, max_size=100000):
+    def __init__(self, max_size=100000, compact_states=True):
         self.max_size = int(max_size)
-        self._states = None       # (max_size, *state_shape)  float16
-        self._policies = None     # (max_size, num_actions)   float16
-        self._masks = None        # (max_size, num_actions)   uint8
+        self.compact_states = bool(compact_states)
+        self._planar = None          # True: bit-plane states; False: dense f16 states
+        self._state_shape = None     # (P, H, W)
+        self._num_actions = None
+        self._K = None
+        self._idx_dtype = None
+        self._st_bits = None         # (N, P, ceil(H*W/8)) u8   [planar]
+        self._st_scale = None        # (N, P) f16               [planar]
+        self._states = None          # (N, P, H, W) f16         [dense fallback]
+        self._pol_idx = None         # (N, K) u16 (pad = num_actions)
+        self._pol_val = None         # (N, K) f16
+        self._mask_bits = None       # (N, ceil(A/8)) u8
         self._values = np.zeros(self.max_size, dtype=np.float32)
-        self._size = 0            # number of valid positions
-        self._write_idx = 0       # circular write pointer
+        self._size = 0               # number of valid positions
+        self._write_idx = 0          # circular write pointer
         self.total_games = 0
         self.total_positions = 0
         self._rng = np.random.default_rng()
+        self._warned_overflow = False
 
     # ── allocation ──
 
-    def _alloc(self, state_shape, policy_shape, mask_shape):
-        self._states   = np.zeros((self.max_size,) + tuple(state_shape),  dtype=self.STATE_DTYPE)
-        self._policies = np.zeros((self.max_size,) + tuple(policy_shape), dtype=self.POLICY_DTYPE)
-        self._masks    = np.zeros((self.max_size,) + tuple(mask_shape),   dtype=self.MASK_DTYPE)
+    def _init_layout(self, state_shape, num_actions, planar, K=None):
+        self._state_shape = tuple(int(x) for x in state_shape)
+        self._num_actions = int(num_actions)
+        self._planar = bool(planar)
+        self._K = int(K) if K is not None else min(self._num_actions, self.MAX_POLICY_SLOTS)
+        self._idx_dtype = np.uint16 if self._num_actions < 65535 else np.uint32
+        N, P = self.max_size, self._state_shape[0]
+        if self._planar:
+            cells = int(np.prod(self._state_shape[1:]))
+            self._st_bits  = np.zeros((N, P, (cells + 7) // 8), np.uint8)
+            self._st_scale = np.zeros((N, P), np.float16)
+        else:
+            self._states = np.zeros((N,) + self._state_shape, np.float16)
+        self._pol_idx   = np.zeros((N, self._K), self._idx_dtype)
+        self._pol_val   = np.zeros((N, self._K), np.float16)
+        self._mask_bits = np.zeros((N, (self._num_actions + 7) // 8), np.uint8)
+
+    @property
+    def nbytes(self):
+        """Bytes held by the preallocated storage."""
+        arrs = (self._st_bits, self._st_scale, self._states, self._pol_idx,
+                self._pol_val, self._mask_bits, self._values)
+        return int(sum(a.nbytes for a in arrs if a is not None))
 
     @property
     def buffer(self):
         """Legacy list-like view (see _BufferView)."""
         return _BufferView(self)
 
+    # ── encoding helpers ──
+
+    def _sparsify_policies(self, pol):
+        """(k, A) policy rows -> ((k,K) idx, (k,K) f16 val)."""
+        pol16 = np.asarray(pol).astype(np.float16)
+        k, A = pol16.shape
+        K = self._K
+        cnt = (pol16 != 0).sum(axis=1)
+        if cnt.max(initial=0) > K:
+            # More visited moves than slots (cannot happen in chess with K=224):
+            # keep the K heaviest entries and rescale to the original mass.
+            if not self._warned_overflow:
+                print(f"[WARN] ReplayBuffer: a policy row has more than {K} non-zero "
+                      f"entries; keeping the {K} largest (renormalised).")
+                self._warned_overflow = True
+            pol16 = pol16.copy()
+            for r in np.nonzero(cnt > K)[0]:
+                row = pol16[r].astype(np.float32)
+                keep = np.argpartition(-row, K - 1)[:K]
+                kept = np.zeros_like(row)
+                kept[keep] = row[keep]
+                if kept.sum() > 0:
+                    kept *= row.sum() / kept.sum()
+                pol16[r] = kept.astype(np.float16)
+        rows, cols = np.nonzero(pol16)
+        cnt = np.bincount(rows, minlength=k)
+        rank = np.arange(len(rows)) - np.repeat(np.cumsum(cnt) - cnt, cnt)
+        idx = np.full((k, K), A, dtype=self._idx_dtype)
+        val = np.zeros((k, K), np.float16)
+        idx[rows, rank] = cols
+        val[rows, rank] = pol16[rows, cols]
+        return idx, val
+
+    def _decode_rows(self, ix):
+        """Dense float32 states/policies, float32 values, uint8 masks for slots ``ix``."""
+        cells = int(np.prod(self._state_shape[1:]))
+        if self._planar:
+            st = _unpack_planes(self._st_bits[ix], self._st_scale[ix], cells)
+            st = st.reshape((len(ix),) + self._state_shape)
+        else:
+            st = self._states[ix].astype(np.float32)
+        po = _densify_policies(self._pol_idx[ix], self._pol_val[ix], self._num_actions)
+        mk = _unpack_masks(self._mask_bits[ix], self._num_actions)
+        return st, po, self._values[ix], mk
+
     # ── writing ──
 
     def add_game(self, game_data):
         """Add a completed game's positions to the buffer.
 
-        game_data: list of (state, policy, value, legal_move_mask) tuples.
+        game_data: list of (state, policy, value, legal_move_mask) tuples
+        (any float/int dtypes; they are re-encoded compactly).
         """
-        k_orig = len(game_data)
+        if not game_data:
+            self.add_arrays(None, None, None, None)
+            return
+        self.add_arrays(np.stack([g[0] for g in game_data]),
+                        np.stack([g[1] for g in game_data]),
+                        np.fromiter((g[2] for g in game_data), dtype=np.float32,
+                                    count=len(game_data)),
+                        np.stack([g[3] for g in game_data]))
+
+    def add_arrays(self, states, policies, values, masks):
+        """Add one finished game given as stacked arrays (k, ...); ``None`` = empty game."""
+        k_orig = 0 if values is None else len(values)
         if k_orig:
-            if self._states is None:
-                s0, p0, _, m0 = game_data[0]
-                self._alloc(np.shape(s0), np.shape(p0), np.shape(m0))
-            gd = game_data[-self.max_size:] if k_orig > self.max_size else game_data
-            k = len(gd)
+            states, policies, masks = np.asarray(states), np.asarray(policies), np.asarray(masks)
+            if self._pol_idx is None:
+                planar = self.compact_states and _pack_planes(states)[2]
+                if self.compact_states and not planar:
+                    print("[WARN] ReplayBuffer: state planes are not one-value-per-plane; "
+                          "storing dense f16 states (policies/masks still compact).")
+                self._init_layout(states.shape[1:], policies.shape[1], planar)
+            if k_orig > self.max_size:
+                states, policies = states[-self.max_size:], policies[-self.max_size:]
+                values, masks = values[-self.max_size:], masks[-self.max_size:]
+            k = len(values)
             idx = (self._write_idx + np.arange(k)) % self.max_size
-            self._states[idx]   = np.stack([g[0] for g in gd])
-            self._policies[idx] = np.stack([g[1] for g in gd])
-            self._values[idx]   = np.fromiter((g[2] for g in gd), dtype=np.float32, count=k)
-            self._masks[idx]    = np.stack([g[3] for g in gd])
+            if self._planar:
+                bits, scale, exact = _pack_planes(states)
+                if not exact:
+                    raise ValueError("ReplayBuffer: a state plane holds more than one distinct "
+                                     "non-zero value, so bit-plane storage would be lossy "
+                                     "(construct ReplayBuffer(compact_states=False) for this encoding)")
+                self._st_bits[idx] = bits
+                self._st_scale[idx] = scale
+            else:
+                self._states[idx] = states
+            pidx, pval = self._sparsify_policies(policies)
+            self._pol_idx[idx] = pidx
+            self._pol_val[idx] = pval
+            self._mask_bits[idx] = _pack_masks(masks)
+            self._values[idx] = values
             self._write_idx = (self._write_idx + k) % self.max_size
             self._size = min(self.max_size, self._size + k)
             self.total_positions += k_orig
@@ -174,26 +342,59 @@ class ReplayBuffer:
 
     # ── reading ──
 
-    def sample_batch(self, batch_size):
-        """Sample a batch without replacement.
-
-        Returns (states f16, policies f16, values f32, masks u8) numpy arrays;
-        the training step converts them to float32 on the device.
-        """
+    def _sample_indices(self, batch_size):
         n = self._size
         k = min(int(batch_size), n)
         ix = self._rng.choice(n, size=k, replace=False)
         ix.sort()   # sequential-ish memory access
-        return (self._states[ix],
-                self._policies[ix],
-                self._values[ix],
-                self._masks[ix])
+        return ix
+
+    def sample_batch_compact(self, batch_size):
+        """Sample a batch WITHOUT decoding: a dict of small numpy arrays.
+
+        ``training.decode_compact_batch`` expands it on the training device
+        (~2.7 MB uploaded per 1024 positions instead of ~30 MB).
+        """
+        ix = self._sample_indices(batch_size)
+        d = {'slots': ix,                      # physical slots (for debugging/tests)
+             'values': self._values[ix],
+             'pol_idx': self._pol_idx[ix],
+             'pol_val': self._pol_val[ix],
+             'mask_bits': self._mask_bits[ix],
+             'state_shape': self._state_shape,
+             'num_actions': self._num_actions}
+        if self._planar:
+            d['st_bits'] = self._st_bits[ix]
+            d['st_scale'] = self._st_scale[ix]
+        else:
+            d['states'] = self._states[ix]
+        return d
+
+    def sample_batch(self, batch_size):
+        """Sample a batch and decode it on the CPU (compatibility path).
+
+        Returns (states f16, policies f16, values f32, masks u8) numpy arrays.
+        """
+        ix = self._sample_indices(batch_size)
+        st, po, va, mk = self._decode_rows(ix)
+        return st.astype(np.float16), po.astype(np.float16), va, mk
 
     def sample_states(self, n):
         """Random sample of ``n`` states as a float32 array (for diagnostics)."""
         k = min(int(n), self._size)
         ix = self._rng.choice(self._size, size=k, replace=False)
-        return self._states[ix].astype(np.float32)
+        return self._decode_rows(ix)[0]
+
+    def sample_states_with_masks(self, n):
+        """Random sample of ``n`` (states float32, legal-move masks uint8) pairs.
+
+        The masks are the same per-position 0/1 legal-move masks stored with
+        each position, used to restrict diagnostics (e.g. policy confidence) to
+        legal moves."""
+        k = min(int(n), self._size)
+        ix = self._rng.choice(self._size, size=k, replace=False)
+        st, _po, _va, mk = self._decode_rows(ix)
+        return st, mk
 
     def __len__(self): return self._size
 
@@ -213,40 +414,39 @@ class ReplayBuffer:
     def save(self, path, compress=False):
         """Save buffer to an .npz file (written atomically).
 
-        Slots are written in their PHYSICAL order together with the write
-        pointer (``write_idx``), so no reordered copy of the multi-GB arrays is
-        ever built in memory (the old version concatenated all four arrays,
-        i.e. a transient +100% of the buffer at every checkpoint).  ``load``
-        restores the age order from ``write_idx``.
-
-        ``compress=False`` (default) is much faster for multi-GB buffers;
-        pass True to trade save time for a smaller file.
+        Compact arrays are written in their PHYSICAL slot order together with
+        the write pointer, so no reordered copy is built in memory; ``load``
+        restores the age order from ``write_idx``.  ``compress=False`` is much
+        faster; the file is already small (~2.7 KB per position).
         """
         if self._size == 0:
             return
         n = self._size
+        arrays = dict(values=self._values[:n], pol_idx=self._pol_idx[:n],
+                      pol_val=self._pol_val[:n], mask_bits=self._mask_bits[:n])
+        if self._planar:
+            arrays.update(st_bits=self._st_bits[:n], st_scale=self._st_scale[:n])
+        else:
+            arrays['states'] = self._states[:n]
         path = str(path)
         tmp = path + ".tmp.npz"
         saver = np.savez_compressed if compress else np.savez
-        saver(
-            tmp,
-            states=self._states[:n], policies=self._policies[:n],
-            values=self._values[:n], masks=self._masks[:n],
-            write_idx=self._write_idx,
-            total_games=self.total_games,
-            total_positions=self.total_positions,
-        )
+        saver(tmp, write_idx=self._write_idx, total_games=self.total_games,
+              total_positions=self.total_positions, fmt=np.int32(_BUFFER_FMT),
+              frame_version=np.int32(FRAME_VERSION),
+              state_shape=np.array(self._state_shape, dtype=np.int64),
+              num_actions=np.int64(self._num_actions), **arrays)
         os.replace(tmp, path)
 
     @classmethod
-    def load(cls, path, max_size=100000):
+    def load(cls, path, max_size=100000, compact_states=True):
         """Load buffer from a .npz file. Returns a new ReplayBuffer, or None on failure.
 
-        Accepts the current format (physical slot order + ``write_idx``) and
-        older files (oldest-first, no ``write_idx``); float32 or compact
-        dtypes are both cast to the storage dtypes.  Arrays are staged one at
-        a time straight into the preallocated storage, so peak memory is the
-        final buffer plus ONE source array (not 2x the buffer).
+        Accepts the compact format and every older (dense) format: float32 or
+        f16 states/policies, with or without legal-move masks, oldest-first or
+        physical order + ``write_idx``.  Dense arrays are converted one array
+        at a time in chunks, so peak memory is the compact buffer plus ONE
+        dense source array.
 
         Backward compatibility: buffers saved before legal-move masking was
         added won't have a 'masks' array. In that case we fill in all-ones
@@ -257,7 +457,17 @@ class ReplayBuffer:
         """
         try:
             data = np.load(path, allow_pickle=False)
-            buf = cls(max_size=max_size)
+            fmt = int(data['fmt']) if 'fmt' in data else 0
+            if fmt < _BUFFER_FMT:
+                raise FrameVersionError(
+                    f"Replay buffer '{path}' is format v{fmt} but this build "
+                    f"requires v{_BUFFER_FMT} (frame_version="
+                    f"{FRAME_VERSION}). The chess input/policy frame changed "
+                    f"(rank-flip encoder + mover-relative policy); the old "
+                    f"buffer would train on mislabelled targets. Delete or "
+                    f"back up the old replay buffer and start a fresh run."
+                )
+            buf = cls(max_size=max_size, compact_states=compact_states)
             max_size = buf.max_size
             values = data['values']
             n_saved = len(values)
@@ -266,15 +476,8 @@ class ReplayBuffer:
             if n_saved == 0:
                 return buf
 
-            has_masks = 'masks' in data
-            if not has_masks:
-                print(f"[WARN] {path} has no saved legal-move masks (old format). "
-                      f"Filling with all-ones masks for {n_saved} positions — these will "
-                      f"train without masking until they age out of the buffer.")
-
-            # Age order: new files are in physical slot order with the write
-            # pointer ``w`` (oldest position = slot w once full); legacy files
-            # are already oldest-first (w = 0).
+            # Age order: files with ``write_idx`` hold physical slot order (oldest
+            # = slot w once full); older files are already oldest-first (w = 0).
             w = int(data['write_idx']) if 'write_idx' in data else 0
             if n_saved > max_size or (n_saved < max_size and 0 < w < n_saved):
                 order = np.concatenate((np.arange(w, n_saved), np.arange(0, w)))
@@ -289,22 +492,63 @@ class ReplayBuffer:
                 n = n_saved
                 buf._write_idx = (w % max_size) if n_saved == max_size else (n % max_size)
 
+            def rows(arr, s, e):          # logical positions [s, e) of a saved array
+                return arr[s:e] if order is None else arr[order[s:e]]
+
             buf._values[:n] = values if order is None else values[order]
             del values
-            for name, attr, dt in (('states',   '_states',   cls.STATE_DTYPE),
-                                   ('policies', '_policies', cls.POLICY_DTYPE),
-                                   ('masks',    '_masks',    cls.MASK_DTYPE)):
-                if name == 'masks' and not has_masks:
-                    full = np.zeros((max_size,) + buf._policies.shape[1:], dtype=dt)
-                    full[:n] = 1
-                else:
-                    arr = data[name]
-                    full = np.zeros((max_size,) + arr.shape[1:], dtype=dt)
-                    full[:n] = arr if order is None else arr[order]
+
+            if 'pol_idx' in data:                       # ── compact format ──
+                shape = tuple(int(x) for x in data['state_shape'])
+                planar = 'st_bits' in data
+                buf._init_layout(shape, int(data['num_actions']), planar,
+                                 K=data['pol_idx'].shape[1])
+                keys = [('pol_idx', '_pol_idx'), ('pol_val', '_pol_val'),
+                        ('mask_bits', '_mask_bits')]
+                keys += ([('st_bits', '_st_bits'), ('st_scale', '_st_scale')]
+                         if planar else [('states', '_states')])
+                for key, attr in keys:
+                    arr = data[key]
+                    getattr(buf, attr)[:n] = arr if order is None else arr[order]
                     del arr
-                setattr(buf, attr, full)
+            else:                                       # ── legacy dense format ──
+                CH = 2048
+                A = game_api.num_actions()
+                states = data['states']
+                planar = bool(compact_states) and _pack_planes(rows(states, 0, min(n, CH)))[2]
+                buf._init_layout(states.shape[1:], A, planar)
+                for s in range(0, n, CH):
+                    e = min(n, s + CH)
+                    chunk = rows(states, s, e)
+                    if planar:
+                        bits, scale, exact = _pack_planes(chunk)
+                        if not exact:
+                            raise ValueError("legacy states are not one-value-per-plane")
+                        buf._st_bits[s:e], buf._st_scale[s:e] = bits, scale
+                    else:
+                        buf._states[s:e] = chunk
+                del states
+                policies = data['policies']
+                for s in range(0, n, CH):
+                    e = min(n, s + CH)
+                    buf._pol_idx[s:e], buf._pol_val[s:e] = buf._sparsify_policies(rows(policies, s, e))
+                del policies
+                if 'masks' in data:
+                    masks = data['masks']
+                    for s in range(0, n, CH):
+                        e = min(n, s + CH)
+                        buf._mask_bits[s:e] = _pack_masks(rows(masks, s, e))
+                    del masks
+                else:
+                    print(f"[WARN] {path} has no saved legal-move masks (old format). "
+                          f"Filling with all-ones masks for {n} positions — these will "
+                          f"train without masking until they age out of the buffer.")
+                    buf._mask_bits[:n] = _pack_masks(np.ones((1, A), np.uint8))[0]
             buf._size = n
             return buf
+        except FrameVersionError:
+            # Refuse stale-frame buffers loudly; do NOT silently start fresh.
+            raise
         except Exception as e:
             print(f"[WARN] Could not load replay buffer from {path}: {e}")
             return None
@@ -932,9 +1176,6 @@ def _worker_loop_single(worker_id, task_queue, result_queue, config_dict, shutdo
         net.load_state_dict(torch.load(buf, map_location='cpu', weights_only=True))
         net.eval()
 
-    # The forced-mate override is wired ONLY into the selfplay branch below
-    # (force_mate=True).  Eval branches (gating / reference) keep it disabled
-    # so they measure true strength.
     force_mate_enabled = (getattr(config.selfplay, 'force_mate', False)
                           and game_api.is_game('chess'))
 

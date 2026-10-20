@@ -20,31 +20,42 @@ Board Representation — matches the AlphaZero paper's M*T + L structure
 
     Total planes = 14*8 + 7 = 119.
 
-    The board is oriented to the perspective of the CURRENT player (P1):
+    The board is oriented to the perspective of the CURRENT player (P1)
+    using a RANK FLIP (files preserved):
       - When White is to move, the board is in the absolute frame
-        (row 0 = rank 8, col 0 = file a).
-      - When Black is to move, the board is rotated 180 degrees
-        (row 0 = rank 1, col 0 = file h), so the current player's home
-        rank is always at row 0 and P1's pawns always advance toward
-        increasing row.
+        (row 0 = rank 1, col 0 = file a).
+      - When Black is to move, only the ranks are flipped
+        (square -> square ^ 56, i.e. a1<->a8, h1<->h8), so row 0 = rank 8
+        (the mover's home rank) and the FILES are unchanged.  Preserving
+        the files keeps the mover's kingside on the h-file (so kingside /
+        queenside castling, and the castling planes, stay consistent with
+        the true colour mirror sigma = rank-flip + colour-swap; a 180-deg
+        rotation would also swap kingside<->queenside).
       - Piece planes represent "player's pieces" (P1) vs "opponent's
         pieces" (P2) rather than white/black.
       - Castling planes are player-relative (P1 = current player's
         rights, P2 = opponent's rights).
-      - The colour plane holds P1's absolute colour (1.0 if White is to
-        move, else 0.0) — this is the paper's "player's colour".
+      - The side-to-move plane is a constant 1.0: the input is fully
+        colour-neutral (the mover is always P1), so the absolute colour
+        is redundant and would otherwise break colour symmetry.
 
-    NOTE: the policy / action output is NOT player-relative.  Per the
-    AlphaZero chess paper, the 8x8x73 policy uses ABSOLUTE compass
-    directions (N = toward rank 8 for both players).  The network maps a
-    player-oriented input to absolute-direction move outputs.  This is
-    the opposite of Shogi, where the action space is also player-relative.
+    NOTE: the policy / action output is MOVER-RELATIVE (frames match the
+    input exactly): the source square is given in the mover's (rank-flipped)
+    frame and the compass directions are the mover's (its "forward" is
+    always toward increasing rank).  Combined with the rank-flip input
+    this makes the whole pipeline colour-neutral:
+        encode(sigma P) == encode(P)
+        index(sigma m in sigma P) == index(m in P)
+    where sigma = rank-flip + colour-swap.  A Black-to-move position is
+    therefore indistinguishable from its colour-mirrored White-to-move
+    twin in both input and policy labels.
 
-    NOTE: this is a BREAKING change to the input representation.  Any
-    existing checkpoints and replay-buffer data were trained on the old
-    104-plane absolute white/black encoding and are INCOMPATIBLE — they
-    must be discarded (start a fresh run with checkpoints/ and
-    replay_buffer.npz removed or backed up).
+    NOTE: this is a BREAKING change to the input representation (frame
+    version 2).  Checkpoints and replay buffers carry a frame-version
+    marker and older ones are REFUSED at load, so start a fresh run with
+    checkpoints/ and replay_buffer.npz removed or backed up.  The marker is
+    checked in network.load_checkpoint / create_model_from_checkpoint and
+    ReplayBuffer.load.
 
     Note on repetition planes: computed per-timestep by walking
     board.is_repetition(n) upward (n=2,3) and setting the corresponding
@@ -64,11 +75,13 @@ Board Representation — matches the AlphaZero paper's M*T + L structure
     and the last move in the history).  The paper's Table S1 doesn't list
     it either.
 
-Move Encoding (8x8x73 = 4672 action space) — unchanged, matches Table S2:
+Move Encoding (8x8x73 = 4672 action space), MOVER-RELATIVE:
     Planes 0-55:  Queen-like moves (8 directions × 7 distances)
     Planes 56-63: Knight moves (8 offsets)
     Planes 64-72: Underpromotions (3 pieces × 3 horizontal offsets)
     - Queen promotions are encoded as queen-like moves (forward direction)
+    - The source square and all directions are expressed in the mover's
+      frame (rank flip for Black), so sigma commutes with the encoding.
 """
 
 import numpy as np
@@ -109,7 +122,7 @@ PLANE_REPETITION_P1 = 12
 PLANE_REPETITION_P2 = 13
 
 # ── L = 7 constant-valued planes, appended ONCE after all history planes ──
-PLANE_SIDE_TO_MOVE = NUM_HISTORY_PLANES        # 112  (P1's absolute colour)
+PLANE_SIDE_TO_MOVE = NUM_HISTORY_PLANES        # 112  (constant 1.0)
 PLANE_CASTLING_P1_K = NUM_HISTORY_PLANES + 1   # 113
 PLANE_CASTLING_P1_Q = NUM_HISTORY_PLANES + 2   # 114
 PLANE_CASTLING_P2_K = NUM_HISTORY_PLANES + 3   # 115
@@ -136,20 +149,31 @@ NO_PROGRESS_NORM = 100.0
 
 NUM_ACTIONS = 8 * 8 * 73  # 4672
 
-# Queen move directions: (dr, dc)
-# row 0 = rank 8 (top), col 0 = file a (left)
-# NOTE: these are ABSOLUTE directions (N = toward rank 8), used for the
-# policy output.  The input board is player-oriented, but the action
-# space is absolute per the AlphaZero chess paper.
+# Frame version.  Bump whenever the input encoding / policy frame changes in
+# a way that invalidates checkpoints or replay buffers.  Bumped to 2 when the
+# encoder switched from a 180-deg rotation to a rank flip and the policy from
+# absolute to mover-relative (colour-neutral frame).
+FRAME_VERSION = 2
+
+
+class FrameVersionError(ValueError):
+    """Raised when a checkpoint / replay buffer predates the current frame.
+
+    See ``FRAME_VERSION``.  Reserved for the mismatch case so callers can
+    refuse stale data loudly while still tolerating genuinely missing files.
+    """
+
+# Queen move directions: (dr, dc), in the MOVER's frame.
+# row 0 = the mover's home rank, col 0 = file a (left, files preserved).
 QUEEN_DIRECTIONS = [
-    (-1, 0),   # 0: N  (toward rank 8)
-    (-1, +1),  # 1: NE
-    (0, +1),   # 2: E  (toward file h)
-    (+1, +1),  # 3: SE
-    (+1, 0),   # 4: S  (toward rank 1)
-    (+1, -1),  # 5: SW
-    (0, -1),   # 6: W  (toward file a)
-    (-1, -1),  # 7: NW
+    (-1, 0),   # 0: toward the opponent's back rank
+    (-1, +1),  # 1
+    (0, +1),   # 2: toward file h
+    (+1, +1),  # 3
+    (+1, 0),   # 4: forward (toward the mover's promotion rank)
+    (+1, -1),  # 5
+    (0, -1),   # 6: toward file a
+    (-1, -1),  # 7
 ]
 
 # Knight move offsets: (dr, dc)
@@ -164,15 +188,13 @@ KNIGHT_OFFSETS = [
     (+2, -1),  # 63
 ]
 
-# Underpromotion encoding (from white's perspective: "forward" = toward rank 8)
+# Underpromotion encoding, in the MOVER's frame: "forward" is always
+# increasing rank (+dr), for both colours (the mover's frame is oriented so
+# its pawns advance toward increasing rank).
 # Index 64-72 = piece_type_offset * 3 + direction_offset
 # piece_type: 0=knight, 1=bishop, 2=rook
 # direction: 0=forward, 1=forward-left, 2=forward-right
 UNDERPROMOTION_OFFSETS = {
-    # (dr, dc) for white pawn moving forward (toward rank 8)
-    # chess.square_rank(): rank 0 = rank 1, rank 7 = rank 8
-    # Forward for white = increasing rank = +dr
-    # Forward for black = decreasing rank = -dr (inverted in policy_index_to_move)
     "forward":      (1, 0),
     "forward_left": (1, -1),
     "forward_right": (1, +1),
@@ -187,13 +209,16 @@ def _underpromotion_plane(piece_type, dir_idx):
     return 64 + piece_idx * 3 + dir_idx
 
 
-def _rotate_square(sq: int) -> int:
-    """Rotate a square 180 degrees (player-oriented frame).
+def _rank_flip_square(sq: int) -> int:
+    """Flip a square's rank (player-oriented frame), preserving the file.
 
-    ``(rank, file) -> (7 - rank, 7 - file)``.  Used when Black is to move
-    so the current player's home rank is always at array row 0.
+    ``(rank, file) -> (7 - rank, file)``, i.e. ``sq ^ 56`` (a1<->a8).  Used
+    when Black is to move so the current player's home rank is always at
+    array row 0 while the files (and therefore kingside/queenside) are
+    unchanged.  This is the true colour mirror when combined with the
+    colour swap, so ``encode(sigma P) == encode(P)``.
     """
-    return 63 - sq
+    return sq ^ 56
 
 
 def _encode_single_position(board, plane_offset, tensor):
@@ -202,9 +227,9 @@ def _encode_single_position(board, plane_offset, tensor):
     once as global L-planes by ``board_to_tensor``.
 
     The position is oriented to the perspective of the current player
-    (``board.turn``): when Black is to move the board is rotated 180
-    degrees, and piece planes represent P1 (current player) vs P2
-    (opponent) rather than white/black.
+    (``board.turn``): when Black is to move the ranks are flipped
+    (``sq ^ 56``, files preserved), and piece planes represent P1
+    (current player) vs P2 (opponent) rather than white/black.
 
     Uses the Rust ``FastBoard.piece_map()`` to iterate only over occupied
     squares, and extracts ``piece_type`` / ``color`` from the raw
@@ -219,7 +244,7 @@ def _encode_single_position(board, plane_offset, tensor):
         pt = p.piece_type        # 1..6 (PAWN..KING)
         color = p.color          # True = WHITE, False = BLACK
         if rotate:
-            sq = _rotate_square(sq)
+            sq = _rank_flip_square(sq)
         row = sq >> 3
         col = sq & 7
         if color == p1_color:
@@ -236,8 +261,10 @@ def _encode_single_position(board, plane_offset, tensor):
 
 def _encode_global_planes(board: chess.Board, tensor: np.ndarray):
     """Write the L=7 constant-valued planes (once, not per-timestep)."""
-    # Player's colour (P1's absolute colour): 1.0 if White to move.
-    tensor[PLANE_SIDE_TO_MOVE, :, :] = 1.0 if board.turn == chess.WHITE else 0.0
+    # Side-to-move plane is a constant 1.0: with the mover-oriented frame
+    # the mover is always P1, so the absolute colour carries no information
+    # and would otherwise break colour symmetry (encode(sigma P) == encode(P)).
+    tensor[PLANE_SIDE_TO_MOVE, :, :] = 1.0
 
     # Castling rights, player-relative: P1 = current player, P2 = opponent.
     p1 = board.turn
@@ -275,13 +302,13 @@ def board_to_tensor(board: chess.Board,
     Structure: M*T + L, per the AlphaZero paper (Table S1, Chess column):
       - M=14 planes per history step (6 P1 pieces + 6 P2 pieces + 2
         repetition), repeated for T=8 history steps (112 planes)
-      - L=7 constant-valued planes appended once: player's colour, 4
-        player-relative castling rights, no-progress count, total move
-        count.
+      - L=7 constant-valued planes appended once: constant side-to-move
+        plane (1.0), 4 player-relative castling rights, no-progress count,
+        total move count.
 
-    The board is oriented to the current player's perspective: rotated
-    180 degrees when Black is to move, with P1/P2 piece planes and
-    player-relative castling.
+    The board is oriented to the current player's perspective: ranks are
+    flipped (``sq ^ 56``, files preserved) when Black is to move, with
+    P1/P2 piece planes and player-relative castling.
 
     **Optimization**: Instead of creating 8 separate board copies (one per
     history step), we copy the board once and walk backwards by popping
@@ -342,60 +369,54 @@ def move_to_policy_index(move: chess.Move, board: chess.Board) -> int:
     The policy space is organized as 8*8*73, where for each source square
     (in rank-file order, rank 0 first), there are 73 possible move planes.
 
-    NOTE: the policy uses ABSOLUTE compass directions (N = toward rank 8
-    for both players), per the AlphaZero chess paper.  The input board is
-    player-oriented, but the action space is absolute.
+    The whole index is expressed in the MOVER's frame: for Black the source
+    and destination squares are rank-flipped (``^ 56``) so that the mover's
+    pawns always advance toward increasing rank, matching the input
+    encoding.  This makes the encoding colour-neutral:
+    ``index(sigma m in sigma P) == index(m in P)``.
     """
     # The expensive part here is *not* the index math but the cache KEY: the
     # old @lru_cache was keyed on (move, board), and Board.__hash__ computes a
-    # full fen() on EVERY call.  Underpromotion direction depends only on
-    # `board.turn`, so cache on (move, turn) and avoid hashing the board.
+    # full fen() on EVERY call.  The frame (and underpromotion direction)
+    # depends only on `board.turn`, so cache on (move, turn).
     return _move_to_policy_index_cached(move, board.turn)
 
 
 @lru_cache(maxsize=8192)
 def _move_to_policy_index_cached(move: chess.Move, turn: bool) -> int:
-    from_rank = chess.square_rank(move.from_square)
-    from_file = chess.square_file(move.from_square)
-    to_rank = chess.square_rank(move.to_square)
-    to_file = chess.square_file(move.to_square)
+    # Express the move in the mover's frame (rank flip for Black, files
+    # preserved), matching the input encoding.
+    from_sq = move.from_square
+    to_sq = move.to_square
+    if turn == chess.BLACK:
+        from_sq ^= 56
+        to_sq ^= 56
 
-    # dr, dc relative to source (in rank-file coordinates)
+    from_rank = from_sq >> 3
+    from_file = from_sq & 7
+    to_rank = to_sq >> 3
+    to_file = to_sq & 7
+
+    # dr, dc relative to source (in the mover's rank-file coordinates)
     dr = to_rank - from_rank
     dc = to_file - from_file
 
-    # Underpromotion direction is turn-dependent (no board access needed).
-    is_promotion = move.promotion is not None
-
-    if is_promotion and move.promotion in (chess.KNIGHT, chess.BISHOP, chess.ROOK):
-        # Underpromotion
-        # For white: forward = +1 rank, for black: forward = -1 rank
-        if turn == chess.WHITE:
-            if dr == 1 and dc == 0:
-                dir_idx = 0  # forward
-            elif dr == 1 and dc == -1:
-                dir_idx = 1  # forward-left
-            elif dr == 1 and dc == 1:
-                dir_idx = 2  # forward-right
-            else:
-                raise ValueError(f"Invalid underpromotion move: {move}")
+    promo = move.promotion
+    if promo in (chess.KNIGHT, chess.BISHOP, chess.ROOK):
+        # Underpromotion: in the mover's frame "forward" is always +dr.
+        if dr == 1 and dc == 0:
+            dir_idx = 0  # forward
+        elif dr == 1 and dc == -1:
+            dir_idx = 1  # forward-left
+        elif dr == 1 and dc == 1:
+            dir_idx = 2  # forward-right
         else:
-            if dr == -1 and dc == 0:
-                dir_idx = 0  # forward
-            elif dr == -1 and dc == 1:
-                dir_idx = 1  # forward-left (from black's perspective, going toward rank 1)
-            elif dr == -1 and dc == -1:
-                dir_idx = 2  # forward-right
-            else:
-                raise ValueError(f"Invalid underpromotion move: {move}")
-
-        plane = _underpromotion_plane(move.promotion, dir_idx)
+            raise ValueError(f"Invalid underpromotion move: {move}")
+        plane = _underpromotion_plane(promo, dir_idx)
     else:
         # Queen-like or knight move (including queen promotions)
-        # Try to find as queen-like move
         plane = _find_queen_move_plane(dr, dc)
         if plane is None:
-            # Try knight move
             plane = _find_knight_move_plane(dr, dc)
         if plane is None:
             raise ValueError(f"Cannot encode move {move} (dr={dr}, dc={dc})")
@@ -464,9 +485,15 @@ def policy_index_to_move(index: int, board: chess.Board) -> chess.Move:
     source_idx = index // 73
     plane = index % 73
 
+    # Coordinates are in the MOVER's frame; the source rank/file are used
+    # directly for the delta math, then mapped back to absolute squares.
     from_rank = source_idx // 8
     from_file = source_idx % 8
+
+    turn = board.turn
     from_square = rank_file_to_square(from_rank, from_file)
+    if turn == chess.BLACK:
+        from_square ^= 56
 
     piece = board.piece_at(from_square)
     if piece is None:
@@ -486,43 +513,29 @@ def policy_index_to_move(index: int, board: chess.Board) -> chess.Move:
         to_rank = from_rank + kdr
         to_file = from_file + kdc
     else:
-        # Underpromotion
+        # Underpromotion: "forward" is +dr in the mover's frame (both colours)
         under_idx = plane - 64
-        piece_idx = under_idx // 3
         dir_idx = under_idx % 3
-        promo_piece = UNDERPROMOTION_PIECES[piece_idx]
-
-        dir_name = UNDERPROMOTION_DIRS[dir_idx]
-        dr, dc = UNDERPROMOTION_OFFSETS[dir_name]
-
-        # Adjust direction based on color
-        if board.turn == chess.BLACK:
-            dr = -dr
-            dc = -dc
-
+        dr, dc = UNDERPROMOTION_OFFSETS[UNDERPROMOTION_DIRS[dir_idx]]
         to_rank = from_rank + dr
         to_file = from_file + dc
 
-    # Bounds check
+    # Bounds check (mover frame)
     if not (0 <= to_rank < 8 and 0 <= to_file < 8):
         return None
 
     to_square = rank_file_to_square(to_rank, to_file)
+    if turn == chess.BLACK:
+        to_square ^= 56
 
-    # Determine promotion
+    # Determine promotion: the mover's promotion rank is rank 7 in its frame.
     promotion = None
-    if piece.piece_type == chess.PAWN:
-        if (board.turn == chess.WHITE and to_rank == 7) or \
-           (board.turn == chess.BLACK and to_rank == 0):
-            if plane < 56 or plane >= 64:
-                # Queen-like move for a pawn to promotion rank = queen promotion
-                # Underpromotion planes have their own piece type
-                if plane < 56:
-                    promotion = chess.QUEEN
-                else:
-                    under_idx = plane - 64
-                    piece_idx = under_idx // 3
-                    promotion = UNDERPROMOTION_PIECES[piece_idx]
+    if piece.piece_type == chess.PAWN and to_rank == 7:
+        if plane < 56:
+            # Queen-like plane to the promotion rank = queen promotion.
+            promotion = chess.QUEEN
+        elif plane >= 64:
+            promotion = UNDERPROMOTION_PIECES[(plane - 64) // 3]
 
     move = chess.Move(from_square, to_square, promotion=promotion)
 

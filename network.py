@@ -14,6 +14,30 @@ import numpy as np
 from typing import Tuple, Optional
 
 import game_api
+from encoding import FRAME_VERSION, FrameVersionError
+
+
+def _check_frame_version(checkpoint: dict, path: str):
+    """Refuse checkpoints saved under a different input/policy frame.
+
+    The chess input encoding and policy indexing were changed in frame
+    version 2 (rank-flip encoder + mover-relative policy).  A checkpoint
+    trained under an older frame is silently misinterpreted, so we raise
+    instead of loading it.  Non-chess checkpoints are not frame-versioned.
+    """
+    gname = checkpoint.get('game_name')
+    is_chess = (gname == 'chess') or (gname is None and game_api.is_game('chess'))
+    if not is_chess:
+        return
+    fv = checkpoint.get('frame_version')
+    if fv != FRAME_VERSION:
+        raise FrameVersionError(
+            f"Checkpoint '{path}' has frame_version={fv!r} but this build "
+            f"requires frame_version={FRAME_VERSION}. The chess input/policy "
+            f"frame changed (rank-flip encoder + mover-relative policy); old "
+            f"checkpoints are incompatible. Delete or back up the old "
+            f"checkpoints and start a fresh run."
+        )
 
 
 class ResBlock(nn.Module):
@@ -227,6 +251,7 @@ def save_checkpoint(model: AlphaZeroNet, optimizer, path: str,
         'optimizer_state_dict': optimizer.state_dict() if optimizer else None,
         'step': step,
         'game_name': model.game_name,
+        'frame_version': FRAME_VERSION,
         'num_residual_blocks': model.num_residual_blocks,
         'num_filters': model.num_filters,
         'num_policy_channels': model.num_policy_channels,
@@ -248,6 +273,7 @@ def load_checkpoint(path: str, model: AlphaZeroNet = None,
     # weights_only=True: checkpoints contain only tensors / primitives, so we
     # never unpickle arbitrary objects from a checkpoint file.
     checkpoint = torch.load(path, map_location='cpu', weights_only=True)
+    _check_frame_version(checkpoint, path)
 
     if model is not None:
         model.load_state_dict(checkpoint['model_state_dict'])
@@ -265,6 +291,7 @@ def create_model_from_checkpoint(path: str) -> Tuple[AlphaZeroNet, dict]:
     Returns (model, checkpoint_dict).
     """
     checkpoint = torch.load(path, map_location='cpu', weights_only=True)
+    _check_frame_version(checkpoint, path)
 
     required = ('num_residual_blocks', 'num_filters', 'num_policy_channels',
                 'num_value_channels', 'value_fc_size')

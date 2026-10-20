@@ -306,9 +306,19 @@ class InferenceClient:
                 else:
                     self._response_cache[resp_id] = (policies[0], float(values[0]))
             else:
-                # ── Queue response: (req_id, policy, value) ──
-                resp_id, policy, value = resp
+                # ── Queue response: (req_id, policies, values) ──
+                # The server always sends full arrays now; decide whether the
+                # caller wanted the arrays (predict_batch) or a single
+                # (policy_vector, scalar) pair (predict) via _batch_req_ids.
+                resp_id, policies, values = resp
+                if resp_id in self._batch_req_ids:
+                    self._batch_req_ids.discard(resp_id)
+                    out = (policies, values)
+                else:
+                    out = (policies[0], float(values[0]))
                 if resp_id == req_id:
-                    return policy, value
+                    self._slot_by_req.pop(resp_id, None)
+                    return out
                 # Out-of-order response — cache it and keep waiting
-                self._response_cache[resp_id] = (policy, value)
+                self._slot_by_req.pop(resp_id, None)
+                self._response_cache[resp_id] = out

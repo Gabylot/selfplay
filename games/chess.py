@@ -16,6 +16,9 @@ num_planes = encoding.NUM_PLANES
 num_actions = encoding.NUM_ACTIONS
 policy_channels = 73
 
+# Index of the constant side-to-move plane (see encoding._encode_global_planes).
+stm_plane = encoding.PLANE_SIDE_TO_MOVE
+
 
 def encode(state):
     return encoding.board_to_tensor(state)
@@ -87,6 +90,11 @@ def adjudicate_value(state, piece_values=None, graded=False, scaling=7.0):
     NOTE: matches the engine's historical material adjudication (white
     perspective, no turn flip) so training signals don't change.  Connect4
     has no material and always returns 0.0.
+
+    When graded, the material margin is clamped to one queen's value before
+    the tanh: a runaway advantage (e.g. +30 pawns) must not push the value
+    toward ~1.0, which would make it indistinguishable from a forced mate.
+    With scaling=9.0 the maximum is tanh(9/9) = ~0.762 (a lone queen).
     """
     if piece_values is None:
         piece_values = {"P": 1, "N": 3, "B": 3, "R": 5, "Q": 9}
@@ -99,6 +107,9 @@ def adjudicate_value(state, piece_values=None, graded=False, scaling=7.0):
             b += v
     diff = w - b
     if graded:
+        # One-queen cap: material guides, but never outshines checkmate (1.0).
+        cap = piece_values.get("Q", 9)
+        diff = max(-cap, min(cap, diff))
         return 0.0 if diff == 0 else float(np.tanh(diff / scaling))
     return 1.0 if diff > 0 else (-1.0 if diff < 0 else 0.0)
 

@@ -256,7 +256,10 @@ class StatsLogger:
         self.conn.commit()
     
     def log_network_stats(self, step: int, avg_max_policy: float, avg_abs_value: float):
-        """Log network confidence trends."""
+        """Log network confidence trends.
+
+        ``avg_max_policy`` is the mean top legal-move probability (masked and
+        renormalised over legal moves)."""
         self.conn.execute(
             "INSERT INTO network_stats (step, avg_max_policy, avg_abs_value, timestamp) "
             "VALUES (?, ?, ?, ?)",

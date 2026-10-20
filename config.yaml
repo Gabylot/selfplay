@@ -9,11 +9,11 @@ game:
 
 # --- Network Architecture ---
 network:
-  num_residual_blocks: 2
-  num_filters: 32
-  num_policy_channels: 32
-  num_value_channels: 8
-  value_fc_size: 64
+  num_residual_blocks: 8
+  num_filters: 128
+  num_policy_channels: 128
+  num_value_channels: 32
+  value_fc_size: 128
 
 # --- MCTS ---
 mcts:
@@ -28,8 +28,8 @@ mcts:
 # --- Self-Play ---
 selfplay:
   network_source: latest      # "latest" (always use newest network) or "gated_best"
-  num_workers: 12              # Worker processes (8 physical cores; >cores slows CPU-bound MCTS)
-  games_per_worker: 6          # Concurrent games per worker process (1 = one game at a time).
+  num_workers: 8              # Worker processes (8 physical cores; >cores slows CPU-bound MCTS)
+  games_per_worker: 8          # Concurrent games per worker process (1 = one game at a time).
                                # >1 gives each game its own private GPU inference endpoint, so the
                                # worker overlaps one game's MCTS tree-walk with another game's GPU
                                # round-trip (fills idle CPU) with NO visit-flattening penalty. The GUI
@@ -63,7 +63,10 @@ selfplay:
   endgame_piece_gate: 1
   endgame_num_simulations: 200
   adjudicate_graded: true     # use tanh grading instead of flat ±1
-  adjudicate_scaling: 9.0     # queen = ~0.76, rook = ~0.51, pawn = ~0.11
+  adjudicate_scaling: 9.0     # margin is clamped to ±1 queen before tanh, so
+                              # the value saturates at ~0.76 (a lone queen):
+                              # queen+ = ~0.76, rook = ~0.51, pawn = ~0.11.
+                              # Material guides but never approaches mate (1.0).
   # Exact forced-mate override for endgame conversion.
   # When true, self-play move selection is overridden by a proof search
   # when a forced mate within force_mate_max_plies exists on a board
@@ -79,7 +82,7 @@ selfplay:
 
 # --- Replay Buffer ---
 buffer:
-  max_size: 200000            # Max positions in replay buffer
+  max_size: 150000            # Max positions in replay buffer
 
 # --- Training ---
 training:
@@ -92,6 +95,11 @@ training:
   training_steps_per_iteration: 10  # Games completed between training sessions
   target_replay_ratio: 8       # trains each new position ~8 times; 0 = fixed num_batches_per_step
   max_batches_per_step: 64     # cap per session so a burst of games can't stall self-play
+  # Step-decay LR schedule, in TOTAL self-play games (the "total" number in the
+  # [Cycle] line; resume-safe).  lr = learning_rate * lr_gamma ** (milestones passed).
+  # Placeholder for a ~300k-game run: 40% = 120000, 80% = 240000.  Edit to your plan.
+  lr_milestone_games: [120000, 240000]
+  lr_gamma: 0.1
 
 # --- Evaluation ---
 evaluation:
@@ -100,6 +108,14 @@ evaluation:
   gate_win_threshold: 0.55    # Win rate needed to promote
   ref_opponent_games: 50      # Games vs alpha-beta reference
   elo_k_factor: 32            # Elo K-factor
+  # Adaptive alpha-beta reference depth: after a reference eval scoring
+  # (wins + 0.5*draws) >= ref_depth_threshold for ref_depth_streak evals in a row,
+  # the reference depth goes up by one (starting at alpha_beta.depth), up to
+  # ref_depth_max.  Deeper references are much slower and eval pauses self-play.
+  ref_depth_adaptive: true
+  ref_depth_threshold: 0.55
+  ref_depth_streak: 2         # 1 = promote on a single eval (noisy with 50 games)
+  ref_depth_max: 4
 
 # --- Alpha-Beta Reference Opponent ---
 alpha_beta:
@@ -145,14 +161,17 @@ tournament:
 inference:
   use_gpu: true              # true = centralized GPU inference server, false = CPU per-worker
   use_shared_memory: true    # true = shared-memory IPC (zero-copy), false = queue-based pickle
-  state_dtype: "float32"     # dtype for shared-memory buffers: "float32" (fast, no conversion) or "float16" (halves size AND PCIe upload; server casts to f32 on-device)
+  state_dtype: "float16"     # dtype for shared-memory buffers: "float16" (halves size AND PCIe upload; server casts to f32 on-device)
   policy_dtype: "float16"    # response policy dtype: GPU casts softmax to f16 before download (halves PCIe D2H); workers gather legal priors only
   max_batch: 2048            # Max samples per GPU forward pass (aggregated across workers)
-  max_wait_ms: 12.0            # Max ms to wait before firing a partial batch
+  max_wait_ms: 3.0            # Max ms to wait before firing a partial batch
   prewarm_batch_sizes: [1, 8, 16, 32, 64, 128, 256, 512, 1024, 2048]  # Batch sizes to pre-warm
   client_concurrency: 2        # Num in-flight batches per worker. >1 pipelines requests (flag pending)
+                               # Also lets ONE game's search have several batches in flight (more
+                               # virtual-loss flattening). With games_per_worker > 1 the other games
+                               # already fill the gaps, so 1 is the "pure" setting; benchmark 1 vs 2.
 
 # --- Main ---
 main:
-  run_name: "default"         # Name for this run (affects output directories)
+  run_name: "run_v2"         # Name for this run (affects output directories)
   output_dir: "output"

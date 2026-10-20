@@ -89,6 +89,21 @@ def board_h():
     return get_game().board_h
 
 
+def side_to_move_plane():
+    """Index of the constant side-to-move plane, or None if the game has none."""
+    return getattr(get_game(), "stm_plane", None)
+
+
+def action_permutation():
+    """Deprecated no-op: the input and policy frames are now identical.
+
+    Retained for API stability; there is no player-relative/absolute relabel
+    anymore (frame version 2 encodes the board rank-flipped for Black and
+    emits mover-relative policy indices), so this always returns None.
+    """
+    return None
+
+
 # ── State lifecycle ──
 def new_state(start=None):
     """Build a fresh game state (and a ``start_kind`` tag).

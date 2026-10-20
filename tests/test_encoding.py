@@ -3,7 +3,7 @@
 Verifies:
 1. Correct tensor shape (119, 8, 8)
 2. Correct plane assignments for piece positions (P1/P2, player-oriented)
-3. Board rotation when Black is to move (180-degree flip)
+3. Board rank-flip when Black is to move (files preserved)
 4. Player-relative castling planes
 5. Per-timestep repetition planes
 6. History planes: positions from previous plies appear correctly
@@ -81,18 +81,18 @@ class TestPiecePlanes:
         # e1 = rank 0, file 4. White king is P1-king plane 5.
         assert tensor[5, 0, 4] == 1.0, "White king at e1 should be in P1-king plane 5"
 
-    def test_black_to_move_rotated(self):
-        """Black to move: board rotated 180 degrees, P1=Black, P2=White."""
+    def test_black_to_move_rank_flip(self):
+        """Black to move: ranks flipped (files preserved), P1=Black, P2=White."""
         board = _make_board_move_stack(['e2e4'])
         tensor = board_to_tensor(board)
-        # Black to move. Black's e7 pawn (abs rank 6, file 4) rotates to
-        # (7-6, 7-4) = (1, 3), and is a P1 piece -> P1-pawn plane 0.
-        assert tensor[0, 1, 3] == 1.0, "Black e7 pawn should be at rotated (1,3) in P1-pawn plane 0"
-        # White's e4 pawn (abs rank 3, file 4) rotates to (7-3, 7-4) = (4, 3),
+        # Black to move. Black's e7 pawn (abs rank 6, file 4) flips to
+        # (7-6, 4) = (1, 4), and is a P1 piece -> P1-pawn plane 0.
+        assert tensor[0, 1, 4] == 1.0, "Black e7 pawn should be at flipped (1,4) in P1-pawn plane 0"
+        # White's e4 pawn (abs rank 3, file 4) flips to (7-3, 4) = (4, 4),
         # P2 piece -> P2-pawn plane 6.
-        assert tensor[6, 4, 3] == 1.0, "White e4 pawn should be at rotated (4,3) in P2-pawn plane 6"
-        # Black king e8 (abs rank 7, file 4) rotates to (0, 3), P1-king plane 5.
-        assert tensor[5, 0, 3] == 1.0, "Black king e8 should be at rotated (0,3) in P1-king plane 5"
+        assert tensor[6, 4, 4] == 1.0, "White e4 pawn should be at flipped (4,4) in P2-pawn plane 6"
+        # Black king e8 (abs rank 7, file 4) flips to (0, 4), P1-king plane 5.
+        assert tensor[5, 0, 4] == 1.0, "Black king e8 should be at flipped (0,4) in P1-king plane 5"
 
     def test_piece_positions_sum(self):
         """Total 1s in piece planes should be 32 (16 per side)."""
@@ -112,19 +112,18 @@ class TestPiecePlanes:
 
 
 class TestSideToMove:
-    """Side-to-move (colour) plane should be 1.0 for white, 0.0 for black."""
+    """The side-to-move plane is a constant 1.0 (colour-neutral frame)."""
 
     def test_white_to_move(self):
         board = chess.Board()
         tensor = board_to_tensor(board)
-        # White to move -> colour plane 112 should be all 1s
-        assert tensor[PLANE_SIDE_TO_MOVE].all() == 1.0, "White to move: colour plane should be all 1s"
+        assert tensor[PLANE_SIDE_TO_MOVE].all() == 1.0, "side-to-move plane should be all 1s"
 
     def test_black_to_move(self):
         board = _make_board_move_stack(['e2e4'])
         tensor = board_to_tensor(board)
-        # Black to move -> colour plane 112 should be all 0s
-        assert tensor[PLANE_SIDE_TO_MOVE].sum() == 0.0, "Black to move: colour plane should be all 0s"
+        # The mover is always P1 in the oriented frame, so the plane is 1.0.
+        assert tensor[PLANE_SIDE_TO_MOVE].all() == 1.0, "side-to-move plane should be all 1s"
 
 
 class TestCastlingPlanes:
@@ -204,19 +203,19 @@ class TestHistoryPlanes:
         # White knight at f3 (rank 2, file 5) -> P1-knight plane 1.
         assert tensor[1, 2, 5] == 1.0, "White knight should be at f3 in current position"
 
-        # Position 1 ply ago (group 1, planes 14-27): black to move -> rotated.
-        # After g1f3, before b8c6. Black knight b8 (abs rank 7, file 1) rotates
-        # to (0, 6), P1-knight plane 1.
-        assert tensor[14 + 1, 0, 6] == 1.0, "Black knight should be at rotated (0,6) 1 ply ago"
+        # Position 1 ply ago (group 1, planes 14-27): black to move -> flipped.
+        # After g1f3, before b8c6. Black knight b8 (abs rank 7, file 1) flips
+        # to (0, 1), P1-knight plane 1.
+        assert tensor[14 + 1, 0, 1] == 1.0, "Black knight should be at flipped (0,1) 1 ply ago"
 
         # Position 2 plies ago (group 2, planes 28-41): white to move -> no flip.
         # After e7e5, before g1f3. White knight g1 (rank 0, file 6) -> P1-knight plane 1.
         assert tensor[28 + 1, 0, 6] == 1.0, "White knight should be at g1 2 plies ago"
 
-        # Position 3 plies ago (group 3, planes 42-55): black to move -> rotated.
-        # After e2e4, before e7e5. Black knight b8 (abs rank 7, file 1) rotates
-        # to (0, 6), P1-knight plane 1.
-        assert tensor[42 + 1, 0, 6] == 1.0, "Black knight should be at rotated (0,6) 3 plies ago"
+        # Position 3 plies ago (group 3, planes 42-55): black to move -> flipped.
+        # After e2e4, before e7e5. Black knight b8 (abs rank 7, file 1) flips
+        # to (0, 1), P1-knight plane 1.
+        assert tensor[42 + 1, 0, 1] == 1.0, "Black knight should be at flipped (0,1) 3 plies ago"
 
         # Position 4 plies ago (group 4, planes 56-69): initial position, white to move.
         # White knight g1 (rank 0, file 6) -> P1-knight plane 1.
@@ -234,17 +233,17 @@ class TestHistoryPlanes:
         board = _make_board_move_stack(moves)
         tensor = board_to_tensor(board)
 
-        # Current: black to move, rotated. White knight at f3 (abs rank 2, file 5)
-        # rotates to (7-2, 7-5) = (5, 2). White is P2 -> P2-knight plane 7.
-        assert tensor[7, 5, 2] == 1.0, "White knight should be at rotated (5,2) in P2-knight plane 7"
+        # Current: black to move, flipped. White knight at f3 (abs rank 2, file 5)
+        # flips to (7-2, 5) = (5, 5). White is P2 -> P2-knight plane 7.
+        assert tensor[7, 5, 5] == 1.0, "White knight should be at flipped (5,5) in P2-knight plane 7"
 
         # 1 ply ago: white to move, no flip. Knight at g1 (rank 0, file 6).
         # P1-knight plane 1.
         assert tensor[14 + 1, 0, 6] == 1.0, "White knight should be at g1 1 ply ago"
 
-        # 2 plies ago: black to move, rotated. Knight at g1 (abs rank 0, file 6)
-        # rotates to (7, 1). White is P2 -> P2-knight plane 7.
-        assert tensor[28 + 7, 7, 1] == 1.0, "White knight should be at rotated (7,1) 2 plies ago"
+        # 2 plies ago: black to move, flipped. Knight at g1 (abs rank 0, file 6)
+        # flips to (7, 6). White is P2 -> P2-knight plane 7.
+        assert tensor[28 + 7, 7, 6] == 1.0, "White knight should be at flipped (7,6) 2 plies ago"
 
     def test_history_repetition_detection(self):
         """When a position repeats, the history planes should show identical patterns."""
@@ -324,13 +323,13 @@ class TestEdgeCases:
         board = _make_board_move_stack(moves)
         tensor = board_to_tensor(board)
 
-        # After 3 plies it's Black to move, so the board is rotated.
-        # White pawn at d5 (abs rank 4, file 3) rotates to (7-4, 7-3) = (3, 4).
+        # After 3 plies it's Black to move, so the board is rank-flipped.
+        # White pawn at d5 (abs rank 4, file 3) flips to (7-4, 3) = (3, 3).
         # White is P2 -> P2-pawn plane 6.
-        assert tensor[6, 3, 4] == 1.0, "White pawn should be at rotated (3,4) in P2-pawn plane 6"
+        assert tensor[6, 3, 3] == 1.0, "White pawn should be at flipped (3,3) in P2-pawn plane 6"
 
-        # Black pawn at d5 should be gone (captured). P1-pawn plane 0 at (3,4).
-        assert tensor[0, 3, 4] == 0.0, "Black pawn at d5 should have been captured"
+        # Black pawn at d5 should be gone (captured). P1-pawn plane 0 at (3,3).
+        assert tensor[0, 3, 3] == 0.0, "Black pawn at d5 should have been captured"
 
     def test_queen_promotion(self):
         """After promotion, queen should appear in the right plane."""
@@ -342,10 +341,10 @@ class TestEdgeCases:
         board.push(chess.Move.from_uci('e7e8q'))
         tensor = board_to_tensor(board)
 
-        # After promotion it's Black to move, so the board is rotated.
-        # White queen at e8 (abs rank 7, file 4) rotates to (0, 3).
+        # After promotion it's Black to move, so the board is rank-flipped.
+        # White queen at e8 (abs rank 7, file 4) flips to (0, 4).
         # White is P2 -> P2-queen plane 10.
-        assert tensor[10, 0, 3] == 1.0, "White queen should be at rotated (0,3) in P2-queen plane 10"
+        assert tensor[10, 0, 4] == 1.0, "White queen should be at flipped (0,4) in P2-queen plane 10"
 
 
 class TestBoardToTensorBatch:

@@ -32,6 +32,7 @@ from training import train_one_step, create_optimizer
 from evaluation import Evaluator
 from stats import StatsLogger
 from tb_logger import TensorBoardLogger
+import chess_metrics
 from gui.live_game import LiveGameState
 
 
@@ -252,6 +253,15 @@ def run_training(config, gui_enabled=False, num_workers=None):
     buffer    = ReplayBuffer(max_size=config.buffer.max_size)
     evaluator = Evaluator(config, stats, live_game=eval_live_game)
 
+    # ── Rolling chess-quality metrics (main process only, off the hot path).
+    # Computed from data already collected per game; logged every ~100 games
+    # over a rolling window of the last 500.  Disable with training.chess_metrics.
+    _tcfg0 = getattr(config, 'training', None)
+    chess_metrics_enabled = bool(getattr(_tcfg0, 'chess_metrics', True))
+    chess_roll = chess_metrics.RollingChessStats() if chess_metrics_enabled else None
+    puzzle_enabled = bool(getattr(getattr(config, 'evaluation', None),
+                                  'puzzle_eval', True))
+
     optimizer = create_optimizer(
         network,
         lr=float(config.training.learning_rate),
@@ -398,6 +408,25 @@ def run_training(config, gui_enabled=False, num_workers=None):
     # featured games shown in the tiles.
     global_stats = {'total_moves': 0, 'total_games': 0}
 
+    def _log_chess_window():
+        """Compute + log the rolling Chess/* metrics (runs every ~100 games).
+
+        Pure main-process bookkeeping over data already collected per game
+        (game_info + stored positions) plus one small batched forward pass to
+        re-predict priors/values.  Never touches a worker or the search path.
+        """
+        if chess_roll is None:
+            return
+        try:
+            res = chess_roll.compute(
+                predict_batch=lambda s: network.predictBatch(s),
+                sample_batch=lambda n: buffer.sample_batch(n))
+            tb.log_chess(res, game_id, axis='game')
+        except Exception as exc:   # diagnostics must never break training
+            print(f"[WARN] chess metrics logging failed: {exc}")
+        finally:
+            chess_roll.reset_counter()
+
     def ingest_selfplay(r):
         """Handle one finished self-play game right away: add it to the
         buffer, log it, and hand the worker its next task.  Called both from
@@ -436,6 +465,16 @@ def run_training(config, gui_enabled=False, num_workers=None):
         tb.log_mcts_stats(game_id=game_id, step=step,
                           avg_tree_depth=gi['avg_mcts_depth'],
                           avg_sims_per_move=config.mcts.num_simulations)
+
+        # Rolling chess-quality metrics (cheap per-game record; the heavier
+        # computation runs only every ~100 games).
+        if chess_roll is not None:
+            try:
+                chess_roll.add_game(gi, game_data)
+            except Exception:
+                pass
+            if chess_roll.due():
+                _log_chess_window()
 
         print(f"  [W{wid}] Game {game_id}: {gi['termination']:18s} | "
               f"{gi['result_str']} | {gi['length']} moves | buf={len(buffer)}")
@@ -561,14 +600,18 @@ def run_training(config, gui_enabled=False, num_workers=None):
                                     white_wins=od['white_wins'],
                                     black_wins=od['black_wins'], draws=od['draws'])
                 if len(buffer) > 0:
-                    sts = buffer.sample_states(50)
+                    # Sample states together with their stored legal-move masks.
+                    sts, mk = buffer.sample_states_with_masks(50)
                     ps, vs = network.predictBatch(sts)
-                    stats.log_network_stats(step,
-                                            float(np.mean(np.max(ps,axis=1))),
-                                            float(np.mean(np.abs(vs))))
-                    tb.log_network_stats(step,
-                                         float(np.mean(np.max(ps,axis=1))),
-                                         float(np.mean(np.abs(vs))))
+                    mk = mk.astype(np.float32)
+                    # Mask + renormalise over legal moves, then take the max:
+                    # the net's confidence in its best LEGAL move.
+                    masked = ps * mk
+                    masked /= np.maximum(masked.sum(axis=1, keepdims=True), 1e-12)
+                    avg_max_policy = float(np.mean(np.max(masked, axis=1)))
+                    avg_abs_value = float(np.mean(np.abs(vs)))
+                    stats.log_network_stats(step, avg_max_policy, avg_abs_value)
+                    tb.log_network_stats(step, avg_max_policy, avg_abs_value)
 
                 # Checkpoint (triggered when step crosses a multiple of the
                 # interval, since n_batches varies per session)
@@ -582,6 +625,21 @@ def run_training(config, gui_enabled=False, num_workers=None):
                                     str(checkpoints_dir/"latest.pt"), step, extra=ex)
                     buffer.save(str(buffer_path))
                     print(f"  Checkpoint: {cp}  Buffer: {len(buffer)} positions")
+
+                    # Puzzle accuracy (net only), White vs Black, incl. a
+                    # mate-in-1 set.  Runs only at checkpoints (cheap forward
+                    # passes after a one-time puzzle-set generation).
+                    if puzzle_enabled and game_api.is_game('chess'):
+                        try:
+                            import puzzle_eval
+                            _t_pz = time.perf_counter()
+                            pz = puzzle_eval.evaluate(
+                                lambda s: network.predictBatch(s))
+                            tb.log_chess(pz, step, axis='step')
+                            print(f"  [Chess] puzzle accuracy ({1000*(time.perf_counter()-_t_pz):.0f}ms): "
+                                  + " ".join(f"{k}={v:.3f}" for k, v in sorted(pz.items())))
+                        except Exception as exc:
+                            print(f"[WARN] puzzle eval failed: {exc}")
 
                 if ld is not None:
                     print(f"  [train] step={step} pol={ld['policy_loss']:.4f} val={ld['value_loss']:.4f} "
@@ -636,6 +694,9 @@ def run_training(config, gui_enabled=False, num_workers=None):
                 # Collect eval results
                 gate_wins=gate_losses=gate_draws=0
                 ref_wins=ref_losses=ref_draws=0
+                # Alpha-beta reference results split by the NET's colour.
+                ref_w_wins=ref_w_losses=ref_w_draws=0
+                ref_b_wins=ref_b_losses=ref_b_draws=0
                 collected = 0
                 eval_game_id_start = eval_game_counter
                 eval_live_start_ids = [0] * num_workers  # per-worker eval game counter
@@ -718,6 +779,15 @@ def run_training(config, gui_enabled=False, num_workers=None):
                             if a_white: ref_losses+=1
                             else:       ref_wins+=1
                         else: ref_draws+=1
+                        # Same tally split by whether the net played White.
+                        if a_white:
+                            if   res=='1-0': ref_w_wins+=1
+                            elif res=='0-1': ref_w_losses+=1
+                            else:            ref_w_draws+=1
+                        else:
+                            if   res=='1-0': ref_b_losses+=1
+                            elif res=='0-1': ref_b_wins+=1
+                            else:            ref_b_draws+=1
 
                     print(f"  [{etype[:4].upper()} W{wid}] {label}: {res}")
 
@@ -781,6 +851,24 @@ def run_training(config, gui_enabled=False, num_workers=None):
                                   total_r,ref_wins,ref_losses,ref_draws)
                     tb.log_elo(new_ne,"alpha_beta_ref",step,
                                total_r,ref_wins,ref_losses,ref_draws)
+
+                    # Net-vs-alpha-beta results, net as White and as Black.
+                    nw = ref_w_wins+ref_w_losses+ref_w_draws
+                    nb = ref_b_wins+ref_b_losses+ref_b_draws
+                    tb.log_chess({
+                        'alphabeta_white_games': nw,
+                        'alphabeta_white_win_rate':
+                            ((ref_w_wins + 0.5*ref_w_draws)/nw) if nw else None,
+                        'alphabeta_white_wins': ref_w_wins,
+                        'alphabeta_white_losses': ref_w_losses,
+                        'alphabeta_white_draws': ref_w_draws,
+                        'alphabeta_black_games': nb,
+                        'alphabeta_black_win_rate':
+                            ((ref_b_wins + 0.5*ref_b_draws)/nb) if nb else None,
+                        'alphabeta_black_wins': ref_b_wins,
+                        'alphabeta_black_losses': ref_b_losses,
+                        'alphabeta_black_draws': ref_b_draws,
+                    }, step, axis='step')
 
                 print(f"  === EVAL DONE -- resuming self-play ===\n")
                 # Resume self-play: push tasks to all workers

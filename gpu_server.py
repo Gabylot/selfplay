@@ -726,12 +726,14 @@ class GPUInferenceServer:
                 continue
 
             # ── Queue response path ──
-            if bs == 1:
-                self._put_response(worker_id,
-                                   (request_id, item_policies[0], float(item_values[0])))
-            else:
-                self._put_response(worker_id,
-                                   (request_id, item_policies, item_values))
+            # Always send the (policies, values) arrays, even for bs == 1.
+            # The client decides (via its batch-request id set) whether the
+            # caller wanted the full arrays (predict_batch) or a single
+            # (policy_vector, scalar) pair (predict).  Sending a bare scalar
+            # value here broke the bs == 1 batched path (MCTS indexes
+            # values_batch[k]).
+            self._put_response(worker_id,
+                               (request_id, item_policies, item_values))
 
         # Safety assertion: offset must equal total samples in this group
         assert offset == sum(it['batch_size'] for it in group), \

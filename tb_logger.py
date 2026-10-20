@@ -382,11 +382,29 @@ class TensorBoardLogger:
 
     def log_network_stats(self, step: int, avg_max_policy: float,
                           avg_abs_value: float):
-        """Log network confidence trends."""
+        """Log network confidence trends.
+
+        ``avg_max_policy`` is the mean top *legal-move* probability (masked and
+        renormalised over legal moves)."""
         self._log(self.writer, "add_scalar", "Network/avg_max_policy",
                   avg_max_policy, step)
         self._log(self.writer, "add_scalar", "Network/avg_abs_value",
                   avg_abs_value, step)
+
+    # ── Chess quality (main-process rolling metrics) ─────────────────
+
+    def log_chess(self, scalars: dict, x: int, axis: str = "game"):
+        """Log a batch of ``Chess/<name>`` scalars.
+
+        ``axis`` selects the x-axis/writer: ``"game"`` uses the game-keyed
+        writer (rolling per-game metrics) and ``"step"`` the step-keyed writer
+        (checkpoint / evaluation events).  ``None`` values are skipped.
+        """
+        writer = self.game_writer if axis == "game" else self.writer
+        for name, value in scalars.items():
+            if value is None:
+                continue
+            self._log(writer, "add_scalar", f"Chess/{name}", float(value), x)
 
     # ── Buffer ───────────────────────────────────────────────────────
 

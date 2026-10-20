@@ -37,6 +37,7 @@ def main():
 
     wins = Counter()      # 'white' / 'black' / 'draw'
     terms = Counter()
+    term_results = Counter()   # (termination, 'white'/'black'/'draw') -> count
     white_cm = black_cm = 0
 
     for i in range(n_games):
@@ -63,12 +64,14 @@ def main():
         )
         r = gi['result']
         if r > 0.5:
-            wins['white'] += 1
+            outcome = 'white'
         elif r < -0.5:
-            wins['black'] += 1
+            outcome = 'black'
         else:
-            wins['draw'] += 1
+            outcome = 'draw'
+        wins[outcome] += 1
         terms[gi['termination']] += 1
+        term_results[(gi['termination'], outcome)] += 1
         if gi['termination'] == 'checkmate':
             if r > 0.5:
                 white_cm += 1
@@ -87,6 +90,14 @@ def main():
     print(f"White cm: {white_cm}")
     print(f"Black cm: {black_cm}")
     print(f"\nTerminations: {dict(terms)}")
+
+    print("\n--- W/B/D split by termination type ---")
+    for term in sorted(terms):
+        w = term_results[(term, 'white')]
+        b = term_results[(term, 'black')]
+        d = term_results[(term, 'draw')]
+        print(f"  {term:16s} total={terms[term]:3d}  "
+              f"white={w:3d}  black={b:3d}  draw={d:3d}")
 
     tw = wins['white'] + wins['black']
     if tw > 0:

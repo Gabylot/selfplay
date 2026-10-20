@@ -126,6 +126,11 @@ class WorkerProfiler:
     def _patch_mcts_method(self, obj, attr_name: str, timer_name: str):
         original = type(obj).__dict__.get(attr_name)
         if original is None:
+            # Missing on this engine class (e.g. the Rust driver has no
+            # _select_child/_collect_batch/_backpropagate*): skip instead of
+            # crashing the worker's profile task.
+            if not hasattr(obj, attr_name):
+                return
             original = getattr(obj, attr_name)
         timer = self.timers[timer_name]
         self._mcts_originals[attr_name] = original
