@@ -79,6 +79,36 @@ def length_stats(games):
     }
 
 
+def fresh_sim_stats(games):
+    """Rolling fresh-simulation diagnostics across all moves in the window.
+
+    ``fresh_sims`` is the number of NEW simulations run for a move (after the
+    reused-root visit count is subtracted and after any min_fresh_sims floor).
+    ``floor_fired`` is whether the old budget
+    ``num_simulations - root.N`` was below ``min_fresh_sims``.
+    """
+    fresh = []
+    floor_moves = 0
+    total_moves = 0
+    for g in games:
+        counts = g.get('fresh_sims') or []
+        flags = g.get('floor_fired') or []
+        fresh.extend(int(x) for x in counts)
+        total_moves += len(counts)
+        floor_moves += sum(1 for x in flags if x)
+    if not fresh:
+        return {}
+    a = np.asarray(fresh, dtype=np.float64)
+    return {
+        'fresh_sims_mean': float(a.mean()),
+        'fresh_sims_p10': float(np.percentile(a, 10)),
+        'fresh_floor_fired_share': float(floor_moves / total_moves)
+            if total_moves else 0.0,
+        'fresh_sims_below25_share': float(np.mean(a < 25)),
+        'fresh_sims_zero_share': float(np.mean(a == 0)),
+    }
+
+
 # ── policy metrics (prior vs visit) ─────────────────────────────────────────
 
 def _log_pos(x):
@@ -208,6 +238,8 @@ class RollingChessStats:
             'result': float(game_info['result']),
             'termination': game_info['termination'],
             'length': int(game_info['length']),
+            'fresh_sims': list(game_info.get('fresh_sims') or []),
+            'floor_fired': list(game_info.get('floor_fired') or []),
         })
         rec = []
         for ply in self.phase_plies:
@@ -230,6 +262,7 @@ class RollingChessStats:
         out.update(white_share(self._games))
         out.update(termination_mix(self._games))
         out.update(length_stats(self._games))
+        out.update(fresh_sim_stats(self._games))
         return out
 
     def compute(self, predict_batch, sample_batch):

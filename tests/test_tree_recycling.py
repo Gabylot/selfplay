@@ -120,7 +120,9 @@ def test_recycle_tree_not_found():
 
 def test_search_on_recycled_root():
     """Running search on a recycled root works and produces valid results."""
-    mcts = MCTS(MockNetwork(), num_simulations=10, dirichlet_alpha=0.0, dirichlet_epsilon=0.0)
+    # Floor disabled: this test covers the legacy fixed-budget recycling path.
+    mcts = MCTS(MockNetwork(), num_simulations=10, dirichlet_alpha=0.0,
+                dirichlet_epsilon=0.0, min_fresh_sims=0)
     board = chess.Board()
 
     # First move

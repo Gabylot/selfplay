@@ -50,7 +50,7 @@ class _RNode:
     a Python handle; the arena owns everything else.
     """
 
-    __slots__ = ('rs_id', '_eng_ref', '_children')
+    __slots__ = ('rs_id', '_eng_ref', '_children', 'mate_seeded')
 
     def __init__(self, eng, rs_id):
         # Weak back-reference: the engine owns its _RNodes, so a strong ref
@@ -59,6 +59,7 @@ class _RNode:
         self._eng_ref = weakref.ref(eng)
         self.rs_id = rs_id
         self._children = None
+        self.mate_seeded = False
 
     @property
     def _eng(self):
@@ -85,8 +86,8 @@ class RustMCTS:
                  c_virtual_loss=0.5, max_game_length=150,
                  adjudicate_material=True, piece_values=None,
                  adjudicate_graded=True, adjudicate_scaling=9.0,
-                 force_mate_in_one=True, inference_pipeline=1,
-                 dll_path=None, **kwargs):
+                 mate_seeding=False, min_fresh_sims=64,
+                 inference_pipeline=1, dll_path=None, **kwargs):
         self.network = network
         self.num_simulations = int(num_simulations)
         self.c_puct = float(c_puct)
@@ -100,7 +101,8 @@ class RustMCTS:
         self.piece_values = piece_values or {'P': 1, 'N': 3, 'B': 3, 'R': 5, 'Q': 9}
         # Accepted for drop-in compatibility with mcts.MCTS (unused here).
         self.c_virtual_loss = c_virtual_loss
-        self.force_mate_in_one = force_mate_in_one
+        self.mate_seeding = mate_seeding
+        self.min_fresh_sims = max(0, int(min_fresh_sims))
         self.inference_pipeline = max(1, int(inference_pipeline))
         self.profile = False
 
@@ -292,6 +294,7 @@ class RustMCTS:
         # Materialise the promoted node's board while the parent link is still
         # intact (board_of walks parents).
         self.board_of(child.rs_id)
+        child.mate_seeded = False
         return child
 
     def _child_for_move(self, root, move):
@@ -317,9 +320,17 @@ class RustMCTS:
         if not root.is_expanded:
             self._expand_node(root.rs_id)
 
+        inherited_root_n = self._N(root.rs_id)
+
+        self._seed_mate_children(root)
+
         self._add_dirichlet_noise(root)
 
-        target_new = max(0, self.num_simulations - self._N(root.rs_id))
+        reused_root = inherited_root_n > 0
+        budget_new_sims = max(0, self.num_simulations - self._N(root.rs_id))
+        target_new = (max(budget_new_sims, self.min_fresh_sims)
+                      if reused_root else budget_new_sims)
+        floor_fired = reused_root and budget_new_sims < self.min_fresh_sims
         use_pipeline = (self.inference_pipeline > 1
                         and hasattr(self.network, 'predict_batch_async')
                         and hasattr(self.network, 'wait_result'))
@@ -348,6 +359,12 @@ class RustMCTS:
             'num_simulations': sims,
             'max_depth': max_depth,
             'avg_depth': total_depth / sims if sims else 0.0,
+            'inherited_root_n': inherited_root_n,
+            'budget_new_sims': budget_new_sims,
+            'target_new_sims': target_new,
+            'min_fresh_sims': self.min_fresh_sims,
+            'reused_root': bool(reused_root),
+            'floor_fired': bool(floor_fired),
         }
         return visit_policy, best_move, stats
 
@@ -545,18 +562,35 @@ class RustMCTS:
             newp = (1 - self.dirichlet_epsilon) * orig + self.dirichlet_epsilon * noise[i]
             self._lib.mcts_rs_set_policy(child.rs_id, newp)
 
-    # ── move selection / stats (reads from arena) ───────────────────────────
+    # ── mate seeding / move selection / stats (reads from arena) ────────────
+    def _seed_mate_children(self, root):
+        """Give every root child that delivers checkmate one terminal visit.
+
+        Mirrors ``mcts.MCTS._seed_mate_children``.  Runs once per root after
+        expansion and before search, makes no network call, and only updates
+        visit/value counts.  The normal visit policy, move choice, and
+        temperature sampling are left untouched.
+        """
+        if not self.mate_seeding or not game_api.is_game("chess"):
+            return
+        if root.mate_seeded:
+            return
+        root.mate_seeded = True
+
+        for child in root.children.values():
+            if not self.board_of(child.rs_id).is_checkmate():
+                continue
+            # The node is terminal from the child's side-to-move perspective
+            # (-1); backprop flips the sign so the mover's root receives +1.
+            self._terminal[child.rs_id] = True
+            self._tvalue[child.rs_id] = -1.0
+            self._lib.mcts_rs_backprop(child.rs_id, -1.0)
+
     def _get_visit_policy(self, root):
         children = root.children
         visit_policy = np.zeros(game_api.num_actions(), dtype=np.float32)
         if not children:
             return visit_policy, None
-
-        if self.force_mate_in_one and game_api.is_game("chess"):
-            mate_move = self._find_checkmate_child(root)
-            if mate_move is not None:
-                visit_policy[game_api.to_index(root.board, mate_move)] = 1.0
-                return visit_policy, mate_move
 
         counts = self._N_batch(root)
         total = 0
@@ -572,21 +606,9 @@ class RustMCTS:
             return visit_policy, None
         return visit_policy / total, self._moves.get(children[best_idx].rs_id)
 
-    def _find_checkmate_child(self, root):
-        """Return a root child move that delivers checkmate (or None).
-
-        Mirrors ``mcts.MCTS._find_checkmate_child`` so the mate-in-one
-        override produces identical targets.
-        """
-        for child in root.children.values():
-            if self._N(child.rs_id) > 0 and self.board_of(child.rs_id).is_checkmate():
-                return self._moves.get(child.rs_id)
-        return None
-
     def select_move_with_temperature(self, root, temperature):
         """Same contract as MCTS.select_move_with_temperature.
 
-        - A root checkmate move wins outright (when ``force_mate_in_one``).
         - Greedy (``temperature < 1e-8``): one-hot on the most-visited child.
         - Otherwise: sample proportionally to ``N ** (1/T)`` for the chosen
           move, but return the *full normalised visit distribution* as the
@@ -597,12 +619,6 @@ class RustMCTS:
         children = root.children
         if not children:
             return visit_policy, None
-
-        if self.force_mate_in_one and game_api.is_game("chess"):
-            mate_move = self._find_checkmate_child(root)
-            if mate_move is not None:
-                visit_policy[game_api.to_index(root.board, mate_move)] = 1.0
-                return visit_policy, mate_move
 
         counts = self._N_batch(root)
         total = sum(counts.values())

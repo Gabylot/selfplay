@@ -39,7 +39,8 @@ def load_config(path: Optional[str] = None) -> dict:
             "dirichlet_epsilon": 0.4,
             "batch_size": 8,
             "c_virtual_loss": 0.5,
-            "force_mate_in_one": True,
+            "mate_seeding": False,
+            "min_fresh_sims": 64,
             # Use the Rust MCTS backend (rust_mcts.RustMCTS) for self-play.
             # Same move-selection targets as the Python engine at ~2x speed;
             # set false to force the pure-Python mcts.MCTS path.

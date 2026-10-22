@@ -1220,7 +1220,9 @@ def run_sanity_check(config):
     t = game_api.encode(state)
     print(f"Tensor: {t.shape}")
     m = game_api.mask(state); print(f"Mask sum: {m.sum():.0f}")
-    me = MCTS(net, num_simulations=10, c_puct=1.5)
+    me = MCTS(net, num_simulations=10, c_puct=1.5,
+              mate_seeding=getattr(lc.mcts, 'mate_seeding', False),
+              min_fresh_sims=getattr(lc.mcts, 'min_fresh_sims', 64))
     root = me.get_root(state)
     vp,bm,st = me.search(root)
     print(f"MCTS best: {game_api.move_str(bm)}  depth: {st['avg_depth']:.2f}")

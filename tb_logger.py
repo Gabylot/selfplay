@@ -207,17 +207,31 @@ class TensorBoardLogger:
                 kept.append(ev)
 
             ts = int(min(ev.wall_time for ev in kept)) or 1
-            merged_name = f"events.out.tfevents.{ts:010d}.Peter.merged.{axis}.0"
-            merged_path = d / merged_name
+            # Never reuse an existing filename.  The timestamp is derived from
+            # the earliest event, so a previous resume produces the *same* name
+            # and that file is one of ``files`` below.  Reusing it would make
+            # the cleanup loop delete the history we just wrote (and silently
+            # wipe every restart's TensorBoard history).
+            suffix = 0
+            while True:
+                tag = "" if suffix == 0 else f".{suffix}"
+                merged_name = (f"events.out.tfevents.{ts:010d}.Peter."
+                               f"merged{tag}.{axis}.0")
+                merged_path = d / merged_name
+                if not merged_path.exists():
+                    break
+                suffix += 1
             with open(merged_path, "wb") as fp:
                 rw = RecordWriter(fp)
                 for ev in kept:
                     rw.write(ev.SerializeToString())
                 rw.close()
             for f in files:
+                if f == merged_path:
+                    continue
                 f.unlink()
             print(f"[TB] merged {len(files)} previous event file(s) from "
-                  f"{d}/ → {merged_name} ({len(kept)} events < {purge_at})")
+                  f"{d}/ -> {merged_name} ({len(kept)} events < {purge_at})")
         except Exception as exc:
             print(f"[TB] merge failed ({exc}); archiving previous files instead")
             TensorBoardLogger._archive_dir(log_dir, d)
@@ -251,7 +265,7 @@ class TensorBoardLogger:
                 shutil.move(str(f), str(arch / f.name))
                 moved += 1
         if moved:
-            print(f"[TB] archived {moved} previous event file(s) from {d} → {arch}")
+            print(f"[TB] archived {moved} previous event file(s) from {d} -> {arch}")
 
     # ── Config / text ────────────────────────────────────────────────
 

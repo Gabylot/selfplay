@@ -195,7 +195,8 @@ def play_match(network_a: AlphaZeroNet, network_b: AlphaZeroNet,
             dirichlet_epsilon=0.0,
             batch_size=getattr(config.mcts, 'batch_size', 1),
             c_virtual_loss=getattr(config.mcts, 'c_virtual_loss', 0.5),
-            force_mate_in_one=getattr(config.mcts, 'force_mate_in_one', True),
+            mate_seeding=getattr(config.mcts, 'mate_seeding', False),
+            min_fresh_sims=getattr(config.mcts, 'min_fresh_sims', 64),
         )
         mcts_b = MCTS(
             network=network_b,
@@ -205,7 +206,8 @@ def play_match(network_a: AlphaZeroNet, network_b: AlphaZeroNet,
             dirichlet_epsilon=0.0,
             batch_size=getattr(config.mcts, 'batch_size', 1),
             c_virtual_loss=getattr(config.mcts, 'c_virtual_loss', 0.5),
-            force_mate_in_one=getattr(config.mcts, 'force_mate_in_one', True),
+            mate_seeding=getattr(config.mcts, 'mate_seeding', False),
+            min_fresh_sims=getattr(config.mcts, 'min_fresh_sims', 64),
         )
         
         # Notify live game viewer of new game
@@ -299,7 +301,8 @@ def play_match_vs_alpha_beta(network: AlphaZeroNet, config,
             dirichlet_epsilon=0.0,
             batch_size=getattr(config.mcts, 'batch_size', 1),
             c_virtual_loss=getattr(config.mcts, 'c_virtual_loss', 0.5),
-            force_mate_in_one=getattr(config.mcts, 'force_mate_in_one', True),
+            mate_seeding=getattr(config.mcts, 'mate_seeding', False),
+            min_fresh_sims=getattr(config.mcts, 'min_fresh_sims', 64),
         )
 
         _state, _move_count, result = play_engine_vs_reference(

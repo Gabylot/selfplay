@@ -69,8 +69,7 @@ class MCTSNode:
                  'N', 'W', 'Q', 'P', 'P_orig', 'is_expanded',
                  'legal_moves_cached', 'visit_count', 'virtual_loss',
                  '_game_over_cached', '_terminal_value_cached',
-                 '_checkmate_child_cached', '_checkmate_child_move',
-                 '_position_hash', 'depth', 'rs_id']
+                 '_mate_seeded', '_position_hash', 'depth', 'rs_id']
 
     def __init__(self, board: Optional[chess.Board] = None,
                  parent: Optional['MCTSNode'] = None,
@@ -93,9 +92,8 @@ class MCTSNode:
         self.virtual_loss = 0  # Virtual loss counter for batched inference
         self._game_over_cached: Optional[bool] = None  # None = not yet checked
         self._terminal_value_cached: Optional[float] = None  # Cached terminal value
+        self._mate_seeded: bool = False  # Root already received mate-seeding visits
         self._position_hash: Optional[int] = None  # Zobrist hash, cached on first materialisation
-        self._checkmate_child_cached: bool = False  # Whether a checkmate child has been found (cached)
-        self._checkmate_child_move: Optional[chess.Move] = None  # The move that leads to checkmate, if found
         # Cached depth from root — avoids O(depth) walk in _node_depth()
         self.depth = 0 if parent is None else parent.depth + 1
 
@@ -124,9 +122,8 @@ class MCTSNode:
         node.virtual_loss = 0
         node._game_over_cached = None
         node._terminal_value_cached = None
+        node._mate_seeded = False
         node._position_hash = None
-        node._checkmate_child_cached = False
-        node._checkmate_child_move = None
         node.depth = parent.depth + 1
         return node
 
@@ -185,7 +182,8 @@ class MCTS:
                  piece_values: Optional[dict] = None,
                  adjudicate_graded: bool = True,
                  adjudicate_scaling: float = 9.0,
-                 force_mate_in_one: bool = True,
+                 mate_seeding: bool = False,
+                 min_fresh_sims: int = 64,
                  inference_pipeline: int = 1):
         """
         Args:
@@ -202,6 +200,14 @@ class MCTS:
             piece_values: Material values for adjudication.
             adjudicate_graded: Use tanh grading (True) or +/-1 (False).
             adjudicate_scaling: Scaling for tanh (if graded).
+            mate_seeding: Give every root child that delivers checkmate one
+                terminal pre-visit before the normal search.  The seed updates
+                visit counts and values only; it does not override the visit
+                policy, move choice, or temperature sampling.
+            min_fresh_sims: Minimum number of new simulations to run after
+                tree reuse, even when the recycled root already has the full
+                visit budget.  0 reproduces the historical
+                ``max(0, num_simulations - root.N)`` behaviour.
         """
         self.network = network
         self.num_simulations = num_simulations
@@ -217,7 +223,8 @@ class MCTS:
         self.piece_values = piece_values or {'P': 1, 'N': 3, 'B': 3, 'R': 5, 'Q': 9}
         self.adjudicate_graded = adjudicate_graded
         self.adjudicate_scaling = adjudicate_scaling
-        self.force_mate_in_one = force_mate_in_one
+        self.mate_seeding = mate_seeding
+        self.min_fresh_sims = max(0, int(min_fresh_sims))
 
         # Async inference pipelining: number of leaf-batches kept in flight so
         # tree work (selection / expansion / backprop) overlaps the network
@@ -280,8 +287,7 @@ class MCTS:
             # N/W/Q are intentionally kept so the next search
             # benefits from accumulated visit information.
             child.visit_count = 0
-            child._checkmate_child_cached = False
-            child._checkmate_child_move = None
+            child._mate_seeded = False
 
             return child
 
@@ -308,8 +314,19 @@ class MCTS:
         if not root.is_expanded:
             self._expand_node(root)
 
+        inherited_root_n = int(root.N)
+
+        # Give mating root moves a terminal pre-visit before the normal search.
+        self._seed_mate_children(root)
+
         # Add Dirichlet noise to root priors
         self._add_dirichlet_noise(root)
+
+        reused_root = inherited_root_n > 0
+        budget_new_sims = max(0, self.num_simulations - int(root.N))
+        target_new_sims = (max(budget_new_sims, self.min_fresh_sims)
+                           if reused_root else budget_new_sims)
+        floor_fired = reused_root and budget_new_sims < self.min_fresh_sims
 
         # Profiling accumulators
         if self.profile:
@@ -339,8 +356,6 @@ class MCTS:
 
         if self.batch_size > 1:
             # Batched mode: collect leaves, evaluate in batch, backprop
-            target_new_sims = max(0, self.num_simulations - root.N)
-
             use_pipeline = (self.inference_pipeline > 1
                             and hasattr(self.network, 'predict_batch_async')
                             and hasattr(self.network, 'wait_result'))
@@ -453,9 +468,7 @@ class MCTS:
                     sims_done += len(pairs)
         else:
             # Sequential mode (original behavior, no virtual loss overhead)
-            remaining = max(0, self.num_simulations - root.N)
-            sims_done = remaining
-            for _ in range(remaining):
+            for _ in range(target_new_sims):
                 node = root
                 depth = 0
 
@@ -485,6 +498,7 @@ class MCTS:
 
                 max_depth = max(max_depth, depth)
                 total_depth += depth
+                sims_done += 1
 
         # Compute visit distribution
         visit_policy, best_move = self._get_visit_policy(root)
@@ -493,6 +507,12 @@ class MCTS:
             'avg_depth': total_depth / sims_done if sims_done > 0 else 0,
             'max_depth': max_depth,
             'num_simulations': sims_done,
+            'inherited_root_n': inherited_root_n,
+            'budget_new_sims': budget_new_sims,
+            'target_new_sims': target_new_sims,
+            'min_fresh_sims': self.min_fresh_sims,
+            'reused_root': bool(reused_root),
+            'floor_fired': bool(floor_fired),
         }
 
         if pf:
@@ -930,29 +950,33 @@ class MCTS:
             child.P = (1 - self.dirichlet_epsilon) * child.P_orig + \
                       self.dirichlet_epsilon * noise[i]
 
-    def _find_checkmate_child(self, root: MCTSNode) -> Optional[chess.Move]:
-        """Check if any root child delivers checkmate.
+    def _seed_mate_children(self, root: MCTSNode) -> None:
+        """Give every root child that delivers checkmate one terminal visit.
 
-        Returns the move that gives mate, or None.  The returned move is
-        always a ``chess.Move`` (wrapped if necessary) to keep the public
-        API consistent.
+        Runs once per root, after root expansion and before the normal search.
+        No network call is made: the mating child is known to be terminal, so
+        its side-to-move value is -1 (the mover scored +1).  Because this uses
+        ordinary backpropagation, the matching root visit/value is updated too.
+
+        This is only a visit-count/value nudge.  It does not touch the visit
+        policy, the selected move, or temperature sampling; those still come
+        from the normal search distribution.
         """
-        if root._checkmate_child_cached:
-            return root._checkmate_child_move
+        if not self.mate_seeding or not game_api.is_game("chess"):
+            return
+        if root._mate_seeded:
+            return
+        root._mate_seeded = True
 
         for child in root.children.values():
-            if child.N > 0 and child.board.is_checkmate():
-                root._checkmate_child_cached = True
-                # child.move may be a FastMove; wrap it to chess.Move
-                move = child.move
-                if not isinstance(move, chess.Move):
-                    move = chess.Move._wrap(move)
-                root._checkmate_child_move = move
-                return move
-
-        root._checkmate_child_cached = True
-        root._checkmate_child_move = None
-        return None
+            if not child.board.is_checkmate():
+                continue
+            # Terminal values are stored from the child's side-to-move
+            # perspective, so a checkmated child is -1; the parent (the mover)
+            # receives +1 as the value flips sign on the way up.
+            child._game_over_cached = True
+            child._terminal_value_cached = -1.0
+            self._backpropagate(child, -1.0)
 
     def _get_visit_policy(self, root: MCTSNode) -> Tuple[np.ndarray, chess.Move]:
         """Compute visit count distribution and select move.
@@ -970,14 +994,6 @@ class MCTS:
         if not root.children:
             # No children -- return empty
             return visit_policy, None
-
-        # Force checkmate move if MCTS found one (mate-in-one override, chess only)
-        checkmate_move = (self._find_checkmate_child(root)
-                          if self.force_mate_in_one and game_api.is_game("chess") else None)
-        if checkmate_move is not None:
-            idx = game_api.to_index(root.board, checkmate_move)
-            visit_policy[idx] = 1.0
-            return visit_policy, checkmate_move
 
         # Fill visit counts
         total_visits = 0
@@ -1035,14 +1051,6 @@ class MCTS:
 
         if not root.children:
             return visit_policy, None
-
-        # Force checkmate move if MCTS found one (mate-in-one override, chess only)
-        checkmate_move = (self._find_checkmate_child(root)
-                          if self.force_mate_in_one and game_api.is_game("chess") else None)
-        if checkmate_move is not None:
-            idx = game_api.to_index(root.board, checkmate_move)
-            visit_policy[idx] = 1.0
-            return visit_policy, checkmate_move
 
         # Get visit counts
         visit_counts = {}

@@ -69,11 +69,10 @@ from evaluation import alpha_beta_best_move
 # somewhat spread here, not spiked), tactical/midgame (fewer clearly-best
 # moves), endgame (often more forcing), and a forced mate-in-1 position.
 #
-# The mate-in-1 position is a built-in harness sanity check: MCTS forces
-# checkmate moves via _find_checkmate_child regardless of network quality,
-# so the returned best move MUST be checkmate there. (Visit concentration
-# is NOT forced — the override only pins the final move choice.) If the
-# best move isn't mate, the harness itself is broken — not the network.
+# The mate-in-1 position is a built-in harness sanity check: mate seeding
+# gives every mating root move one terminal pre-visit regardless of network
+# quality, so the mating child MUST have a visit. Seeding does NOT pin the
+# final move choice, so the chosen move is allowed to be a non-mate.
 # ─────────────────────────────────────────────────────────────────────────
 
 TEST_POSITIONS = {
@@ -84,7 +83,7 @@ TEST_POSITIONS = {
     "midgame_2":           "r4rk1/pp3ppp/2n1q3/2pp4/3P2b1/2P1PN2/PP1Q1PPP/R3R1K1 w - - 0 12",
     "endgame_rook":        "5k2/pp3ppp/8/2r5/4R3/8/PP3PPP/4K3 w - - 0 20",
     "endgame_pawn_race":   "8/5p2/4k3/8/3K4/8/5P2/8 w - - 0 1",
-    "back_rank_mate_in_1": "6k1/5ppp/8/8/8/8/8/R3K3 w Q - 0 1",  # sanity check: Top1 must == 100%
+    "back_rank_mate_in_1": "6k1/5ppp/8/8/8/8/8/R3K3 w Q - 0 1",  # sanity check: mate child gets a seed visit
 }
 
 
@@ -111,7 +110,8 @@ def load_network(checkpoint_path, config):
 # Core search + measurement
 # ─────────────────────────────────────────────────────────────────────────
 
-def run_one_search(net, board, num_simulations, c_puct, batch_size, c_virtual_loss=0.5):
+def run_one_search(net, board, num_simulations, c_puct, batch_size,
+                   c_virtual_loss=0.5, mate_seeding=True):
     """Run a single MCTS search with root noise disabled."""
     mcts = MCTS(
         network=net,
@@ -121,6 +121,7 @@ def run_one_search(net, board, num_simulations, c_puct, batch_size, c_virtual_lo
         dirichlet_epsilon=0.0,   # disabled
         batch_size=batch_size,
         c_virtual_loss=c_virtual_loss,
+        mate_seeding=mate_seeding,
     )
     root = mcts.get_root(board)
     visit_policy, best_move, stats = mcts.search(root)
@@ -188,16 +189,12 @@ def run_quality_sweep(net, sim_values, c_puct_values, batch_size,
                     top5_all.append(top5)
 
                     if label == "back_rank_mate_in_1":
-                        # The mate-in-1 override (_find_checkmate_child) only
-                        # forces the returned *move*, it does not concentrate
-                        # visits, so verify the move itself delivers mate.
-                        if best_move is None:
+                        # Mate seeding pre-visits every mating root child.  It
+                        # deliberately does not force the final move, so check
+                        # the seed visit rather than best_move.
+                        if not any(c.N > 0 and c.board.is_checkmate()
+                                   for c in root.children.values()):
                             mate_check_ok = False
-                        else:
-                            nb = board.copy()
-                            nb.push(best_move)
-                            if not nb.is_checkmate():
-                                mate_check_ok = False
 
                     if ab_move is not None and best_move is not None:
                         ab_total += 1

@@ -837,6 +837,9 @@ def play_one_game(mcts_engine, max_game_length=150, adjudicate_material=True,
     board, start_kind = game_api.new_state(start)
     game_states = []
     mcts_stats_list = []
+    fresh_sims_per_move = []
+    inherited_root_n_per_move = []
+    floor_fired_per_move = []
     move_count = 0
     termination = "unknown"
     outcome = 0.0
@@ -893,6 +896,11 @@ def play_one_game(mcts_engine, max_game_length=150, adjudicate_material=True,
                             cp, np.asarray(legal_mask).astype(np.uint8)))
         mcts_stats_list.append(stats)
 
+        effort = _search_effort_fields(stats)
+        fresh_sims_per_move.append(effort.get('fresh_sims', 0))
+        inherited_root_n_per_move.append(effort.get('inherited_root_n', 0))
+        floor_fired_per_move.append(effort.get('floor_fired', False))
+
         mcts_move_data = {
             'selected_move': game_api.move_str(selected_move),
             'candidates':     move_candidates,
@@ -902,6 +910,7 @@ def play_one_game(mcts_engine, max_game_length=150, adjudicate_material=True,
             'sims':           int(stats.get('num_simulations')
                                   or sum(c['N'] for c in move_candidates)),
         }
+        mcts_move_data.update(effort)
         game_api.apply(board, selected_move)
         move_count += 1
         if on_move:
@@ -934,6 +943,9 @@ def play_one_game(mcts_engine, max_game_length=150, adjudicate_material=True,
         'avg_mcts_depth': avg_depth,
         'num_positions': len(game_data),
         'material_diff': material_diff,
+        'fresh_sims': fresh_sims_per_move,
+        'inherited_root_n': inherited_root_n_per_move,
+        'floor_fired': floor_fired_per_move,
     }
 
 
@@ -968,7 +980,8 @@ def self_play_game(network, config, on_move=None):
         piece_values=config.selfplay.piece_values,
         adjudicate_graded=getattr(config.selfplay, 'adjudicate_graded', True),
         adjudicate_scaling=getattr(config.selfplay, 'adjudicate_scaling', 9.0),
-        force_mate_in_one=getattr(config.mcts, 'force_mate_in_one', True),
+        mate_seeding=getattr(config.mcts, 'mate_seeding', False),
+        min_fresh_sims=getattr(config.mcts, 'min_fresh_sims', 64),
         inference_pipeline=getattr(config.inference, 'client_concurrency', 1)
             if getattr(config, 'inference', None) else 1,
         **mcts_kwargs,
@@ -1005,13 +1018,28 @@ def _game_result_str(state, move_count, max_game_length):
     return '*'
 
 
-def _mcts_child_stats(engine, root, mv, topn=8):
+def _search_effort_fields(search_stats):
+    """Per-move logging fields shared by self-play and eval/GUI snapshots."""
+    if not search_stats:
+        return {}
     return {
+        'inherited_root_n': int(search_stats.get('inherited_root_n', 0)),
+        'fresh_sims': int(search_stats.get('num_simulations', 0)),
+        'floor_fired': bool(search_stats.get('floor_fired', False)),
+        'min_fresh_sims': int(search_stats.get('min_fresh_sims', 0)),
+        'reused_root': bool(search_stats.get('reused_root', False)),
+    }
+
+
+def _mcts_child_stats(engine, root, mv, topn=8, search_stats=None):
+    out = {
         'selected_move': game_api.move_str(mv),
         'candidates': [{'move': c['move'], 'N': c['N'], 'W': c['W'],
                         'Q': c['Q'], 'P': c['P']}
                        for c in engine.get_root_child_stats(root)[:topn]],
     }
+    out.update(_search_effort_fields(search_stats))
+    return out
 
 
 def play_two_engine_match(engine_a, engine_b, a_is_first, max_game_length,
@@ -1037,11 +1065,11 @@ def play_two_engine_match(engine_a, engine_b, a_is_first, max_game_length,
             if root_b is None:
                 root_b = engine.get_root(state)
             r = root_b
-        engine.search(r)
+        _, _, search_stats = engine.search(r)
         _, mv = engine.select_move_with_temperature(r, temperature)
         if mv is None:
             break
-        ms = _mcts_child_stats(engine, r, mv)
+        ms = _mcts_child_stats(engine, r, mv, search_stats=search_stats)
         game_api.apply(state, mv)
         move_count += 1
         if on_move:
@@ -1070,11 +1098,11 @@ def play_engine_vs_reference(engine, that_first, max_game_length,
             if root_net is None:
                 root_net = engine.get_root(state)
             r = root_net
-            engine.search(r)
+            _, _, search_stats = engine.search(r)
             _, mv = engine.select_move_with_temperature(r, temperature)
             if mv is None:
                 break
-            ms = _mcts_child_stats(engine, r, mv)
+            ms = _mcts_child_stats(engine, r, mv, search_stats=search_stats)
             game_api.apply(state, mv)
             move_count += 1
             if on_move:
@@ -1179,7 +1207,8 @@ def _worker_loop_single(worker_id, task_queue, result_queue, config_dict, shutdo
     force_mate_enabled = (getattr(config.selfplay, 'force_mate', False)
                           and game_api.is_game('chess'))
 
-    force_mate_in_one = getattr(config.mcts, 'force_mate_in_one', True)
+    mate_seeding = getattr(config.mcts, 'mate_seeding', False)
+    min_fresh_sims = getattr(config.mcts, 'min_fresh_sims', 64)
     _plain_cls, _fm_cls = _engine_classes(config, force_mate_enabled)
 
     def mcts(net, noise, force_mate=False):
@@ -1206,7 +1235,8 @@ def _worker_loop_single(worker_id, task_queue, result_queue, config_dict, shutdo
             piece_values=config.selfplay.piece_values,
             adjudicate_graded=getattr(config.selfplay, 'adjudicate_graded', True),
             adjudicate_scaling=getattr(config.selfplay, 'adjudicate_scaling', 9.0),
-            force_mate_in_one=force_mate_in_one,
+            mate_seeding=mate_seeding,
+            min_fresh_sims=min_fresh_sims,
             inference_pipeline=getattr(config.inference, 'client_concurrency', 1)
                 if getattr(config, 'inference', None) else 1,
             **mcts_kwargs,
@@ -1412,7 +1442,8 @@ def _worker_loop_multi(worker_id, task_queue, result_queue, config_dict, shutdow
 
     force_mate_enabled = (getattr(config.selfplay, 'force_mate', False)
                           and game_api.is_game('chess'))
-    force_mate_in_one = getattr(config.mcts, 'force_mate_in_one', True)
+    mate_seeding = getattr(config.mcts, 'mate_seeding', False)
+    min_fresh_sims = getattr(config.mcts, 'min_fresh_sims', 64)
     _plain_cls, _fm_cls = _engine_classes(config, force_mate_enabled)
 
     def mcts(net, noise, force_mate=False):
@@ -1438,7 +1469,8 @@ def _worker_loop_multi(worker_id, task_queue, result_queue, config_dict, shutdow
             piece_values=config.selfplay.piece_values,
             adjudicate_graded=getattr(config.selfplay, 'adjudicate_graded', True),
             adjudicate_scaling=getattr(config.selfplay, 'adjudicate_scaling', 9.0),
-            force_mate_in_one=force_mate_in_one,
+            mate_seeding=mate_seeding,
+            min_fresh_sims=min_fresh_sims,
             inference_pipeline=getattr(config.inference, 'client_concurrency', 1)
                 if getattr(config, 'inference', None) else 1,
             **mcts_kwargs,
