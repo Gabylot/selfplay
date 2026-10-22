@@ -41,6 +41,7 @@ import queue
 import itertools
 import numpy as np
 import multiprocessing as mp
+import threading
 from typing import Optional, List
 
 import game_api
@@ -57,6 +58,13 @@ _RESPONSE_TIMEOUT_S = 120.0
 # MUST be unique across clients -- otherwise a response could cross clients and
 # hand one network the other's policy/value.
 _REQ_COUNTER = itertools.count(1)
+
+# Process-global response parking lot.  Clients sharing one response queue can
+# pop responses that belong to a sibling client; instead of caching those in a
+# private dict (where the rightful owner would never see them and eventually
+# time out), every client parks them here so the owner pops them on arrival.
+_RESPONSE_CACHE = {}
+_RESPONSE_CACHE_LOCK = threading.Lock()
 
 
 class InferenceClient:
@@ -101,9 +109,6 @@ class InferenceClient:
         self._shared_buffers = shared_buffers
         self._concurrency = max(1, concurrency)
         self._req_counter = 0
-        # Cache for out-of-order responses (needed when multiple
-        # InferenceClients share the same response queue, e.g. gating eval)
-        self._response_cache = {}
         # req_ids that are BATCH predictions (vs single-state).  Used to
         # return full arrays instead of (policy_vector, scalar_value).
         self._batch_req_ids = set()
@@ -119,6 +124,13 @@ class InferenceClient:
         else:
             self._num_slots = 1
             self._next_slot = 0
+        # In-flight request count (shared-memory mode only).  num_slots are
+        # the hard ceiling: more requests than that would round-robin onto a
+        # slot whose previous payload the server has not read yet and thus
+        # silently corrupt batches.  Callers keep inflight <= concurrency,
+        # and SharedMemoryTransport sizes num_slots == client_concurrency,
+        # so this only trips if that invariant is ever broken.
+        self._inflight = 0
 
     def _acquire_slot(self) -> int:
         """Return the slot to use for the next in-flight request."""
@@ -128,6 +140,25 @@ class InferenceClient:
 
     def _track_slot(self, req_id: int, slot: int):
         self._slot_by_req[req_id] = slot
+
+    def _claim_slot_budget(self):
+        """Raise if more requests are in flight than there are buffer slots.
+
+        Prevents silent shared-memory slot corruption (see _inflight note
+        in __init__); every entry point that writes a shared-memory slot
+        must call this first.
+        """
+        if self._shared_buffers is not None and self._inflight >= self._num_slots:
+            raise RuntimeError(
+                f"InferenceClient(worker={self.worker_id}) reached its slot "
+                f"limit: {self._inflight} requests already in flight vs "
+                f"{self._num_slots} slots.  Collect pending results before "
+                f"issuing further predict_batch_async/predict calls."
+            )
+
+    def _release_slot_budget(self):
+        if self._inflight > 0:
+            self._inflight -= 1
 
     # ── Public interface (matches AlphaZeroNet) ─────────────────────────
 
@@ -152,6 +183,7 @@ class InferenceClient:
             # ── Shared-memory path ──
             # Write the single state (as a 1-element batch) to shared memory,
             # then send only metadata through the queue.
+            self._claim_slot_budget()
             states_batch = state[np.newaxis, ...]  # (1, 20, 8, 8)
             slot = self._acquire_slot()
             self._track_slot(req_id, slot)
@@ -161,7 +193,10 @@ class InferenceClient:
             self.request_queue.put(
                 (self.worker_id, req_id, self.network_id, 1, slot)  # batch_size=1, slot
             )
-            return self._wait_response(req_id)
+            try:
+                return self._wait_response(req_id)
+            finally:
+                self._release_slot_budget()
 
         # ── Queue (pickle) path ──
         self.request_queue.put((self.worker_id, req_id, self.network_id, state))
@@ -207,6 +242,8 @@ class InferenceClient:
 
         if self._shared_buffers is not None:
             # ── Shared-memory path ──
+            self._claim_slot_budget()
+            self._inflight += 1
             slot = self._acquire_slot()
             self._track_slot(req_id, slot)
             SharedMemoryTransport.write_states(
