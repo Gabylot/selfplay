@@ -68,16 +68,22 @@ class _RNode:
     @property
     def children(self):
         if self._children is None:
-            self._children = self._eng._make_children(self.rs_id)
+            eng = self._eng
+            eng._use()          # select the owning engine's thread-local arena
+            self._children = eng._make_children(self.rs_id)
         return self._children
 
     @property
     def board(self):
-        return self._eng.board_of(self.rs_id)
+        eng = self._eng
+        eng._use()
+        return eng.board_of(self.rs_id)
 
     @property
     def is_expanded(self):
-        return bool(self._eng._lib.mcts_rs_is_expanded(self.rs_id))
+        eng = self._eng
+        eng._use()
+        return bool(eng._lib.mcts_rs_is_expanded(self.rs_id))
 
 
 class RustMCTS:

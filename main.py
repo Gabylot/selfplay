@@ -17,7 +17,7 @@ Usage:
 """
 import sys, os
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import argparse, sys, os, time, threading, signal, io
+import argparse, time, threading, signal, io
 from pathlib import Path
 
 import torch
@@ -29,7 +29,7 @@ from network import AlphaZeroNet, create_model_from_config, save_checkpoint, loa
 from mcts import MCTS
 from selfplay import self_play_game, ReplayBuffer, ParallelSelfPlay
 from training import train_one_step, create_optimizer
-from evaluation import Evaluator
+from evaluation import Evaluator, elo_update
 from stats import StatsLogger
 from tb_logger import TensorBoardLogger
 import chess_metrics
@@ -136,7 +136,7 @@ def _launch_tensorboard(log_dir, host="127.0.0.1", port=6006):
 # Training loop
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _dispatch_live_message(psp, worker_live_games, worker_live_game_ids,
+def _dispatch_live_message(worker_live_games, worker_live_game_ids,
                            worker_feature, worker_active, step, result,
                            global_stats=None):
     """Handle a single live_start / live_move / live_end result immediately
@@ -207,6 +207,25 @@ def lr_for_games(games, base_lr, milestones, gamma):
     """Step-decay learning rate as a function of total self-play games:
     base_lr * gamma ** (number of milestones already passed)."""
     return base_lr * (gamma ** sum(1 for mlst in milestones if games >= mlst))
+
+
+def _collect_result(psp, total_timeout_s=300.0):
+    """collect_one() with the long wait split into short slices.
+
+    On Windows an ``mp.Queue.get`` is not interruptible, so a single
+    300-second blocking wait means Ctrl+C can take up to five minutes to
+    be honored.  Slicing the deadline into ~10 s windows keeps shutdown
+    latency low while preserving the original "no result for 5 min"
+    semantics.
+    """
+    deadline = time.monotonic() + float(total_timeout_s)
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0 or _shutdown:
+            return None
+        r = psp.collect_one(timeout=min(10.0, remaining))
+        if r is not None:
+            return r
 
 
 def run_training(config, gui_enabled=False, num_workers=None):
@@ -513,7 +532,7 @@ def run_training(config, gui_enabled=False, num_workers=None):
 
     try:
         while not _shutdown:
-            result = psp.collect_one(timeout=300.0)
+            result = _collect_result(psp, 300.0)
             if result is None:
                 print("[WARN] No result in 5 min -- workers may be stuck")
                 continue
@@ -521,7 +540,7 @@ def run_training(config, gui_enabled=False, num_workers=None):
                 continue
 
             # ── Live incremental messages (real-time GUI updates) ──
-            if _dispatch_live_message(psp, worker_live_games, worker_live_game_ids,
+            if _dispatch_live_message(worker_live_games, worker_live_game_ids,
                                       worker_feature, worker_active, step, result,
                                       global_stats):
                 continue
@@ -562,7 +581,7 @@ def run_training(config, gui_enabled=False, num_workers=None):
                 # training ends).
                 def _drain_pending():
                     for r in psp.collect_available():
-                        if _dispatch_live_message(psp, worker_live_games, worker_live_game_ids,
+                        if _dispatch_live_message(worker_live_games, worker_live_game_ids,
                                                   worker_feature, worker_active, step, r,
                                                   global_stats):
                             continue
@@ -692,19 +711,28 @@ def run_training(config, gui_enabled=False, num_workers=None):
                 n_ref  = config.evaluation.ref_opponent_games
                 total_eval = n_gate + n_ref
 
-                # Build task list: half-and-half colors
+                # Build task list: half-and-half colors.
+                # In GPU mode the inference server already holds both
+                # networks (pushed via push_eval_weights above), so the
+                # per-task weight blobs would never be read by the worker --
+                # serializing and pickling two full state_dicts per game was
+                # pure IPC overhead.
                 eval_tasks = []
+                if use_gpu:
+                    weights_a = weights_b = None
+                else:
+                    weights_a, weights_b = wb_latest, wb_best
                 for gi in range(n_gate):
                     eval_tasks.append({
                         'type':'eval', 'eval_type':'gating',
-                        'weights_a': wb_latest, 'weights_b': wb_best,
+                        'weights_a': weights_a, 'weights_b': weights_b,
                         'a_is_white': (gi % 2 == 0),
                         'game_label': f"Gate {gi+1}/{n_gate}",
                     })
                 for gi in range(n_ref):
                     eval_tasks.append({
                         'type':'eval', 'eval_type':'reference',
-                        'weights_a': wb_latest, 'weights_b': None, 'ref_depth': ref_depth,
+                        'weights_a': weights_a, 'weights_b': None, 'ref_depth': ref_depth,
                         'a_is_white': (gi % 2 == 0),
                         'game_label': f"Ref {gi+1}/{n_ref}",
                     })
@@ -723,7 +751,7 @@ def run_training(config, gui_enabled=False, num_workers=None):
                 eval_live_start_ids = [0] * num_workers  # per-worker eval game counter
 
                 while collected < dispatched and not _shutdown:
-                    r = psp.collect_one(timeout=300.0)
+                    r = _collect_result(psp, 300.0)
                     if r is None:
                         print("[WARN] Eval result timeout"); break
                     if r.get('done'): continue
@@ -820,7 +848,12 @@ def run_training(config, gui_enabled=False, num_workers=None):
 
                     print(f"  [{etype[:4].upper()} W{wid}] {label}: {res}")
 
-                eval_game_counter += collected
+                # Count every dispatched game: games stranded by a worker
+                # crash / collection timeout can never be ingested later
+                # (the main loop discards late 'eval' results), so counting
+                # only `collected` would desync eval_game_counter from the
+                # checkpointed value.
+                eval_game_counter += dispatched
 
                 # Gating decision
                 k = config.evaluation.elo_k_factor
@@ -835,7 +868,9 @@ def run_training(config, gui_enabled=False, num_workers=None):
                     else:
                         print(f"  [GATE] not promoted  win_rate={wr:.1%}")
                     old_elo = evaluator.best_elo
-                    evaluator.best_elo = old_elo + k*(wr - 0.5)
+                    # Self-gating (identical ratings) -> expected = 0.5 by
+                    # design; see Evaluator.run_gating_match.
+                    evaluator.best_elo = elo_update(old_elo, old_elo, wr, k)
                     stats.log_promotion_attempt(step=step, promoted=promoted,
                                                 win_rate=wr, games_played=total_g,
                                                 wins=gate_wins, losses=gate_losses,
@@ -874,8 +909,8 @@ def run_training(config, gui_enabled=False, num_workers=None):
                                       games_played=total_r,
                                       wins=ref_wins, losses=ref_losses,
                                       draws=ref_draws, win_rate=rwr)
-                    net_elo = evaluator.ref_elo + 200
-                    new_ne  = net_elo + k*(rwr - 0.5)
+                    net_elo = evaluator.ref_elo + 200  # starts 200 pts above ref
+                    new_ne = elo_update(net_elo, evaluator.ref_elo, rwr, k)
                     stats.log_elo(new_ne,"alpha_beta_ref",step,
                                   total_r,ref_wins,ref_losses,ref_draws)
                     tb.log_elo(new_ne,"alpha_beta_ref",step,
@@ -1088,7 +1123,7 @@ def run_benchmark(config, num_workers=None, num_games=10, profile_games=3):
     print(f"[INFO] Device: {device}")
     use_gpu = getattr(config, 'inference', None) and getattr(config.inference, 'use_gpu', False)
     if use_gpu:
-        print("[INFO] Inference: GPU (DirectML centralized server)")
+        print("[INFO] Inference: GPU (CUDA/ROCm centralized server)")
 
     if num_workers is None:
         num_workers = getattr(config.selfplay, 'num_workers', 8)
@@ -1141,7 +1176,7 @@ def run_benchmark(config, num_workers=None, num_games=10, profile_games=3):
         while games_done < num_games and not _shutdown:
             # Waiting for a result
             t_wait = time.perf_counter()
-            result = psp.collect_one(timeout=300.0)
+            result = _collect_result(psp, 300.0)
             timers.wait += time.perf_counter() - t_wait
             if result is None:
                 print("[WARN] No result in 5 min -- workers may be stuck")
@@ -1173,14 +1208,18 @@ def run_benchmark(config, num_workers=None, num_games=10, profile_games=3):
                   f"{game_info['length']} moves")
             timers.bookkeeping += time.perf_counter() - t_bk
 
-            # Respawning this worker (weights serialization + task push, as in training)
+            # Respawning this worker (weights serialization + task push, as in training).
+            # In GPU mode the inference server already holds the weights, so
+            # skip the serialization -- mirrors ingest_selfplay().
             t_rp = time.perf_counter()
-            import torch as _torch, io as _io
-            buf2 = _io.BytesIO()
-            _torch.save(network.state_dict(), buf2)
-            wb = buf2.getvalue()
+            task = {'type': 'selfplay'}
+            if not use_gpu:
+                import torch as _torch, io as _io
+                buf2 = _io.BytesIO()
+                _torch.save(network.state_dict(), buf2)
+                task['weights'] = buf2.getvalue()
             try:
-                psp._task_qs[wid].put_nowait({'type': 'selfplay', 'weights': wb})
+                psp._task_qs[wid].put_nowait(task)
             except Exception:
                 pass
             timers.respawn += time.perf_counter() - t_rp
@@ -1195,7 +1234,7 @@ def run_benchmark(config, num_workers=None, num_games=10, profile_games=3):
             expected = num_workers
             received = 0
             while received < expected and not _shutdown:
-                r = psp.collect_one(timeout=300.0)
+                r = _collect_result(psp, 300.0)
                 if r is None:
                     print("[WARN] Profile collection timeout")
                     break
@@ -1284,7 +1323,7 @@ def run_tournament_mode(config, gui_enabled=True, model_dir=None, models=None,
     print(f"[INFO] Device: {device}")
     use_gpu = getattr(config, 'inference', None) and getattr(config.inference, 'use_gpu', False)
     if use_gpu:
-        print("[INFO] Inference: GPU (DirectML centralized server)")
+        print("[INFO] Inference: GPU (CUDA/ROCm centralized server)")
 
     from tournament import (discover_models, build_schedule, Tournament,
                             run_tournament, print_standings)
@@ -1431,7 +1470,7 @@ def main():
     elif args.mode == "evaluate":
         use_gpu = getattr(config, 'inference', None) and getattr(config.inference, 'use_gpu', False)
         if use_gpu:
-            print("[INFO] Inference: GPU (DirectML centralized server)")
+            print("[INFO] Inference: GPU (CUDA/ROCm centralized server)")
 
         dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         net = create_model_from_config(config); net.to(dev)

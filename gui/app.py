@@ -208,5 +208,10 @@ def start_gui_server(stats=None, config=None, worker_live_games=None, eval_live_
         if Path(db).exists():
             _stats = StatsLogger(db)
 
+    # allow_unsafe_werkzeug is required (not optional): flask_socketio
+    # refuses the Werkzeug dev server whenever stdin is not a tty, which is
+    # exactly how this training loop runs (headless / detached sessions).
+    # The server binds to 127.0.0.1 only (config.gui.host), which is the
+    # intended "unsafe" use-case boundary.
     socketio.run(app, host=host, port=port,
                  allow_unsafe_werkzeug=True, use_reloader=False, log_output=False)

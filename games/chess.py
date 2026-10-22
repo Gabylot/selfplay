@@ -71,8 +71,10 @@ def is_fifty_moves(state):
 def terminal_value(state):
     """Terminal value from the side-to-move's perspective.
 
-    Returns None for non-terminal / claimable-draw positions so the MCTS
-    can handle those separately (matching the legacy behavior).
+    Returns None only for non-terminal positions.  Callable draws are NOT
+    returned as None: the backend treats threefold/50-move as automatic
+    claims (result() already reports 1/2-1/2 for them), so this maps them to
+    0.0 like other draws.
     """
     result = state.result()
     if result == "*":
@@ -84,7 +86,7 @@ def terminal_value(state):
     return 0.0
 
 
-def adjudicate_value(state, piece_values=None, graded=False, scaling=7.0):
+def adjudicate_value(state, piece_values=None, graded=False, scaling=9.0):
     """Material-based adjudication.
 
     NOTE: matches the engine's historical material adjudication (white
@@ -94,7 +96,8 @@ def adjudicate_value(state, piece_values=None, graded=False, scaling=7.0):
     When graded, the material margin is clamped to one queen's value before
     the tanh: a runaway advantage (e.g. +30 pawns) must not push the value
     toward ~1.0, which would make it indistinguishable from a forced mate.
-    With scaling=9.0 the maximum is tanh(9/9) = ~0.762 (a lone queen).
+    With scaling=9.0 (the pipeline default; every engine call site explicitly
+    passes it) the maximum is tanh(9/9) = ~0.762 (a lone queen).
     """
     if piece_values is None:
         piece_values = {"P": 1, "N": 3, "B": 3, "R": 5, "Q": 9}

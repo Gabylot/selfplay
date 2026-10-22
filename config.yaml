@@ -23,11 +23,13 @@ mcts:
   dirichlet_epsilon: 0.3     # Weight of noise vs root prior
   batch_size: 8               # Batch size for tree-parallel MCTS (1 = sequential, no virtual loss)
   c_virtual_loss: 0.5         # Virtual loss penalty for batch MCTS
-  force_mate_in_one: false     # Force a one-hot policy for a root checkmate move (mate-in-1)
+  mate_seeding: true          # Give each mating root move one terminal pre-visit before search
+  min_fresh_sims: 64          # Minimum new simulations after tree reuse (0 = old max(0, budget-root.N))
 
 # --- Self-Play ---
 selfplay:
-  network_source: latest      # "latest" (always use newest network) or "gated_best"
+  # NOTE: self-play always trains from the LATEST network (never the gated
+  # best) -- evaluation/gating are monitoring signals only.
   num_workers: 8              # Worker processes (8 physical cores; >cores slows CPU-bound MCTS)
   games_per_worker: 8          # Concurrent games per worker process (1 = one game at a time).
                                # >1 gives each game its own private GPU inference endpoint, so the
@@ -45,7 +47,7 @@ selfplay:
                               # start_fen.
   start_colors_random: false   # Flip colour assignment per game for asymmetric
                               # specs (e.g. "KQQk"): either side gets the queens.
-  adjudicate_material: true   # When max length hit, judge by material instead of draw
+  adjudicate_material: false   # When max length hit, judge by material instead of draw
   # Material values for adjudication
   piece_values:
     P: 1
@@ -62,7 +64,7 @@ selfplay:
   endgame_temperature: 0.1
   endgame_piece_gate: 1
   endgame_num_simulations: 200
-  adjudicate_graded: true     # use tanh grading instead of flat ±1
+  adjudicate_graded: false     # use tanh grading instead of flat ±1
   adjudicate_scaling: 9.0     # margin is clamped to ±1 queen before tanh, so
                               # the value saturates at ~0.76 (a lone queen):
                               # queen+ = ~0.76, rook = ~0.51, pawn = ~0.11.
@@ -87,7 +89,7 @@ buffer:
 # --- Training ---
 training:
   batch_size: 1024
-  learning_rate: 0.02
+  learning_rate: 0.01
   momentum: 0.9
   weight_decay: 1e-4
   num_batches_per_step: 24    # Number of gradient steps per training session
@@ -173,5 +175,5 @@ inference:
 
 # --- Main ---
 main:
-  run_name: "run_v2"         # Name for this run (affects output directories)
+  run_name: "run_v3"         # Name for this run (affects output directories)
   output_dir: "output"

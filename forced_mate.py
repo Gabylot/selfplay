@@ -140,6 +140,12 @@ class ForceMateMixin:
         self.forced_log = []
 
     def select_move_with_temperature(self, root, temperature):
+        # The Rust engine keeps per-thread arenas: touching root state via
+        # FFI requires our arena to be the thread's current one (the Python
+        # engine has no _use; guard accordingly).
+        use = getattr(self, '_use', None)
+        if use is not None:
+            use()
         b = root.board
         n_pieces = len(b.piece_map())
         if n_pieces <= self.min_pieces_gate:

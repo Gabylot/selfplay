@@ -85,14 +85,15 @@ a pure-Python fallback.
 
 ### MCTS (PUCT)
 - Configurable simulations per move (default 200, tunable 50–800)
-- Dirichlet noise at root for exploration (α=0.3, ε=0.25)
+- Dirichlet noise at root for exploration (α=0.25, ε=0.3)
 - Temperature-based move selection (τ=1.0 opening, τ=0.1 middlegame)
 
 ### Self-Play Design
 - **Always uses the latest network** (not gated "best") — prevents stagnation from evaluation variance
 - Gating/Elo are purely monitoring signals, not training gates
-- Material adjudication at 150 half-move cap (configurable)
-- FIFO replay buffer (default 100k positions)
+- Material adjudication at 180 half-move cap (configurable; off by default --
+  graded ±0.76-max tanh option when enabled)
+- FIFO replay buffer (default 150k positions)
 - No data augmentation in v1
 
 ### Training
@@ -107,21 +108,22 @@ All hyperparameters are in `config.yaml`:
 
 ```yaml
 network:
-  num_residual_blocks: 4    # ResNet depth
-  num_filters: 64           # Channel width
+  num_residual_blocks: 8    # ResNet depth
+  num_filters: 128          # Channel width
 
 mcts:
   num_simulations: 200      # Per move
   c_puct: 1.5               # Exploration constant
 
 selfplay:
-  network_source: latest    # "latest" or "gated_best"
-  max_game_length: 150      # Half-move cap
-  temperature_threshold: 30 # Move to switch temp
+  # self-play always trains from the LATEST network (never the gated best);
+  # evaluation/gating are monitoring signals only
+  max_game_length: 180      # Half-move cap
+  temperature_threshold: 20 # Move to switch temp
 
 training:
-  batch_size: 256
-  learning_rate: 0.001
+  batch_size: 1024
+  learning_rate: 0.01
 ```
 
 ## GUI Dashboard

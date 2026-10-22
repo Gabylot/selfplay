@@ -237,23 +237,6 @@ class TensorBoardLogger:
             TensorBoardLogger._archive_dir(log_dir, d)
 
     @staticmethod
-    def _archive_previous(log_dir: str, axis_dir: Path, purge_at):
-        """Fallback: move existing event files aside before resuming.
-
-        Used if the in-place merge fails.  Relocates every pre-existing
-        ``events.out.tfevents.*`` out of ``step/``/``game/`` — including
-        the per-tag ``add_scalars`` subdirectories — to a sibling
-        ``<log_dir>_tb_archive/<axis>/`` (and ``.../<axis>/<subdir>/``)
-        folder that sits outside the run tree TensorBoard scans.
-        """
-        d = Path(axis_dir)
-        if purge_at is None or not d.exists():
-            return
-        targets = [d] + sorted(x for x in d.iterdir() if x.is_dir())
-        for target in targets:
-            TensorBoardLogger._archive_dir(log_dir, target)
-
-    @staticmethod
     def _archive_dir(log_dir: str, d: Path):
         arch_root = Path(log_dir).with_name(Path(log_dir).name + "_tb_archive")
         rel = d.relative_to(Path(log_dir))

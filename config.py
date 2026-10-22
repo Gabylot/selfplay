@@ -27,16 +27,17 @@ def load_config(path: Optional[str] = None) -> dict:
         },
         "network": {
             "num_residual_blocks": 8,
-            "num_filters": 64,
-            "num_policy_channels": 64,
-            "num_value_channels": 1,
+            "num_residual_blocks": 8,
+            "num_filters": 128,
+            "num_policy_channels": 128,
+            "num_value_channels": 32,
             "value_fc_size": 128,
         },
         "mcts": {
-            "num_simulations": 400,
-            "c_puct": 3.0,
-            "dirichlet_alpha": 0.3,
-            "dirichlet_epsilon": 0.4,
+            "num_simulations": 200,
+            "c_puct": 1.5,
+            "dirichlet_alpha": 0.25,
+            "dirichlet_epsilon": 0.3,
             "batch_size": 8,
             "c_virtual_loss": 0.5,
             "mate_seeding": False,
@@ -47,7 +48,8 @@ def load_config(path: Optional[str] = None) -> dict:
             "use_rust_engine": True,
         },
         "selfplay": {
-            "network_source": "latest",
+            # NOTE: self-play always trains from the LATEST network (never the
+            # gated best) -- evaluation/gating are monitoring signals only.
             # FEN every self-play game starts from (None = standard start).
             "start_fen": None,
             # Start positions for self-play games: a piece set always frames a fresh
@@ -61,21 +63,21 @@ def load_config(path: Optional[str] = None) -> dict:
             # colour assignment per game, so either side gets the strong
             # pieces 50% of the time.
             "start_colors_random": False,
-            "max_game_length": 150,
-            "adjudicate_material": True,
+            "max_game_length": 180,
+            "adjudicate_material": False,
             "piece_values": {"P": 1, "N": 3, "B": 3, "R": 5, "Q": 9},
-            "adjudicate_graded": True,
+            "adjudicate_graded": False,
             "adjudicate_scaling": 9.0,
-            "temperature_threshold": 30,
+            "temperature_threshold": 20,
             "temperature_high": 1.0,
             "temperature_low": 0.1,
             # Endgame tuning: applied when <= endgame_piece_gate pieces stay
             # on the board (usually the "simple endgames" the net struggles
             # to convert).  Uses its own temperature and a deeper simulation
             # budget without touching the middlegame settings.
-            "endgame_temperature": 0.3,
-            "endgame_piece_gate": 6,
-            "endgame_num_simulations": 1600,
+            "endgame_temperature": 0.1,
+            "endgame_piece_gate": 1,
+            "endgame_num_simulations": 200,
             # Exact forced-mate override for endgame conversion
             # (see forced_mate.py).  When enabled, self-play move selection
             # is overridden by a proof search when a forced mate within
@@ -92,26 +94,26 @@ def load_config(path: Optional[str] = None) -> dict:
             "force_mate_deep_gate_pieces": 4,
         },
         "buffer": {
-            "max_size": 100000,
+            "max_size": 150000,
         },
         "training": {
-            "batch_size": 256,
-            "learning_rate": 0.001,
+            "batch_size": 1024,
+            "learning_rate": 0.01,
             "momentum": 0.9,
             "weight_decay": 1e-4,
-            "num_batches_per_step": 10,
-            "checkpoint_interval": 50,
-            "training_steps_per_iteration": 5,
+            "num_batches_per_step": 24,
+            "checkpoint_interval": 2000,
+            "training_steps_per_iteration": 10,
         },
         "evaluation": {
-            "eval_interval": 50,
-            "gate_games": 20,
+            "eval_interval": 5000,
+            "gate_games": 50,
             "gate_win_threshold": 0.55,
-            "ref_opponent_games": 20,
+            "ref_opponent_games": 50,
             "elo_k_factor": 32,
         },
         "alpha_beta": {
-            "depth": 2,
+            "depth": 1,
             "piece_values": {"P": 1, "N": 3, "B": 3, "R": 5, "Q": 9},
             "checkmate_score": 10000,
         },
@@ -139,15 +141,17 @@ def load_config(path: Optional[str] = None) -> dict:
             "initial_elo": 1000,
         },
         "inference": {
-            "use_gpu": False,
+            "use_gpu": True,
             "use_shared_memory": True,
-            "state_dtype": "float32",
-            "max_batch": 256,
-            "max_wait_ms": 2.0,
-            "prewarm_batch_sizes": [1, 8, 16, 32, 64, 128, 256],
+            "state_dtype": "float16",
+            "policy_dtype": "float16",
+            "client_concurrency": 2,
+            "max_batch": 2048,
+            "max_wait_ms": 3.0,
+            "prewarm_batch_sizes": [1, 8, 16, 32, 64, 128, 256, 512, 1024, 2048],
         },
         "main": {
-            "run_name": "default",
+            "run_name": "run_v3",
             "output_dir": "output",
         },
     }

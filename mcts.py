@@ -30,29 +30,6 @@ from encoding import (
 from network import AlphaZeroNet
 
 
-# ---- Helper for material adjudication (copied from selfplay.py to avoid circular import) ----
-def adjudicate_by_material(board, piece_values, graded=False, scaling=9.0):
-    """Return +1/-1/0 (or tanh-scaled) based on material difference."""
-    # Use piece_map() to iterate only occupied squares (~32) instead of all 64.
-    w = b = 0
-    for sq, p in board.piece_map().items():
-        v = piece_values.get(p.symbol().upper(), 0)
-        if p.color == chess.WHITE:
-            w += v
-        else:
-            b += v
-    diff = w - b
-    if graded:
-        if diff == 0:
-            return 0.0
-        return float(np.tanh(diff / scaling))
-    if diff > 0:
-        return 1.0
-    if diff < 0:
-        return -1.0
-    return 0.0
-
-
 class MCTSNode:
     """A node in the MCTS tree.
 

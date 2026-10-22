@@ -12,6 +12,7 @@ python-chess>=1.999
 PyYAML>=6.0
 flask>=3.0
 flask-socketio>=5.3
+tensorboard>=2.10    # torch.utils.tensorboard needs the real package at runtime
 
 # Optional: build the Rust fastchess encoding extension and mcts_rs engine
 # (pure-Python fallbacks are used when these are unavailable).

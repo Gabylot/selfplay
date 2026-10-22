@@ -292,8 +292,8 @@ class StatsLogger:
         """Get training losses over time."""
         query = "SELECT step, policy_loss, value_loss, total_loss, timestamp FROM training_log"
         if last_n:
-            query += f" ORDER BY id DESC LIMIT {last_n}"
-            rows = self.conn.execute(query).fetchall()
+            query += " ORDER BY id DESC LIMIT ?"
+            rows = self.conn.execute(query, (int(last_n),)).fetchall()
             rows.reverse()
         else:
             rows = self.conn.execute(query + " ORDER BY id ASC").fetchall()
@@ -305,8 +305,8 @@ class StatsLogger:
         query = ("SELECT game_id, step, result, length, termination, avg_mcts_depth, "
                  "material_diff, timestamp FROM game_log")
         if last_n:
-            query += f" ORDER BY id DESC LIMIT {last_n}"
-            rows = self.conn.execute(query).fetchall()
+            query += " ORDER BY id DESC LIMIT ?"
+            rows = self.conn.execute(query, (int(last_n),)).fetchall()
             rows.reverse()
         else:
             rows = self.conn.execute(query + " ORDER BY id ASC").fetchall()

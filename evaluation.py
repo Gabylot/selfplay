@@ -420,10 +420,15 @@ class Evaluator:
 
         # Update Elo (network A = latest, network B = best) BEFORE logging the
         # promotion attempt so old_elo/new_elo reflect an actual change.
+        # NOTE: gating is self-play (latest vs current best), so both ratings
+        # are the same -> expected score is constant 0.5.  This is by design:
+        # the "Elo" is a monitoring signal (a fixed-k walk on the gate win
+        # rate), not a true two-player rating.  elo_update() with equal
+        # ratings encodes exactly that.
         score_a = match_result['win_rate_a']
         k = self.config.evaluation.elo_k_factor
         old_elo = self.best_elo
-        self.best_elo = elo_update(self.best_elo, self.best_elo, score_a, k)
+        self.best_elo = elo_update(old_elo, old_elo, score_a, k)
 
         # Log promotion attempt
         self.stats.log_promotion_attempt(

@@ -291,7 +291,9 @@ def _board_to_tensor_rust(board: chess.Board) -> np.ndarray:
         return board_to_tensor(board, 8)
     if hasattr(b, "encode_tensor"):
         data = b.encode_tensor(NO_PROGRESS_NORM, MOVE_COUNT_NORM)
-        return np.frombuffer(data, dtype=np.float32).reshape(NUM_PLANES, 8, 8)
+        # Rust serialises little-endian (to_le_bytes); decode with an explicit
+        # '<f4' instead of native order so this stays correct on big-endian hosts.
+        return np.frombuffer(data, dtype='<f4').reshape(NUM_PLANES, 8, 8)
     return board_to_tensor(board, 8)
 
 

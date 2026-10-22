@@ -92,6 +92,11 @@ class LiveGameState:
         self._emit_pending:   bool    = False
         self._emit_timer:     Optional[threading.Timer] = None
         self._last_global_stats: float = 0.0
+        # Guards the throttle fields above: they are touched from the
+        # game-loop thread and from Timer-callback threads (_flush_pending).
+        # Separate from self._lock -- _do_emit() must not run while holding
+        # it (it internally acquires self._lock, which is non-reentrant).
+        self._emit_lock = threading.Lock()
 
     # ── Public API called by training/eval loops ──────────────────────────
 
@@ -231,27 +236,39 @@ class LiveGameState:
             return
 
         now = time.monotonic()
-        elapsed = now - self._last_emit_time
+        emit_now = False
+        notify_timer = False
+        with self._emit_lock:
+            elapsed = now - self._last_emit_time
 
-        if force or elapsed >= self._MIN_EMIT_INTERVAL:
-            # Emit now
-            self._last_emit_time = now
-            self._emit_pending = False
+            if force or elapsed >= self._MIN_EMIT_INTERVAL:
+                # Emit now
+                self._last_emit_time = now
+                self._emit_pending = False
+                emit_now = True
+            else:
+                # Defer this emit — schedule a flush for when the interval expires
+                self._emit_pending = True
+                notify_timer = (self._emit_timer is None
+                                or not self._emit_timer.is_alive())
+                if notify_timer:
+                    delay = self._MIN_EMIT_INTERVAL - elapsed
+                    self._emit_timer = threading.Timer(delay, self._flush_pending)
+                    self._emit_timer.daemon = True
+        if emit_now:
             self._do_emit()
-        else:
-            # Defer this emit — schedule a flush for when the interval expires
-            self._emit_pending = True
-            if self._emit_timer is None or not self._emit_timer.is_alive():
-                delay = self._MIN_EMIT_INTERVAL - elapsed
-                self._emit_timer = threading.Timer(delay, self._flush_pending)
-                self._emit_timer.daemon = True
-                self._emit_timer.start()
+        elif notify_timer:
+            self._emit_timer.start()
 
     def _flush_pending(self):
         """Flush a deferred (throttled) emit if one is still pending."""
-        if self._emit_pending:
-            self._emit_pending = False
-            self._last_emit_time = time.monotonic()
+        should_emit = False
+        with self._emit_lock:
+            if self._emit_pending:
+                self._emit_pending = False
+                self._last_emit_time = time.monotonic()
+                should_emit = True
+        if should_emit:
             self._do_emit()
 
     def _do_emit(self):

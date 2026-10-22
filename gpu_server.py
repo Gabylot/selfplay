@@ -1,8 +1,8 @@
 """Centralized GPU inference server for AlphaZero chess.
 
-Runs in a dedicated process, owns the GPU (torch_directml), and serves
+Runs in a dedicated process, owns the GPU (torch CUDA / ROCm), and serves
 inference requests from all worker processes.  Includes shader pre-warming
-to eliminate DirectML's lazy-compilation latency spikes.
+to eliminate lazy-compilation latency spikes.
 
 Supports **two** networks simultaneously (network_id 0 and 1) so that
 gating evaluation (network A vs network B) can run entirely on the GPU
@@ -54,7 +54,7 @@ from shared_memory_transport import SharedMemoryTransport, WorkerSharedBuffers
 # ─────────────────────────────────────────────────────────────────────────────
 
 def warmup_shaders(network, device, batch_sizes=(1, 8, 16, 32, 64, 128)):
-    """Run dummy forward passes to force DirectML to compile & cache shaders.
+    """Run dummy forward passes to force the backend to compile & cache shaders.
 
     After this function returns, inference at the given batch sizes should
     consistently hit the cached fast path (~1-2 ms) instead of randomly
@@ -201,6 +201,10 @@ class GPUInferenceServer:
         # The object arrives via spawn/unpickle, so __init__ does not re-run:
         # restore the active game (spawned interpreter defaults to chess).
         game_api.set_game(self.game_name)
+        # Locks cannot be pickled: (re-)create them here in the child process
+        # (this object arrives via spawn/unpickle and __init__ does not
+        # re-run, same as _model_lock below).
+        self._busy_lock = threading.Lock()
         # Re-resolve: shared_buffers arrive via pickle, dtype may differ from
         # what __init__ saw in the parent process.
         self._upload_dtype = self._resolve_upload_dtype()
@@ -503,13 +507,23 @@ class GPUInferenceServer:
             if latest[nid] is not None:
                 t0 = time.perf_counter()
                 buf = io.BytesIO(latest[nid])
-                state_dict = torch.load(buf, map_location='cpu', weights_only=True)
-                # Serialize against the forward-worker thread which may be
-                # executing nets[nid] concurrently.
-                lock = self._model_lock if self._model_lock is not None else contextlib.nullcontext()
-                with lock:
-                    nets[nid].load_state_dict(state_dict)
-                    nets[nid].eval()
+                try:
+                    state_dict = torch.load(buf, map_location='cpu', weights_only=True)
+                    # Serialize against the forward-worker thread which may be
+                    # executing nets[nid] concurrently.
+                    lock = (self._model_lock if self._model_lock is not None
+                            else contextlib.nullcontext())
+                    with lock:
+                        nets[nid].load_state_dict(state_dict)
+                        nets[nid].eval()
+                except Exception as e:
+                    # A malformed weight payload must not kill the server
+                    # process -- every worker would then burn a full response
+                    # timeout.  Keep the previously loaded weights, count and
+                    # log loudly so a poisoned checkpoint is visible.
+                    self.stats['weight_errors'] = self.stats.get('weight_errors', 0) + 1
+                    print(f"[GPU-Server] ERROR: failed to load weights for "
+                          f"network {nid} ({e!r}); keeping previous weights")
                 self.stats['weight_load_time'] += time.perf_counter() - t0
 
     def _process_aggregated(self, nets, device, pending, net_a):
@@ -759,11 +773,12 @@ class GPUInferenceServer:
             if job is None:
                 break
             net, group, _unused = job  # mega build now happens inside _forward_and_distribute
-            self._busy_count += 1
+            with self._busy_lock:
+                self._busy_count += 1
             try:
                 self._forward_and_distribute(net, device, group)
             except Exception as e:
-                # A transient GPU/DirectML error must NOT kill this thread.
+                # A transient GPU error must NOT kill this thread.
                 # Dropping one batch is far better than crashing the server --
                 # but we now tell each waiting client explicitly so it can
                 # raise instead of blocking until its timeout.
@@ -778,7 +793,8 @@ class GPUInferenceServer:
                     except Exception:
                         pass
             finally:
-                self._busy_count -= 1
+                with self._busy_lock:
+                    self._busy_count -= 1
 
     def _stop_forward_worker(self):
         """Signal the forward workers to stop and wait for them to drain."""

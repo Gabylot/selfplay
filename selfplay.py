@@ -76,6 +76,72 @@ def _engine_classes(config, force_mate):
     return MCTS, ForceMateMCTS
 
 
+def _make_engine(config, net, noise=True, force_mate=False):
+    """Build the MCTS engine from ``config`` (single source of truth).
+
+    Used by every worker loop and the standalone self-play entry point; the
+    constructor call was previously duplicated three times and had already
+    started to drift.
+    """
+    force_mate_enabled = (getattr(config.selfplay, 'force_mate', False)
+                          and game_api.is_game('chess'))
+    plain_cls, fm_cls = _engine_classes(config, force_mate_enabled)
+    cls = fm_cls if force_mate else plain_cls
+    mcts_kwargs = {}
+    if force_mate:
+        mcts_kwargs = {
+            'max_force_plies': getattr(config.selfplay, 'force_mate_max_plies', 5),
+            'min_pieces_gate': getattr(config.selfplay, 'force_mate_gate_pieces', 8),
+            'deep_plies': getattr(config.selfplay, 'force_mate_deep_plies', 9),
+            'deep_gate_pieces': getattr(config.selfplay, 'force_mate_deep_gate_pieces', 4),
+        }
+    return cls(
+        network=net,
+        num_simulations=config.mcts.num_simulations,
+        c_puct=config.mcts.c_puct,
+        dirichlet_alpha=(config.mcts.dirichlet_alpha if noise else 0.0),
+        dirichlet_epsilon=(config.mcts.dirichlet_epsilon if noise else 0.0),
+        batch_size=getattr(config.mcts, 'batch_size', 1),
+        c_virtual_loss=getattr(config.mcts, 'c_virtual_loss', 0.5),
+        max_game_length=config.selfplay.max_game_length,
+        adjudicate_material=config.selfplay.adjudicate_material,
+        piece_values=config.selfplay.piece_values,
+        adjudicate_graded=getattr(config.selfplay, 'adjudicate_graded', True),
+        adjudicate_scaling=getattr(config.selfplay, 'adjudicate_scaling', 9.0),
+        mate_seeding=getattr(config.mcts, 'mate_seeding', False),
+        min_fresh_sims=getattr(config.mcts, 'min_fresh_sims', 64),
+        inference_pipeline=getattr(config.inference, 'client_concurrency', 1)
+            if getattr(config, 'inference', None) else 1,
+        **mcts_kwargs,
+    )
+
+
+def _run_game(config, mcts_engine, piece_values, on_move=None,
+              temperature_override=None):
+    """Play one self-play game with the standard config settings.
+
+    Single source of truth for the ``play_one_game`` argument list that was
+    previously duplicated in every worker loop.
+    """
+    return play_one_game(
+        mcts_engine,
+        config.selfplay.max_game_length,
+        config.selfplay.adjudicate_material, piece_values,
+        config.selfplay.temperature_threshold,
+        config.selfplay.temperature_high, config.selfplay.temperature_low,
+        on_move=on_move,
+        temperature_override=temperature_override,
+        adjudicate_graded=getattr(config.selfplay, 'adjudicate_graded', True),
+        adjudicate_scaling=getattr(config.selfplay, 'adjudicate_scaling', 9.0),
+        endgame_temperature=getattr(config.selfplay, 'endgame_temperature', None),
+        endgame_piece_gate=getattr(config.selfplay, 'endgame_piece_gate', 6),
+        endgame_num_simulations=getattr(config.selfplay, 'endgame_num_simulations', 0),
+        fen=getattr(config.selfplay, 'start_fen', None),
+        start_pieces=getattr(config.selfplay, 'start_pieces', None),
+        start_colors_random=getattr(config.selfplay, 'start_colors_random', False),
+    )
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Replay Buffer
 # ─────────────────────────────────────────────────────────────────────────────
@@ -562,22 +628,6 @@ def get_temperature(move_number, threshold=30, temp_high=1.0, temp_low=0.1):
     return temp_high if move_number < threshold else temp_low
 
 
-def adjudicate_by_material(board, piece_values, graded=False, scaling=9.0):
-    # Use piece_map() to iterate only occupied squares (~32) instead of all 64.
-    w=b=0
-    for sq, p in board.piece_map().items():
-        v=piece_values.get(p.symbol().upper(),0)
-        if p.color==chess.WHITE: w+=v
-        else: b+=v
-    diff=w-b
-    if graded:
-        if diff==0: return 0.0
-        return float(np.tanh(diff / scaling))
-    if diff>0: return 1.0
-    if diff<0: return -1.0
-    return 0.0
-
-
 def material_point_difference(board, piece_values):
     """Return raw material point difference (white - black) at current position."""
     # Use piece_map() to iterate only occupied squares (~32) instead of all 64.
@@ -761,7 +811,11 @@ def random_start_board(pieces, rng=None, randomize_colors=False):
         if wking is None or bking is None:
             continue
         # Kings must not be adjacent (that would be an illegal check).
-        if max(abs(wking & 7 - bking & 7), abs((wking >> 3) - (bking >> 3))) <= 1:
+        # NOTE: & binds looser than - in intent only -- the file comparison
+        # MUST be parenthesised, otherwise it parses as
+        # wking & (7 - bking) & 7 and rejects/re-accepts the wrong positions.
+        if max(abs((wking & 7) - (bking & 7)),
+               abs((wking >> 3) - (bking >> 3))) <= 1:
             continue
         # Two bishops of the same colour must sit on opposite-coloured
         # squares: same-coloured bishops can never force mate, so those
@@ -962,56 +1016,10 @@ def self_play_game(network, config, on_move=None):
     # (see forced_mate.py).  The proof search is gated to sparse boards
     # (<= force_mate_gate_pieces pieces) and cheap (sub-ms).  It is a
     # chess-only feature, so it is disabled for other games.
-    force_mate = (getattr(config.selfplay, 'force_mate', False)
-                  and game_api.is_game('chess'))
-    plain_cls, fm_cls = _engine_classes(config, force_mate)
-    mcts_cls = fm_cls if force_mate else plain_cls
-    mcts_kwargs = {}
-    if force_mate:
-        mcts_kwargs = {
-            'max_force_plies': getattr(config.selfplay, 'force_mate_max_plies', 5),
-            'min_pieces_gate': getattr(config.selfplay, 'force_mate_gate_pieces', 8),
-            'deep_plies': getattr(config.selfplay, 'force_mate_deep_plies', 9),
-            'deep_gate_pieces': getattr(config.selfplay, 'force_mate_deep_gate_pieces', 4),
-        }
-    mcts_engine = mcts_cls(
-        network=network,
-        num_simulations=config.mcts.num_simulations,
-        c_puct=config.mcts.c_puct,
-        dirichlet_alpha=config.mcts.dirichlet_alpha,
-        dirichlet_epsilon=config.mcts.dirichlet_epsilon,
-        batch_size=getattr(config.mcts,'batch_size',1),
-        c_virtual_loss=getattr(config.mcts,'c_virtual_loss',0.5),
-        # ---- NEW: pass game‑length and adjudication parameters ----
-        max_game_length=config.selfplay.max_game_length,
-        adjudicate_material=config.selfplay.adjudicate_material,
-        piece_values=config.selfplay.piece_values,
-        adjudicate_graded=getattr(config.selfplay, 'adjudicate_graded', True),
-        adjudicate_scaling=getattr(config.selfplay, 'adjudicate_scaling', 9.0),
-        mate_seeding=getattr(config.mcts, 'mate_seeding', False),
-        min_fresh_sims=getattr(config.mcts, 'min_fresh_sims', 64),
-        inference_pipeline=getattr(config.inference, 'client_concurrency', 1)
-            if getattr(config, 'inference', None) else 1,
-        **mcts_kwargs,
-    )
-    return play_one_game(
-        mcts_engine=mcts_engine,
-        max_game_length=config.selfplay.max_game_length,
-        adjudicate_material=config.selfplay.adjudicate_material,
-        piece_values=config.selfplay.piece_values,
-        temp_threshold=config.selfplay.temperature_threshold,
-        temp_high=config.selfplay.temperature_high,
-        temp_low=config.selfplay.temperature_low,
-        on_move=on_move,
-        adjudicate_graded=getattr(config.selfplay,'adjudicate_graded',True),
-        adjudicate_scaling=getattr(config.selfplay,'adjudicate_scaling',9.0),
-        endgame_temperature=getattr(config.selfplay, 'endgame_temperature', None),
-        endgame_piece_gate=getattr(config.selfplay, 'endgame_piece_gate', 6),
-        endgame_num_simulations=getattr(config.selfplay, 'endgame_num_simulations', 0),
-        fen=getattr(config.selfplay, 'start_fen', None),
-        start_pieces=getattr(config.selfplay, 'start_pieces', None),
-        start_colors_random=getattr(config.selfplay, 'start_colors_random', False),
-    )
+    mcts_engine = _make_engine(config, network, noise=True,
+                               force_mate=True)
+    return _run_game(config, mcts_engine, config.selfplay.piece_values,
+                     on_move=on_move)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1215,40 +1223,8 @@ def _worker_loop_single(worker_id, task_queue, result_queue, config_dict, shutdo
     force_mate_enabled = (getattr(config.selfplay, 'force_mate', False)
                           and game_api.is_game('chess'))
 
-    mate_seeding = getattr(config.mcts, 'mate_seeding', False)
-    min_fresh_sims = getattr(config.mcts, 'min_fresh_sims', 64)
-    _plain_cls, _fm_cls = _engine_classes(config, force_mate_enabled)
-
     def mcts(net, noise, force_mate=False):
-        cls = _fm_cls if force_mate else _plain_cls
-        mcts_kwargs = {}
-        if force_mate:
-            mcts_kwargs = {
-                'max_force_plies': getattr(config.selfplay, 'force_mate_max_plies', 5),
-                'min_pieces_gate': getattr(config.selfplay, 'force_mate_gate_pieces', 8),
-                'deep_plies': getattr(config.selfplay, 'force_mate_deep_plies', 9),
-                'deep_gate_pieces': getattr(config.selfplay, 'force_mate_deep_gate_pieces', 4),
-            }
-        return cls(
-            network=net,
-            num_simulations=config.mcts.num_simulations,
-            c_puct=config.mcts.c_puct,
-            dirichlet_alpha=config.mcts.dirichlet_alpha if noise else 0.0,
-            dirichlet_epsilon=config.mcts.dirichlet_epsilon if noise else 0.0,
-            batch_size=getattr(config.mcts,'batch_size',1),
-            c_virtual_loss=getattr(config.mcts,'c_virtual_loss',0.5),
-            # ---- NEW: pass game‑length and adjudication parameters ----
-            max_game_length=config.selfplay.max_game_length,
-            adjudicate_material=config.selfplay.adjudicate_material,
-            piece_values=config.selfplay.piece_values,
-            adjudicate_graded=getattr(config.selfplay, 'adjudicate_graded', True),
-            adjudicate_scaling=getattr(config.selfplay, 'adjudicate_scaling', 9.0),
-            mate_seeding=mate_seeding,
-            min_fresh_sims=min_fresh_sims,
-            inference_pipeline=getattr(config.inference, 'client_concurrency', 1)
-                if getattr(config, 'inference', None) else 1,
-            **mcts_kwargs,
-        )
+        return _make_engine(config, net, noise=noise, force_mate=force_mate)
 
     while not shutdown_event.is_set():
         try: task = task_queue.get(timeout=2.0)
@@ -1277,21 +1253,7 @@ def _worker_loop_single(worker_id, task_queue, result_queue, config_dict, shutdo
                         'worker_id': worker_id, 'type': 'live_move',
                         'fen': fen, 'move': uci, 'move_number': mn, 'mcts_stats': ms,
                     })
-                gd, gi = play_one_game(
-                    eng, config.selfplay.max_game_length,
-                    config.selfplay.adjudicate_material, piece_values,
-                    config.selfplay.temperature_threshold,
-                    config.selfplay.temperature_high, config.selfplay.temperature_low,
-                    on_move=on_sp,
-                    adjudicate_graded=getattr(config.selfplay, 'adjudicate_graded', True),
-                    adjudicate_scaling=getattr(config.selfplay, 'adjudicate_scaling', 9.0),
-                    endgame_temperature=getattr(config.selfplay, 'endgame_temperature', None),
-                    endgame_piece_gate=getattr(config.selfplay, 'endgame_piece_gate', 6),
-                    endgame_num_simulations=getattr(config.selfplay, 'endgame_num_simulations', 0),
-                    fen=getattr(config.selfplay, 'start_fen', None),
-                    start_pieces=getattr(config.selfplay, 'start_pieces', None),
-                    start_colors_random=getattr(config.selfplay, 'start_colors_random', False),
-                )
+                gd, gi = _run_game(config, eng, piece_values, on_move=on_sp)
                 result_queue.put({
                     'worker_id': worker_id, 'type': 'live_end',
                     'result': gi['result_str'], 'termination': gi['termination'],
@@ -1450,39 +1412,9 @@ def _worker_loop_multi(worker_id, task_queue, result_queue, config_dict, shutdow
 
     force_mate_enabled = (getattr(config.selfplay, 'force_mate', False)
                           and game_api.is_game('chess'))
-    mate_seeding = getattr(config.mcts, 'mate_seeding', False)
-    min_fresh_sims = getattr(config.mcts, 'min_fresh_sims', 64)
-    _plain_cls, _fm_cls = _engine_classes(config, force_mate_enabled)
 
     def mcts(net, noise, force_mate=False):
-        cls = _fm_cls if force_mate else _plain_cls
-        mcts_kwargs = {}
-        if force_mate:
-            mcts_kwargs = {
-                'max_force_plies': getattr(config.selfplay, 'force_mate_max_plies', 5),
-                'min_pieces_gate': getattr(config.selfplay, 'force_mate_gate_pieces', 8),
-                'deep_plies': getattr(config.selfplay, 'force_mate_deep_plies', 9),
-                'deep_gate_pieces': getattr(config.selfplay, 'force_mate_deep_gate_pieces', 4),
-            }
-        return cls(
-            network=net,
-            num_simulations=config.mcts.num_simulations,
-            c_puct=config.mcts.c_puct,
-            dirichlet_alpha=config.mcts.dirichlet_alpha if noise else 0.0,
-            dirichlet_epsilon=config.mcts.dirichlet_epsilon if noise else 0.0,
-            batch_size=getattr(config.mcts, 'batch_size', 1),
-            c_virtual_loss=getattr(config.mcts, 'c_virtual_loss', 0.5),
-            max_game_length=config.selfplay.max_game_length,
-            adjudicate_material=config.selfplay.adjudicate_material,
-            piece_values=config.selfplay.piece_values,
-            adjudicate_graded=getattr(config.selfplay, 'adjudicate_graded', True),
-            adjudicate_scaling=getattr(config.selfplay, 'adjudicate_scaling', 9.0),
-            mate_seeding=mate_seeding,
-            min_fresh_sims=min_fresh_sims,
-            inference_pipeline=getattr(config.inference, 'client_concurrency', 1)
-                if getattr(config, 'inference', None) else 1,
-            **mcts_kwargs,
-        )
+        return _make_engine(config, net, noise=noise, force_mate=force_mate)
 
     def make_client(vid, rq, buf, nid=0):
         return InferenceClient(vid, request_queue, rq, network_id=nid,
@@ -1528,21 +1460,7 @@ def _worker_loop_multi(worker_id, task_queue, result_queue, config_dict, shutdow
                 'worker_id': worker_id, 'type': 'live_move', 'sub': g,
                 'fen': fen, 'move': uci, 'move_number': mn, 'mcts_stats': ms,
             })
-        gd, gi = play_one_game(
-            eng, config.selfplay.max_game_length,
-            config.selfplay.adjudicate_material, piece_values,
-            config.selfplay.temperature_threshold,
-            config.selfplay.temperature_high, config.selfplay.temperature_low,
-            on_move=on_sp,
-            adjudicate_graded=getattr(config.selfplay, 'adjudicate_graded', True),
-            adjudicate_scaling=getattr(config.selfplay, 'adjudicate_scaling', 9.0),
-            endgame_temperature=getattr(config.selfplay, 'endgame_temperature', None),
-            endgame_piece_gate=getattr(config.selfplay, 'endgame_piece_gate', 6),
-            endgame_num_simulations=getattr(config.selfplay, 'endgame_num_simulations', 0),
-            fen=getattr(config.selfplay, 'start_fen', None),
-            start_pieces=getattr(config.selfplay, 'start_pieces', None),
-            start_colors_random=getattr(config.selfplay, 'start_colors_random', False),
-        )
+        gd, gi = _run_game(config, eng, piece_values, on_move=on_sp)
         result_queue.put({
             'worker_id': worker_id, 'type': 'live_end', 'sub': g,
             'result': gi['result_str'], 'termination': gi['termination'],
@@ -1891,8 +1809,6 @@ class ParallelSelfPlay:
             for _ in range(G):
                 try: tq.put_nowait(task)
                 except queue.Full: break
-
-    def push_weights(self, network): self.push_selfplay(network)
 
     def push_weights_to_gpu(self, network):
         """Push updated weights to the GPU server without disturbing task queues.

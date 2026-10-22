@@ -184,6 +184,7 @@ class InferenceClient:
             # Write the single state (as a 1-element batch) to shared memory,
             # then send only metadata through the queue.
             self._claim_slot_budget()
+            self._inflight += 1
             states_batch = state[np.newaxis, ...]  # (1, 20, 8, 8)
             slot = self._acquire_slot()
             self._track_slot(req_id, slot)
@@ -269,12 +270,29 @@ class InferenceClient:
             For a batch: (policies, values) arrays.
             For a single predict: (policy_vector, scalar_value).
         """
-        return self._wait_response(req_id)
+        try:
+            return self._wait_response(req_id)
+        finally:
+            self._release_slot_budget()
 
     # ── Internal ────────────────────────────────────────────────────────
 
     def _next_id(self):
         return next(_REQ_COUNTER)
+
+    def _park(self, req_id: int, payload):
+        """Park an out-of-order (or sibling-client) response by request id."""
+        with _RESPONSE_CACHE_LOCK:
+            _RESPONSE_CACHE[req_id] = payload
+
+    @staticmethod
+    def _take_cached(req_id: int):
+        with _RESPONSE_CACHE_LOCK:
+            return _RESPONSE_CACHE.pop(req_id, None)
+
+    def _cleanup_pending(self, req_id: int):
+        self._slot_by_req.pop(req_id, None)
+        self._batch_req_ids.discard(req_id)
 
     def _wait_response(self, req_id):
         """Block until a response matching *req_id* arrives.
@@ -283,12 +301,49 @@ class InferenceClient:
         ``(req_id, batch_size, slot)`` and the actual policy/value data
         lives in the shared response buffers.  In queue mode the server
         sends ``(req_id, policy, value)`` directly.
+
+        Responses for *other* request ids (our own pipelining, or sibling
+        clients sharing this response queue) are parked in the global
+        ``_RESPONSE_CACHE`` so their owners can pick them up -- a client
+        must never swallow a response that belongs to someone else.
         """
-        # Check cache for any previously received out-of-order response
-        if req_id in self._response_cache:
-            return self._response_cache.pop(req_id)
         deadline = time.monotonic() + _RESPONSE_TIMEOUT_S
         while True:
+            cached = self._take_cached(req_id)
+            if cached is not None:
+                if isinstance(cached, tuple) and cached[:1] == ('__ERR__',):
+                    self._cleanup_pending(req_id)
+                    raise RuntimeError(
+                        f"GPU inference server error for request {req_id}: {cached[1]}"
+                    )
+                if isinstance(cached, tuple) and cached[:1] == ('__SHM__',):
+                    # Parked by a sibling client (it could not know this
+                    # client's shared-memory slot): perform our own SHM read
+                    # using the slot mapping we kept from the request.
+                    batch_size = cached[1]
+                    slot = self._slot_by_req.pop(req_id, 0)
+                    policies = SharedMemoryTransport.read_policies(
+                        self._shared_buffers, batch_size, slot
+                    )
+                    values = SharedMemoryTransport.read_values(
+                        self._shared_buffers, batch_size, slot
+                    )
+                    out = ((policies, values) if req_id in self._batch_req_ids
+                           else (policies[0], float(values[0])))
+                    self._batch_req_ids.discard(req_id)
+                    return out
+                if isinstance(cached, tuple) and cached[:1] == ('__Q__',):
+                    # Parked raw queue-style response (from a sibling
+                    # client): decide the return shape via OUR state.
+                    _, policies, values = cached
+                    self._slot_by_req.pop(req_id, None)
+                    if req_id in self._batch_req_ids:
+                        self._batch_req_ids.discard(req_id)
+                        return (policies, values)
+                    return (policies[0], float(values[0]))
+                self._batch_req_ids.discard(req_id)
+                self._slot_by_req.pop(req_id, None)
+                return cached
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 self._slot_by_req.pop(req_id, None)
@@ -305,57 +360,79 @@ class InferenceClient:
             except queue.Empty:
                 continue
             if resp is None:
-                # Server shutting down — return zeros
-                return np.zeros(game_api.num_actions(), dtype=np.float32), 0.0
-
-            # Error response from the server (e.g. a batch dropped because the
-            # forward pass raised).  Surface it instead of hanging forever.
-            if (isinstance(resp, tuple) and len(resp) == 3
-                    and isinstance(resp[0], str) and resp[0] == 'ERR'):
+                # Server shutting down: bookkeeping consistent with the other
+                # failure paths, then raise -- returning zeroes would inject
+                # meaningless policy/values (and draw labels) into a live
+                # game/search without anyone noticing.
                 self._slot_by_req.pop(req_id, None)
                 self._batch_req_ids.discard(req_id)
                 raise RuntimeError(
-                    f"GPU inference server error for request {resp[1]}: {resp[2]}"
+                    f"InferenceClient(worker={self.worker_id}, "
+                    f"net={self.network_id}): inference server shut down "
+                    f"while request {req_id} was pending."
                 )
+
+            # Error response from the server (e.g. a batch dropped because the
+            # forward pass raised).  The second element identifies the exact
+            # request; only raise/shutdown bookkeeping for OUR request, park
+            # errors for sibling/pipelined requests so they surface to their
+            # rightful owner.
+            if (isinstance(resp, tuple) and len(resp) == 3
+                    and isinstance(resp[0], str) and resp[0] == 'ERR'):
+                err_id = resp[1]
+                if err_id == req_id:
+                    self._slot_by_req.pop(req_id, None)
+                    self._batch_req_ids.discard(req_id)
+                    raise RuntimeError(
+                        f"GPU inference server error for request {req_id}: {resp[2]}"
+                    )
+                self._park(err_id, ('__ERR__', resp[2]))
+                continue
 
             if self._shared_buffers is not None and len(resp) == 2:
                 # ── Shared-memory response: (req_id, batch_size) ──
                 resp_id, batch_size = resp
-                slot = self._slot_by_req.get(resp_id, 0)
-                policies = SharedMemoryTransport.read_policies(
-                    self._shared_buffers, batch_size, slot
-                )
-                values = SharedMemoryTransport.read_values(
-                    self._shared_buffers, batch_size, slot
-                )
-                if resp_id == req_id:
-                    self._slot_by_req.pop(resp_id, None)
+                if resp_id in self._slot_by_req or resp_id == req_id:
+                    # Our own request (current or pipelined): we know the slot.
+                    slot = self._slot_by_req.pop(resp_id, 0)
+                    policies = SharedMemoryTransport.read_policies(
+                        self._shared_buffers, batch_size, slot
+                    )
+                    values = SharedMemoryTransport.read_values(
+                        self._shared_buffers, batch_size, slot
+                    )
                     if resp_id in self._batch_req_ids:
                         self._batch_req_ids.discard(resp_id)
-                        return policies, values
-                    return policies[0], float(values[0])
-                # Out-of-order — cache it and keep waiting.  Pop the slot
-                # mapping too, otherwise _slot_by_req grows without bound.
-                self._slot_by_req.pop(resp_id, None)
-                if resp_id in self._batch_req_ids:
-                    self._batch_req_ids.discard(resp_id)
-                    self._response_cache[resp_id] = (policies, values)
+                        out = (policies, values)
+                    else:
+                        out = (policies[0], float(values[0]))
+                    if resp_id == req_id:
+                        return out
+                    self._park(resp_id, out)
                 else:
-                    self._response_cache[resp_id] = (policies[0], float(values[0]))
+                    # Request from a sibling client sharing this response
+                    # queue: we cannot know its slot, so park a marker and
+                    # let the owner do its own shared-memory read.
+                    self._park(resp_id, ('__SHM__', batch_size))
             else:
                 # ── Queue response: (req_id, policies, values) ──
                 # The server always sends full arrays now; decide whether the
                 # caller wanted the arrays (predict_batch) or a single
                 # (policy_vector, scalar) pair (predict) via _batch_req_ids.
                 resp_id, policies, values = resp
-                if resp_id in self._batch_req_ids:
-                    self._batch_req_ids.discard(resp_id)
-                    out = (policies, values)
-                else:
-                    out = (policies[0], float(values[0]))
-                if resp_id == req_id:
+                if resp_id == req_id or resp_id in self._batch_req_ids:
+                    if resp_id in self._batch_req_ids:
+                        self._batch_req_ids.discard(resp_id)
+                        out = (policies, values)
+                    else:
+                        out = (policies[0], float(values[0]))
+                    if resp_id == req_id:
+                        self._slot_by_req.pop(resp_id, None)
+                        return out
+                    # Out-of-order response — park it for its owner
                     self._slot_by_req.pop(resp_id, None)
-                    return out
-                # Out-of-order response — cache it and keep waiting
-                self._slot_by_req.pop(resp_id, None)
-                self._response_cache[resp_id] = out
+                    self._park(resp_id, out)
+                else:
+                    # Sibling client's request: shapes are decided by its
+                    # state, not ours — park raw for the owner to interpret.
+                    self._park(resp_id, ('__Q__', policies, values))

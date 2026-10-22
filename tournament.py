@@ -18,6 +18,7 @@ Supported systems:
 
 import io
 import threading
+import time
 from pathlib import Path
 
 import torch
@@ -372,13 +373,18 @@ def _play_one_game(psp, white, black, live_game, game_id, label):
 
     if psp._use_gpu:
         # network_id 0 = white, network_id 1 = black on the GPU server.
+        # The workers never read per-task weights in GPU mode (the server
+        # already holds both networks), so don't ship ~2x model blobs per game.
         psp.push_eval_weights(white['weights'], black['weights'])
+        weights_a = weights_b = None
+    else:
+        weights_a, weights_b = white['weights'], black['weights']
 
     task = {
         'type': 'eval',
         'eval_type': 'gating',
-        'weights_a': white['weights'],
-        'weights_b': black['weights'],
+        'weights_a': weights_a,
+        'weights_b': weights_b,
         'a_is_white': True,
         'game_label': label,
     }
@@ -387,11 +393,16 @@ def _play_one_game(psp, white, black, live_game, game_id, label):
         return '*'
 
     result = '*'
+    # Chunked 5-minute wait: mp.Queue.get is not interruptible on Windows,
+    # so single long waits would delay Ctrl+C by minutes.
+    deadline = time.monotonic() + 300.0
     while True:
-        r = psp.collect_one(timeout=300.0)
+        r = psp.collect_one(timeout=min(10.0, max(0.0, deadline - time.monotonic())))
         if r is None:
-            print("[WARN] Tournament: no result in 5 min — skipping game")
-            break
+            if time.monotonic() >= deadline:
+                print("[WARN] Tournament: no result in 5 min — skipping game")
+                break
+            continue
         if r.get('done'):
             break
         rt = r.get('type')
