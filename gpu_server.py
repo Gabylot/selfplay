@@ -204,6 +204,13 @@ class GPUInferenceServer:
         # Re-resolve: shared_buffers arrive via pickle, dtype may differ from
         # what __init__ saw in the parent process.
         self._upload_dtype = self._resolve_upload_dtype()
+        if not torch.cuda.is_available():
+            # Exiting without setting ready_event makes the manager fail
+            # loudly instead of hanging forever (see ParallelSelfPlay).
+            print("[GPU-Server] ERROR: torch.cuda.is_available() is False. "
+                  "Install a CUDA/ROCm build of torch or set "
+                  "inference.use_gpu: false. GPU server will exit.")
+            return
         device = torch.device("cuda")
         t_start = time.perf_counter()
         print(f"[GPU-Server] ROCm device: {torch.cuda.get_device_name(0)}")

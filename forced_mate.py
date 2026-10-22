@@ -64,6 +64,14 @@ def forced_mate(board: chess.Board, plies: int) -> Optional[chess.Move]:
     legal reply leaves us in a forced mate in ``plies - 2``.
 
     Memoized on ``(board.fen(), plies)``.
+
+    Copies keep the full repetition history (``stack=True``) so
+    ``is_game_over()`` can detect threefold-repetition escapes: a
+    ``stack=False`` copy starts a fresh history and would let a shuffling
+    opponent turn a "forced" mate into a draw.  (Memoizing on FEN shares the
+    entry across differing histories, which makes the proof conservative --
+    it may miss a mate that one particular path allows, but never returns
+    one that a repetition escape refutes.)
     """
     if board.is_game_over() or plies <= 0:
         return None
@@ -73,7 +81,7 @@ def forced_mate(board: chess.Board, plies: int) -> Optional[chess.Move]:
         return memo[key]
     if plies == 1:
         for m in board.legal_moves:
-            nb = board.copy(stack=False)
+            nb = board.copy()
             nb.push(m)
             if nb.is_checkmate():
                 memo[key] = m
@@ -81,7 +89,7 @@ def forced_mate(board: chess.Board, plies: int) -> Optional[chess.Move]:
         memo[key] = None
         return None
     for m in board.legal_moves:
-        nb = board.copy(stack=False)
+        nb = board.copy()
         nb.push(m)
         if nb.is_checkmate():
             memo[key] = m
@@ -90,7 +98,7 @@ def forced_mate(board: chess.Board, plies: int) -> Optional[chess.Move]:
             continue                      # stalemate/draw after m -> not mate
         ok = True
         for r in nb.legal_moves:
-            rb = nb.copy(stack=False)
+            rb = nb.copy()
             rb.push(r)
             if rb.is_game_over():
                 ok = False

@@ -7,6 +7,8 @@ Small, CPU/GPU-friendly network with:
 - Random weight initialization (no pretraining)
 """
 
+import os
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -260,7 +262,11 @@ def save_checkpoint(model: AlphaZeroNet, optimizer, path: str,
     }
     if extra:
         checkpoint.update(extra)
-    torch.save(checkpoint, path)
+    # Atomic rename (save to a temp file first): a crash mid-write corrupts
+    # the temp file, never the checkpoint the trainer depends on to resume.
+    tmp_path = str(path) + '.tmp'
+    torch.save(checkpoint, tmp_path)
+    os.replace(tmp_path, path)
 
 
 def load_checkpoint(path: str, model: AlphaZeroNet = None,

@@ -296,21 +296,39 @@ def run_training(config, gui_enabled=False, num_workers=None):
     latest_ckpt = checkpoints_dir / "latest.pt"
     if latest_ckpt.exists():
         print(f"[INFO] Loading checkpoint: {latest_ckpt}")
-        ckpt = load_checkpoint(str(latest_ckpt), network, optimizer)
-        step             = ckpt.get('step', 0)
-        game_id          = ckpt.get('game_id', 0)
-        eval_game_counter= ckpt.get('eval_game_counter', 0)
-        if 'best_elo' in ckpt: evaluator.best_elo = ckpt['best_elo']
-        if 'ref_elo'  in ckpt: evaluator.ref_elo  = ckpt['ref_elo']
-        if 'ref_depth' in ckpt: ref_depth = max(ref_depth, int(ckpt['ref_depth']))
-        print(f"[INFO] Resumed step={step} game={game_id}")
+        try:
+            ckpt = load_checkpoint(str(latest_ckpt), network, optimizer)
+        except Exception as exc:
+            # A corrupt checkpoint (e.g. crash mid-write from an older
+            # non-atomic save) must not make the run unstartable: move it
+            # aside and resume from a fresh model.  The latest step_N.pt
+            # still exists for manual recovery.
+            corrupt = checkpoints_dir / "latest.pt.corrupt"
+            print(f"[WARN] Failed to load checkpoint ({exc!r}); moving it aside")
+            os.replace(str(latest_ckpt), str(corrupt))
+            ckpt = {}
+            step = game_id = eval_game_counter = 0
+            ref_streak = 0
+        else:
+            step             = ckpt.get('step', 0)
+            game_id          = ckpt.get('game_id', 0)
+            eval_game_counter= ckpt.get('eval_game_counter', 0)
+            if 'best_elo' in ckpt: evaluator.best_elo = ckpt['best_elo']
+            if 'ref_elo'  in ckpt: evaluator.ref_elo  = ckpt['ref_elo']
+            if 'ref_depth' in ckpt: ref_depth = max(ref_depth, int(ckpt['ref_depth']))
+            print(f"[INFO] Resumed step={step} game={game_id}")
 
     # Load best network from disk (if available) so it survives restarts.
     # If no best.pt exists, copy the latest checkpoint into best_network.
     best_pt_path = output_dir / "best.pt"
     if best_pt_path.exists():
         print(f"[INFO] Loading best network: {best_pt_path}")
-        load_checkpoint(str(best_pt_path), best_network)
+        try:
+            load_checkpoint(str(best_pt_path), best_network)
+        except Exception as exc:
+            print(f"[WARN] Failed to load best.pt ({exc!r}) -- rebuilding it "
+                  f"from the latest checkpoint")
+            best_network.load_state_dict(network.state_dict())
     else:
         best_network.load_state_dict(network.state_dict())
         print(f"[INFO] No best.pt found -- best_network initialised from latest checkpoint")
@@ -570,6 +588,9 @@ def run_training(config, gui_enabled=False, num_workers=None):
                     t_step_sum += ld.get('t_total', 0.0)
                     n_done += 1
                     step += 1
+                    if not ld.get('finite', True):
+                        print(f"[WARN] step {step}: non-finite loss/gradients -- "
+                              f"optimizer update skipped (weights kept)")
                     stats.log_training_step(step=step,
                                             policy_loss=ld['policy_loss'],
                                             value_loss=ld['value_loss'],
@@ -737,7 +758,15 @@ def run_training(config, gui_enabled=False, num_workers=None):
                         continue
 
                     if rt != 'eval':
-                        continue   # stray self-play result -- discard
+                        # In-flight self-play games from before the eval
+                        # started (or from workers that already finished
+                        # their drain) are valid training data -- throwing
+                        # them away loses entire completed games every eval
+                        # cycle.  Ingest them into the buffer like the main
+                        # loop does, then keep collecting eval results.
+                        if r.get('type') == 'selfplay':
+                            ingest_selfplay(r)
+                        continue
 
                     wid       = r['worker_id']
                     res       = r['result']

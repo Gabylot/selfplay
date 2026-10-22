@@ -879,11 +879,19 @@ def play_one_game(mcts_engine, max_game_length=150, adjudicate_material=True,
         if selected_move is None:
             selected_move = best_move
             if selected_move is None:
-                # This should never happen after fixing MCTS expansion (no claim_draw=True)
+                # This should never happen after fixing MCTS expansion (no claim_draw=True).
+                # Dump the full search state so a recurrence can be diagnosed:
+                # sims/budget tell us whether zero simulations ran (budget /
+                # inference desync) or expansion silently dropped the moves.
+                exp = getattr(root, 'is_expanded', 'n/a')
                 with open("mcts_empty_root.log", "a") as f:
                     f.write(f"Empty root at move {move_count}: {game_api.describe(board)}\n"
-                            f"Legal moves: {[game_api.move_str(m) for m in game_api.legal_moves(board)]}\n"
-                            f"Children after search: {len(root.children)}\n\n")
+                            f"Engine: {type(mcts_engine).__name__}\n"
+                            f"root.is_expanded: {exp}\n"
+                            f"Legal moves ({len(game_api.legal_moves(board))}): "
+                            f"{[game_api.move_str(m) for m in game_api.legal_moves(board)]}\n"
+                            f"Children after search: {len(root.children)}\n"
+                            f"Search stats: {stats}\n\n")
                 break
 
         st = game_api.encode(board)
@@ -1846,7 +1854,15 @@ class ParallelSelfPlay:
         self._gpu_server_process = mp.Process(target=server.run, daemon=True)
         self._gpu_server_process.start()
         print("[INFO] Waiting for GPU server to warm up shaders...")
-        self._gpu_ready.wait()
+        # Poll instead of an untimed wait(): if the GPU server process dies
+        # during startup (no CUDA, OOM, bad device name, malformed weights)
+        # we must surface an error instead of hanging forever.
+        while not self._gpu_ready.wait(timeout=5.0):
+            if self._gpu_server_process.exitcode not in (None,):
+                raise RuntimeError(
+                    "[ERROR] GPU server process exited during startup "
+                    f"(exitcode={self._gpu_server_process.exitcode}). "
+                    "Check the GPU-Server diagnostics printed above.")
         print("[INFO] GPU server ready")
 
     def _serialize_weights(self, network):

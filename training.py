@@ -167,7 +167,15 @@ def train_one_step(model: AlphaZeroNet, optimizer: torch.optim.Optimizer,
     else:
         grad_norm = torch.zeros((), device=device)
 
-    optimizer.step()
+    # NaN/Inf poison guard: a corrupt batch or a poisoned buffer can produce
+    # non-finite losses/gradients.  clip_grad_norm_ does NOT sanitize NaN
+    # norms (the clipped grads stay NaN), so optimizer.step() would corrupt
+    # every weight -- permanently NaN-ing the whole run.  Skip the update
+    # instead and let the caller decide how to react.
+    loss_finite = bool(torch.isfinite(total_loss.detach()))
+    grad_finite = bool(torch.isfinite(grad_norm.detach()))
+    if loss_finite and grad_finite:
+        optimizer.step()
 
     # One device sync for all four scalars (was four separate .item() calls).
     p_f, v_f, t_f, g_f = torch.stack([
@@ -180,6 +188,7 @@ def train_one_step(model: AlphaZeroNet, optimizer: torch.optim.Optimizer,
         'value_loss': v_f,
         'total_loss': t_f,
         'grad_norm': g_f,
+        'finite': loss_finite and grad_finite,
         't_sample': t_sample,
         't_total': time.perf_counter() - t_start,
     }

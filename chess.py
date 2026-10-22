@@ -5,15 +5,17 @@ This module is a compatibility shim: the existing codebase does
 ``chess.Piece`` API.  Everything here re-exports the fast Rust
 implementation (shakmaty-based) with the same names/conventions.
 
-The ``USE_FAST_BACKEND`` flag lets you fall back to the original
-python-chess package at runtime if something is missing.
+NOTE: there is no runtime python-chess fallback -- this module *shadows*
+the ``python-chess`` package (repo root precedes site-packages on
+sys.path), so ``import chess`` always resolves here.  If the ``fastchess``
+extension is missing, importing this module raises immediately with build
+instructions instead of crashing later with an unrelated NameError.
 """
 
 import importlib
 import numpy as np
 
-# The fast backend is the default
-_has_fast = True
+# The fast backend is the only backend
 try:
     from fastchess import (
         FastBoard as _FastBoard,
@@ -22,8 +24,12 @@ try:
     )
     import fastchess as _fc
 except Exception as _e:  # pragma: no cover
-    _has_fast = False
-    _reason = _e
+    raise ImportError(
+        "The 'fastchess' Rust extension is required by this project but "
+        "could not be imported.  Build it with maturin: "
+        "`pip install maturin && maturin develop --release` (from fastchess/).  "
+        f"Original import error: {_e!r}"
+    ) from _e
 
 # ── Constants (python-chess compatible) ────────────────────────────────────
 # python-chess: WHITE = True, BLACK = False
@@ -415,14 +421,12 @@ class Board:
 
 
 # ── Convenience re-exports ─────────────────────────────────────────────────
-if _has_fast:
-    # Add fastchess helper functions at module level
-    _square_rank = _fc.square_rank
-    _square_file = _fc.square_file
-    _square = _fc.square
+# Add fastchess helper functions at module level
+_square_rank = _fc.square_rank
+_square_file = _fc.square_file
+_square = _fc.square
 
-# ---- Fallback switch -------------------------------------------------------
-USE_FAST_BACKEND = _has_fast
+USE_FAST_BACKEND = True
 
 __all__ = [
     'Board', 'Move', 'Piece',
