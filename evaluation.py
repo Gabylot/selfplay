@@ -216,9 +216,12 @@ def play_match(network_a: AlphaZeroNet, network_b: AlphaZeroNet,
                                  game_type="gating",
                                  match_info=f"Gating Game {game_idx+1}/{num_games}")
         
-        result = _play_evaluation_game(mcts_a, mcts_b, a_is_white, 
+        result = _play_evaluation_game(mcts_a, mcts_b, a_is_white,
                                         max_moves=config.selfplay.max_game_length,
-                                        on_move=on_move)
+                                        on_move=on_move,
+                                        adjudicate_material=getattr(config.selfplay, 'adjudicate_material', True),
+                                        adjudicate_graded=getattr(config.selfplay, 'adjudicate_graded', True),
+                                        adjudicate_scaling=getattr(config.selfplay, 'adjudicate_scaling', 9.0))
         
         # Notify live game viewer that game is over
         if live_game is not None:
@@ -307,7 +310,10 @@ def play_match_vs_alpha_beta(network: AlphaZeroNet, config,
 
         _state, _move_count, result = play_engine_vs_reference(
             mcts, network_is_white, config.selfplay.max_game_length,
-            depth=ab_depth, on_move=on_move)
+            depth=ab_depth, on_move=on_move,
+            adjudicate_material=getattr(config.selfplay, 'adjudicate_material', True),
+            adjudicate_graded=getattr(config.selfplay, 'adjudicate_graded', True),
+            adjudicate_scaling=getattr(config.selfplay, 'adjudicate_scaling', 9.0))
         move_count = _move_count
 
         if result == "1-0":
@@ -365,10 +371,15 @@ def _build_mcts_stats(root, selected_move):
 
 
 def _play_evaluation_game(mcts_a: MCTS, mcts_b: MCTS, a_is_white: bool,
-                           max_moves: int = 150, on_move=None) -> str:
+                           max_moves: int = 150, on_move=None,
+                           adjudicate_material=True, adjudicate_graded=True,
+                           adjudicate_scaling=9.0) -> str:
     """Play a single evaluation game between two MCTS agents (any game)."""
     _state, _move_count, result = play_two_engine_match(
-        mcts_a, mcts_b, a_is_white, max_moves, on_move=on_move)
+        mcts_a, mcts_b, a_is_white, max_moves, on_move=on_move,
+        adjudicate_material=adjudicate_material,
+        adjudicate_graded=adjudicate_graded,
+        adjudicate_scaling=adjudicate_scaling)
     return result
 
 

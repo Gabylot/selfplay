@@ -384,7 +384,11 @@ class RustMCTS:
         """
         from collections import deque
         P = max(1, self.inference_pipeline)
-        inflight = deque()      # (req_id, leaves, tv, ex_idx, ex_nodes, ids)
+        # Gathered-resolution mode: request server-side packing of ONLY the
+        # legal priors (identical search semantics, ~100x smaller download).
+        gather_api = hasattr(self.network, 'predict_batch_gathered_async')
+        inflight = deque()      # (req_id, leaves, tv, ex_idx, ex_nodes, ids,
+                                #  targets or None)
         outstanding = 0         # leaves dispatched but not yet applied
         sims = 0
         total_depth = 0
@@ -402,27 +406,43 @@ class RustMCTS:
                     break
 
                 tv, ex_idx, ex_nodes = self._split_leaves(leaves)
+                targets = None
                 if ex_nodes:
                     states = np.stack(
                         [board_to_tensor(self.board_of(rs)) for rs in ex_nodes],
                         axis=0)
-                    req_id = self.network.predict_batch_async(states)
+                    if gather_api:
+                        targets = [self._legal_targets(rs) for rs in ex_nodes]
+                        legal_indices = [
+                            np.asarray(vi, dtype=np.int64)
+                            for _, vi in targets
+                        ]
+                        req_id = self.network.predict_batch_gathered_async(
+                            states, legal_indices)
+                    else:
+                        req_id = self.network.predict_batch_async(states)
                 else:
                     req_id = None
                 ids = {rs for rs, _d in leaves}
-                inflight.append((req_id, leaves, tv, ex_idx, ex_nodes, ids))
+                inflight.append(
+                    (req_id, leaves, tv, ex_idx, ex_nodes, ids, targets))
                 outstanding += len(leaves)
 
             if not inflight:
                 break
 
-            req_id, leaves, tv, ex_idx, ex_nodes, _ids = inflight.popleft()
+            req_id, leaves, tv, ex_idx, ex_nodes, _ids, targets \
+                = inflight.popleft()
             outstanding -= len(leaves)
 
             if req_id is not None:
                 policies, vals = self.network.wait_result(req_id)
-                values = self._apply_network_results(
-                    leaves, tv, ex_idx, ex_nodes, policies, vals)
+                if targets is not None:
+                    values = self._apply_network_results_gathered(
+                        leaves, tv, ex_idx, ex_nodes, policies, targets, vals)
+                else:
+                    values = self._apply_network_results(
+                        leaves, tv, ex_idx, ex_nodes, policies, vals)
             else:
                 values = [tv.get(i, 0.0) for i in range(len(leaves))]
 
@@ -458,14 +478,17 @@ class RustMCTS:
                                float(value))
         return float(value)
 
-    def _expand_with_data(self, rs_id, policy, value):
+    def _legal_targets(self, rs_id):
+        """(valid_moves, valid_idx) for a node's legal moves.
+
+        ``valid_idx`` are action indices in policy space; index-None moves
+        (not representable in the policy layout) are filtered out.  Shared
+        by the full-policy and gathered-response expansion paths.
+        """
         board = self.board_of(rs_id)
         raw = board.legal_moves_raw
         if not raw:
-            self._lib.mcts_rs_expand_batch(
-                rs_id, None, None, 0, None)
-            return 0.0
-
+            return [], []
         rust_idxs = (board._b.legal_move_policy_indices()
                      if hasattr(board._b, 'legal_move_policy_indices') else None)
 
@@ -484,6 +507,10 @@ class RustMCTS:
                     valid_idx.append(move_to_policy_index(m, board))
                 except ValueError:
                     continue
+        return valid_moves, valid_idx
+
+    def _expand_with_data(self, rs_id, policy, value):
+        valid_moves, valid_idx = self._legal_targets(rs_id)
 
         if not valid_idx:
             self._lib.mcts_rs_expand_batch(rs_id, None, None, 0, None)
@@ -496,6 +523,44 @@ class RustMCTS:
             priors = np.ascontiguousarray(legal / s, dtype=np.float32)
         else:
             priors = np.full(len(valid_idx), 1.0 / len(valid_idx), dtype=np.float32)
+        out = np.empty(len(valid_idx), dtype=np.int32)
+
+        self._lib.mcts_rs_expand_batch(
+            rs_id,
+            idx_arr.ctypes.data_as(ctypes.POINTER(ctypes.c_int)),
+            priors.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+            len(valid_idx),
+            out.ctypes.data_as(ctypes.POINTER(ctypes.c_int)))
+
+        for k, rid in enumerate(out.tolist()):
+            self._moves[rid] = valid_moves[k]
+        return 0.0
+
+    def _expand_with_priors(self, rs_id, valid_moves, valid_idx, priors,
+                            value):
+        """Expand a node from PRE-GATHERED legal priors (gathered response).
+
+        ``priors`` must align with ``valid_idx`` (the server packs them in
+        the request's legal-index order).  Renormalization/collapse rules
+        mirror ``_expand_with_data``.
+        """
+        if not valid_idx:
+            self._lib.mcts_rs_expand_batch(rs_id, None, None, 0, None)
+            return 0.0
+
+        priors = np.asarray(priors, dtype=np.float32)
+        if len(priors) != len(valid_idx):
+            raise RuntimeError(
+                f"gathered response width {len(priors)} != legal count "
+                f"{len(valid_idx)} for node {rs_id}"
+            )
+        s = float(priors.sum())
+        if s > 0:
+            priors = np.ascontiguousarray(priors / s, dtype=np.float32)
+        else:
+            priors = np.full(len(valid_idx), 1.0 / len(valid_idx),
+                             dtype=np.float32)
+        idx_arr = np.asarray(valid_idx, dtype=np.int32)
         out = np.empty(len(valid_idx), dtype=np.int32)
 
         self._lib.mcts_rs_expand_batch(
@@ -534,6 +599,21 @@ class RustMCTS:
         policies = np.asarray(policies, dtype=np.float32)
         for k, rs in enumerate(ex_rs):
             self._expand_with_data(rs, policies[k], float(vals[k]))
+            tv[ex_idx[k]] = float(vals[k])
+        return [tv.get(i, 0.0) for i in range(len(leaves))]
+
+    def _apply_network_results_gathered(self, leaves, tv, ex_idx, ex_nodes,
+                                        gathered, targets, vals):
+        """Expand leaves from gathered priors; return values in leaf order.
+
+        ``gathered`` is the list of per-sample prior arrays returned by the
+        gathered API; ``targets`` is the (valid_moves, valid_idx) pair each
+        sample was submitted with.
+        """
+        for k, rs in enumerate(ex_nodes):
+            valid_moves, valid_idx = targets[k]
+            self._expand_with_priors(rs, valid_moves, valid_idx,
+                                     gathered[k], float(vals[k]))
             tv[ex_idx[k]] = float(vals[k])
         return [tv.get(i, 0.0) for i in range(len(leaves))]
 

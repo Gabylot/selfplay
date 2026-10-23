@@ -131,6 +131,11 @@ class InferenceClient:
         # and SharedMemoryTransport sizes num_slots == client_concurrency,
         # so this only trips if that invariant is ever broken.
         self._inflight = 0
+        # req_id -> {'indices': [...per-sample legal index arrays...],
+        #            'shm_gather': bool} for gathered requests.  The server
+        # packs priors for shm_gather requests; otherwise the response
+        # carries full rows and this client gathers them on receive.
+        self._gather_by_req = {}
 
     def _acquire_slot(self) -> int:
         """Return the slot to use for the next in-flight request."""
@@ -260,6 +265,129 @@ class InferenceClient:
             )
         return req_id
 
+    def predict_batch_gathered_async(self, states: np.ndarray,
+                                     legal_indices) -> int:
+        """Send a gathered-resolution batch prediction without blocking.
+
+        Like ``predict_batch_async``, but the request also carries the per
+        sample legal-move policy indices.  The GPU server then responds with
+        ONLY the priors at those indices (packed f16) instead of the full
+        4672-wide policy vector -- roughly a 100x smaller download.
+
+        ``wait_result()`` on the returned id ALWAYS yields
+        ``(priors_list, values)`` -- ``priors_list[k]`` is a numpy array
+        aligned with ``legal_indices[k]`` -- regardless of which transport
+        path handled the request (the client gathers full rows itself when
+        the server did not).
+
+        Args:
+            states: (batch, planes, h, w) numpy array
+            legal_indices: list of per-sample int arrays (each may be empty)
+
+        Returns:
+            request_id (int) — pass to ``wait_result()``.
+        """
+        n = len(states)
+        req_id = self._next_id()
+        self._batch_req_ids.add(req_id)
+
+        # Per-request gather metadata: indices for client-side gathering +
+        # whether the server did the gathering (shared-memory path only).
+        self._gather_by_req[req_id] = {
+            'indices': list(legal_indices),
+            'shm_gather': False,
+        }
+
+        if self._shared_buffers is not None:
+            self._claim_slot_budget()
+            self._inflight += 1
+            slot = self._acquire_slot()
+            self._track_slot(req_id, slot)
+            SharedMemoryTransport.write_states(
+                self._shared_buffers, states, slot
+            )
+            gm = getattr(self._shared_buffers, 'gather_moves', 0)
+            acceptable = (gm > 0
+                          and all(len(idx) <= gm for idx in legal_indices))
+            if acceptable:
+                SharedMemoryTransport.write_gather_indices(
+                    self._shared_buffers, legal_indices, slot
+                )
+                self._gather_by_req[req_id]['shm_gather'] = True
+                self.request_queue.put(
+                    (self.worker_id, req_id, self.network_id, n, slot, 1)
+                )
+                return req_id
+            # Oversized or legacy buffers: ship as a normal full-policy SHM
+            # request; this client gathers the response rows itself.
+            self.request_queue.put(
+                (self.worker_id, req_id, self.network_id, n, slot)
+            )
+            return req_id
+
+        # ── Queue (pickle) fallback: send states, gather client-side ──
+        self.request_queue.put(
+            (self.worker_id, req_id, self.network_id, states)
+        )
+        return req_id
+
+    def _gather_rows_from_full(self, policies, values, indices):
+        """Gather per-sample legal priors from full policy rows (client side).
+
+        Used when the response carries complete 4672-wide rows (queue mode
+        or an oversized SHM request the server handled as full policy).
+        """
+        dtype = (self._shared_buffers.policy_dtype
+                 if self._shared_buffers is not None else np.float16)
+        priors_list = []
+        for k, idx in enumerate(indices):
+            if len(idx):
+                priors_list.append(
+                    np.asarray(policies[k], dtype=dtype)[
+                        np.asarray(idx, dtype=np.int64)].copy())
+            else:
+                priors_list.append(np.zeros(0, dtype=dtype))
+        return (priors_list, values)
+
+    def _gather_response(self, resp_id, batch_size, slot):
+        """Interpret a shared-memory response for a gathered request.
+
+        Returns ``(priors_list, values)`` aligned to the per-sample index
+        lists stored in ``self._gather_by_req[resp_id]``.  Pops the metadata.
+        """
+        meta = self._gather_by_req.pop(resp_id, None)
+        indices = meta['indices'] if meta is not None else None
+        values = SharedMemoryTransport.read_values(
+            self._shared_buffers, batch_size, slot
+        )
+        if meta is None or indices is None:
+            # Unknown metadata (should not happen): return raw rows.
+            policies = SharedMemoryTransport.read_policies(
+                self._shared_buffers, batch_size, slot
+            )
+            return (policies, values)
+        if meta.get('shm_gather'):
+            # Server packs priors via SUBSET-softmax over the legal-index
+            # columns (exp(l_j) proportional).  Renormalize over each
+            # sample's count to recover the same priors a full softmax +
+            # renormalize-over-legal would produce.  Unused tail columns
+            # (exp(0)=1 padding) are sliced away by the per-sample counts.
+            priors = SharedMemoryTransport.read_gathered_priors(
+                self._shared_buffers, [len(x) for x in indices], slot
+            )
+            renormed = []
+            for p in priors:
+                p32 = p.astype(np.float32)
+                s = float(p32.sum())
+                renormed.append(
+                    p32 / s if s > 0.0 else p32)
+            return (renormed, values)
+        # Full rows were written to SHM; gather the legal priors here.
+        policies = SharedMemoryTransport.read_policies(
+            self._shared_buffers, batch_size, slot
+        )
+        return self._gather_rows_from_full(policies, values, indices)
+
     def wait_result(self, req_id: int):
         """Block until the response for *req_id* arrives and return it.
 
@@ -293,6 +421,7 @@ class InferenceClient:
     def _cleanup_pending(self, req_id: int):
         self._slot_by_req.pop(req_id, None)
         self._batch_req_ids.discard(req_id)
+        self._gather_by_req.pop(req_id, None)
 
     def _wait_response(self, req_id):
         """Block until a response matching *req_id* arrives.
@@ -310,18 +439,29 @@ class InferenceClient:
         deadline = time.monotonic() + _RESPONSE_TIMEOUT_S
         while True:
             cached = self._take_cached(req_id)
-            if cached is not None:
-                if isinstance(cached, tuple) and cached[:1] == ('__ERR__',):
+            if cached is None:
+                pass
+            elif isinstance(cached, tuple) and len(cached) > 0 \
+                    and isinstance(cached[0], str):
+                # Marker tuples start with a str tag; raw data tuples parked
+                # by a sibling client start with arrays.  Guarding on the
+                # cached[0] type avoids numpy elementwise comparison crashes
+                # for plain data tuples.
+                if cached[0] == '__ERR__':
                     self._cleanup_pending(req_id)
                     raise RuntimeError(
                         f"GPU inference server error for request {req_id}: {cached[1]}"
                     )
-                if isinstance(cached, tuple) and cached[:1] == ('__SHM__',):
+                if cached[0] == '__SHM__':
                     # Parked by a sibling client (it could not know this
                     # client's shared-memory slot): perform our own SHM read
                     # using the slot mapping we kept from the request.
                     batch_size = cached[1]
                     slot = self._slot_by_req.pop(req_id, 0)
+                    if req_id in self._gather_by_req:
+                        out = self._gather_response(req_id, batch_size, slot)
+                        self._batch_req_ids.discard(req_id)
+                        return out
                     policies = SharedMemoryTransport.read_policies(
                         self._shared_buffers, batch_size, slot
                     )
@@ -332,15 +472,35 @@ class InferenceClient:
                            else (policies[0], float(values[0])))
                     self._batch_req_ids.discard(req_id)
                     return out
-                if isinstance(cached, tuple) and cached[:1] == ('__Q__',):
+                if cached[0] == '__Q__':
                     # Parked raw queue-style response (from a sibling
                     # client): decide the return shape via OUR state.
                     _, policies, values = cached
                     self._slot_by_req.pop(req_id, None)
+                    meta = self._gather_by_req.pop(req_id, None)
+                    if meta is not None:
+                        # Gathered request served through the queue path.
+                        if req_id not in self._batch_req_ids:
+                            raise RuntimeError(
+                                f"InferenceClient(worker={self.worker_id}, "
+                                f"net={self.network_id}): gathered request "
+                                f"{req_id} did not go through the batch API"
+                            )
+                        self._batch_req_ids.discard(req_id)
+                        return self._gather_rows_from_full(
+                            policies, values, meta['indices']
+                        )
                     if req_id in self._batch_req_ids:
                         self._batch_req_ids.discard(req_id)
                         return (policies, values)
                     return (policies[0], float(values[0]))
+                raise RuntimeError(
+                    f"InferenceClient(worker={self.worker_id}, "
+                    f"net={self.network_id}): unknown marker {cached!r}"
+                )
+            else:
+                # Plain (possibly out-of-order, sibling-parked) data response
+                # such as (policies, values) or (policy, value).
                 self._batch_req_ids.discard(req_id)
                 self._slot_by_req.pop(req_id, None)
                 return cached
@@ -348,6 +508,7 @@ class InferenceClient:
             if remaining <= 0:
                 self._slot_by_req.pop(req_id, None)
                 self._batch_req_ids.discard(req_id)
+                self._gather_by_req.pop(req_id, None)
                 raise TimeoutError(
                     f"InferenceClient(worker={self.worker_id}, "
                     f"net={self.network_id}) timed out after "
@@ -366,6 +527,7 @@ class InferenceClient:
                 # game/search without anyone noticing.
                 self._slot_by_req.pop(req_id, None)
                 self._batch_req_ids.discard(req_id)
+                self._gather_by_req.pop(req_id, None)
                 raise RuntimeError(
                     f"InferenceClient(worker={self.worker_id}, "
                     f"net={self.network_id}): inference server shut down "
@@ -383,6 +545,7 @@ class InferenceClient:
                 if err_id == req_id:
                     self._slot_by_req.pop(req_id, None)
                     self._batch_req_ids.discard(req_id)
+                    self._gather_by_req.pop(req_id, None)
                     raise RuntimeError(
                         f"GPU inference server error for request {req_id}: {resp[2]}"
                     )
@@ -395,6 +558,15 @@ class InferenceClient:
                 if resp_id in self._slot_by_req or resp_id == req_id:
                     # Our own request (current or pipelined): we know the slot.
                     slot = self._slot_by_req.pop(resp_id, 0)
+                    meta = self._gather_by_req.get(resp_id)
+                    if meta is not None:
+                        # ── Gathered (or gather-fallback) response ──
+                        out = self._gather_response(resp_id, batch_size, slot)
+                        self._batch_req_ids.discard(resp_id)
+                        if resp_id == req_id:
+                            return out
+                        self._park(resp_id, out)
+                        continue
                     policies = SharedMemoryTransport.read_policies(
                         self._shared_buffers, batch_size, slot
                     )
@@ -420,8 +592,16 @@ class InferenceClient:
                 # caller wanted the arrays (predict_batch) or a single
                 # (policy_vector, scalar) pair (predict) via _batch_req_ids.
                 resp_id, policies, values = resp
+                meta = self._gather_by_req.pop(resp_id, None)
                 if resp_id == req_id or resp_id in self._batch_req_ids:
-                    if resp_id in self._batch_req_ids:
+                    if meta is not None:
+                        # Gathered request served through the queue path:
+                        # response carries full rows; gather client-side.
+                        self._batch_req_ids.discard(resp_id)
+                        out = self._gather_rows_from_full(
+                            policies, values, meta['indices']
+                        )
+                    elif resp_id in self._batch_req_ids:
                         self._batch_req_ids.discard(resp_id)
                         out = (policies, values)
                     else:

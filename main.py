@@ -1054,6 +1054,12 @@ def _print_benchmark_report(timers, total_wall, games, total_moves, total_sims,
         print(f"  Samples processed: {gpu_stats.get('samples_processed', 0)}    "
               f"Avg batch size: "
               f"{gpu_stats.get('samples_processed', 0) / max(1, gpu_stats.get('aggregated_batches', 0)):.1f}")
+        _ng = gpu_stats.get('gathered_samples', 0)
+        _nf = gpu_stats.get('full_samples', 0)
+        _ns = _ng + _nf
+        print(f"  Gathered responses: {_ng} ({100.0 * _ng / max(1, _ns):.1f}%)    "
+              f"Full: {_nf}    "
+              f"Gathered passes: {gpu_stats.get('gathered_passes', 0)}")
         print(f"  Aggregation wait time: {gpu_stats.get('aggregation_wait_time', 0):.3f}s")
         npt = max(1, gpu_stats.get('n_passes_timed', 0))
         print(f"  Per-pass avg (n={gpu_stats.get('n_passes_timed', 0)}): "

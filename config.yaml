@@ -106,9 +106,9 @@ training:
 # --- Evaluation ---
 evaluation:
   eval_interval: 5000         # Run eval every N self-play games
-  gate_games: 50              # Games for network-vs-network gating
+  gate_games: 100              # Games for network-vs-network gating
   gate_win_threshold: 0.55    # Win rate needed to promote
-  ref_opponent_games: 50      # Games vs alpha-beta reference
+  ref_opponent_games: 100      # Games vs alpha-beta reference
   elo_k_factor: 32            # Elo K-factor
   # Adaptive alpha-beta reference depth: after a reference eval scoring
   # (wins + 0.5*draws) >= ref_depth_threshold for ref_depth_streak evals in a row,

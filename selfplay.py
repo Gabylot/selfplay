@@ -1026,11 +1026,28 @@ def self_play_game(network, config, on_move=None):
 # Worker process
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _game_result_str(state, move_count, max_game_length):
-    """Display result string for an eval match ('*' if the game lives on)."""
+def _game_result_str(state, move_count, max_game_length,
+                     adjudicate_material=True, adjudicate_graded=True,
+                     adjudicate_scaling=9.0):
+    """Display result string for an eval match ('*' if the game lives on).
+
+    A telestopped game is adjudicated by the game adapter using the config's
+    material-adjudication flags -- non-terminal eval games hitting
+    ``max_game_length`` previously always counted as draws ('*') regardless of
+    ``selfplay.adjudicate_material``.
+    """
     if game_api.is_terminal(state):
         return game_api.final_result(
-            state, move_count, max_game_length)['result_str']
+            state, move_count, max_game_length,
+            adjudicate_material=adjudicate_material,
+            adjudicate_graded=adjudicate_graded,
+            adjudicate_scaling=adjudicate_scaling)['result_str']
+    if move_count >= max_game_length:
+        return game_api.final_result(
+            state, move_count, max_game_length,
+            adjudicate_material=adjudicate_material,
+            adjudicate_graded=adjudicate_graded,
+            adjudicate_scaling=adjudicate_scaling)['result_str']
     return '*'
 
 
@@ -1059,7 +1076,9 @@ def _mcts_child_stats(engine, root, mv, topn=8, search_stats=None):
 
 
 def play_two_engine_match(engine_a, engine_b, a_is_first, max_game_length,
-                          temperature=0.1, on_move=None):
+                          temperature=0.1, on_move=None,
+                          adjudicate_material=True, adjudicate_graded=True,
+                          adjudicate_scaling=9.0):
     """Play one game between two MCTS engines of the active game.
 
     Returns ``(state, move_count, result_str)``.  Each engine keeps its own
@@ -1096,11 +1115,17 @@ def play_two_engine_match(engine_a, engine_b, a_is_first, max_game_length,
         else:
             root_b = engine.recycle_tree(r, mv)
             root_a = None
-    return state, move_count, _game_result_str(state, move_count, max_game_length)
+    return state, move_count, _game_result_str(
+        state, move_count, max_game_length,
+        adjudicate_material=adjudicate_material,
+        adjudicate_graded=adjudicate_graded,
+        adjudicate_scaling=adjudicate_scaling)
 
 
 def play_engine_vs_reference(engine, that_first, max_game_length,
-                             temperature=0.1, depth=2, on_move=None):
+                             temperature=0.1, depth=2, on_move=None,
+                             adjudicate_material=True, adjudicate_graded=True,
+                             adjudicate_scaling=9.0):
     """Play one game between an MCTS engine and the game's reference player.
 
     Returns ``(state, move_count, result_str)``.
@@ -1133,7 +1158,11 @@ def play_engine_vs_reference(engine, that_first, max_game_length,
             if on_move:
                 on_move(game_api.describe(state), game_api.move_str(mv), move_count, None)
             root_net = None
-    return state, move_count, _game_result_str(state, move_count, max_game_length)
+    return state, move_count, _game_result_str(
+        state, move_count, max_game_length,
+        adjudicate_material=adjudicate_material,
+        adjudicate_graded=adjudicate_graded,
+        adjudicate_scaling=adjudicate_scaling)
 
 def _set_game_from_config_dict(config_dict):
     """Make worker processes adopt the config's active game name."""
@@ -1303,7 +1332,10 @@ def _worker_loop_single(worker_id, task_queue, result_queue, config_dict, shutdo
 
                     _state, _mc, game_result = play_two_engine_match(
                         ea, eb, a_is_white, config.selfplay.max_game_length,
-                        on_move=on_ev_live)
+                        on_move=on_ev_live,
+                        adjudicate_material=getattr(config.selfplay, 'adjudicate_material', True),
+                        adjudicate_graded=getattr(config.selfplay, 'adjudicate_graded', True),
+                        adjudicate_scaling=getattr(config.selfplay, 'adjudicate_scaling', 9.0))
 
                 else:  # reference
                     # ── GPU path: network A via the GPU server (network_id=0) ──
@@ -1317,7 +1349,10 @@ def _worker_loop_single(worker_id, task_queue, result_queue, config_dict, shutdo
 
                     _state, _mc, game_result = play_engine_vs_reference(
                         ea, a_is_white, config.selfplay.max_game_length,
-                        depth=task.get('ref_depth', config.alpha_beta.depth), on_move=on_ev_live)
+                        depth=task.get('ref_depth', config.alpha_beta.depth), on_move=on_ev_live,
+                        adjudicate_material=getattr(config.selfplay, 'adjudicate_material', True),
+                        adjudicate_graded=getattr(config.selfplay, 'adjudicate_graded', True),
+                        adjudicate_scaling=getattr(config.selfplay, 'adjudicate_scaling', 9.0))
 
                 result_queue.put({
                     'worker_id': worker_id, 'type': 'live_end',
@@ -1531,7 +1566,10 @@ def _worker_loop_multi(worker_id, task_queue, result_queue, config_dict, shutdow
 
             _state, _mc, game_result = play_two_engine_match(
                 ea, eb, a_is_white, config.selfplay.max_game_length,
-                on_move=on_ev_live)
+                on_move=on_ev_live,
+                adjudicate_material=getattr(config.selfplay, 'adjudicate_material', True),
+                adjudicate_graded=getattr(config.selfplay, 'adjudicate_graded', True),
+                adjudicate_scaling=getattr(config.selfplay, 'adjudicate_scaling', 9.0))
 
         else:  # reference
             if eval_client_a is not None:
@@ -1542,7 +1580,10 @@ def _worker_loop_multi(worker_id, task_queue, result_queue, config_dict, shutdow
 
             _state, _mc, game_result = play_engine_vs_reference(
                 ea, a_is_white, config.selfplay.max_game_length,
-                depth=task.get('ref_depth', config.alpha_beta.depth), on_move=on_ev_live)
+                depth=task.get('ref_depth', config.alpha_beta.depth), on_move=on_ev_live,
+                adjudicate_material=getattr(config.selfplay, 'adjudicate_material', True),
+                adjudicate_graded=getattr(config.selfplay, 'adjudicate_graded', True),
+                adjudicate_scaling=getattr(config.selfplay, 'adjudicate_scaling', 9.0))
 
         result_queue.put({
             'worker_id': worker_id, 'type': 'live_end',

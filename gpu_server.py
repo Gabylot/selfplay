@@ -189,6 +189,9 @@ class GPUInferenceServer:
             'total_requests': 0,
             'aggregated_batches': 0,  # = number of forward passes
             'samples_processed': 0,
+            'gathered_passes': 0,     # passes containing gathered items
+            'gathered_samples': 0,    # samples answered with packed priors
+            'full_samples': 0,        # samples answered with full policy
             'aggregation_wait_time': 0.0,  # time spent collecting requests
             'aggregation_cycles': 0,       # number of _handle_request calls
             'server_total': 0.0,
@@ -430,22 +433,31 @@ class GPUInferenceServer:
             slot, states (ndarray or None), buf (WorkerSharedBuffers or None)
 
         Request protocol (shared-memory mode):
-            (worker_id, request_id, network_id, batch_size[, slot])
+            (worker_id, request_id, network_id, batch_size[, slot][, gather])
         The optional 5th element is the shared-buffer slot index used for
         client-side pipelining (multiple in-flight requests per worker).
         4-tuples default to slot 0 (single-request-in-flight behaviour).
+        The optional 6th element is the gathered-response flag: the request
+        carries per-sample legal-move indices in the shared buffer and the
+        server responds with ONLY the priors at those indices (packed)
+        instead of the full policy vector.
 
         For shared-memory requests, states are NOT read here -- they are
         read later in ``_process_aggregated`` when ready to process.
         This is safe because each in-flight request owns its slot and a
         worker only reuses a slot after the server has responded.
         """
-        if len(req) >= 5:
+        if len(req) >= 6:
+            worker_id, request_id, network_id, fourth, slot, gather = req
+        elif len(req) == 5:
             worker_id, request_id, network_id, fourth, slot = req
+            gather = False
         else:
             worker_id, request_id, network_id, fourth = req
             slot = 0
+            gather = False
         is_shm = isinstance(fourth, int)
+        gather = bool(gather)
 
         if is_shm:
             batch_size = fourth
@@ -459,6 +471,7 @@ class GPUInferenceServer:
                 'is_shm': True,
                 'batch_size': batch_size,
                 'slot': slot,
+                'gather': gather,
                 'states': None,
                 'buf': buf,
             }
@@ -475,6 +488,7 @@ class GPUInferenceServer:
                 'is_shm': False,
                 'batch_size': batch_size,
                 'slot': slot,
+                'gather': False,
                 'states': states,
                 'buf': None,
             }
@@ -626,6 +640,10 @@ class GPUInferenceServer:
         Runs on the forward-worker thread in pipelined mode, or inline on
         the host thread otherwise.  The model lock serializes this against
         ``load_state_dict`` calls from the host thread.
+
+        Split download: gather requests get ONLY the priors at their
+        per-sample legal-move indices; full requests get the complete
+        policy vector.  Both share one forward pass.
         """
         # ── Forward pass ──
         t0 = time.perf_counter()
@@ -660,30 +678,113 @@ class GPUInferenceServer:
             states_t = states_t.float()
         t_h2d = time.perf_counter()
 
+        # ── Classify rows by download kind ──
+        # Gather items contribute their absolute-padded-row indices plus a
+        # per-row legal-index table; full items contribute their rows.
+        gather_moves = 0
+        for item in group:
+            if item.get('gather') and item['is_shm']:
+                gather_moves = item['buf'].gather_moves
+                break
+        gather_row_off = 0   # cursor into the gather subset (rows + tables)
+        gather_rows = []     # absolute padded rows of gather samples
+        gather_tables = []   # (bs, gather_moves) uint16 index tables
+        full_rows = []       # absolute padded rows of full samples
+        offset = 0
+        for item in group:
+            bs = item['batch_size']
+            if item.get('gather') and item['is_shm']:
+                t_shm = time.perf_counter()
+                idx_np, _cnt_np = SharedMemoryTransport.read_gather_requests(
+                    item['buf'], bs, item['slot']
+                )
+                self.stats['shm_read_time'] += \
+                    time.perf_counter() - t_shm
+                gather_rows.extend(range(offset, offset + bs))
+                gather_tables.append(idx_np)
+                gather_row_off += bs
+            else:
+                full_rows.extend(range(offset, offset + bs))
+            offset += bs
+        self._n_gathered_rows = gather_row_off
+
+        if gather_rows:
+            gather_rows_np = np.fromiter(gather_rows, dtype=np.int64,
+                                         count=len(gather_rows))
+            gather_idx_np = np.concatenate(
+                [t.astype(np.int64) for t in gather_tables], axis=0
+            ) if gather_row_off > 0 else np.zeros((0, gather_moves), np.int64)
+
         lock = self._model_lock if self._model_lock is not None else contextlib.nullcontext()
         with lock:
             with torch.inference_mode():
                 policy_logits, values = net(states_t)
+                t_fwd = time.perf_counter()
+
+        # ── Downloads (outside the model lock) ──
+        # Gathered items get a SUBSET-softmax: softmax over only the packed
+        # legal-index columns.  The tree consumer renormalizes priors over
+        # the legal set, so softmax-over-legal ≡ full-softmax-then-gather
+        # (identical ratios; unused tail columns carry exp(0)=1 mass that
+        # the client's per-sample renormalization divides out).  This cuts
+        # the D2H download ~16x vs the full policy vector.  Full items keep
+        # the full-row softmax.  (Packing host-side from a full-row
+        # download kept the drain-dominated D2H cost intact -- no gain;
+        # GPU packing measured worse on ROCm when it needed index_select +
+        # a second big intermediate.)
+        if gather_row_off:
+            with torch.inference_mode():
+                idx_t = torch.from_numpy(np.concatenate(
+                    [t.astype(np.int64) for t in gather_tables],
+                    axis=0)).to(device)
+                logits_g = policy_logits[:n].gather(1, idx_t)
+                packed = F.softmax(logits_g, dim=1)
+                if self.policy_f16:
+                    packed = packed.half()
+                packed_np = packed.cpu().numpy()
+                values = values.squeeze(-1)[:n].cpu().numpy()
+            pol_full = None
+            if full_rows:
+                # Rare mixed pass: full items still need complete rows.
+                with torch.inference_mode():
+                    pol = F.softmax(policy_logits[:n], dim=1)
+                    if self.policy_f16:
+                        pol = pol.half()
+                    pol_full = pol.cpu().numpy()
+                # Same-quantization packing from the downloaded rows keeps
+                # the gathered values consistent in mixed passes.
+                gather_rows_np = np.fromiter(
+                    gather_rows, dtype=np.intp, count=len(gather_rows))
+                packed_np = np.take_along_axis(
+                    pol_full[gather_rows_np],
+                    np.concatenate([t.astype(np.intp)
+                                    for t in gather_tables], axis=0),
+                    axis=1)
+        else:
+            with torch.inference_mode():
                 pol = F.softmax(policy_logits[:n], dim=1)
                 if self.policy_f16:
                     pol = pol.half()
-                t_fwd = time.perf_counter()
-        # Download OUTSIDE the model lock: the sync may wait ~10ms for the
-        # GPU to drain; holding the lock here would serialize weight reloads
-        # and (with 2 forward threads) stall the sibling's launches.
-        policies = pol.cpu().numpy()
-        values = values.squeeze(-1)[:n].cpu().numpy()
+                pol_full = pol.cpu().numpy()
+                packed_np = None
+                values = values.squeeze(-1)[:n].cpu().numpy()
         t_d2h = time.perf_counter()
         self.stats['gpu_forward_time'] += time.perf_counter() - t0
         self.stats['samples_processed'] += n
         self.stats['aggregated_batches'] += 1
+        n_gathered = getattr(self, '_n_gathered_rows', 0)
+        if n_gathered:
+            self.stats['gathered_passes'] += 1
+            self.stats['gathered_samples'] += n_gathered
+        if len(full_rows):
+            self.stats['full_samples'] += len(full_rows)
         # Sub-phase timing (diagnostics): H2D copy / network / D2H copy
         self.stats['t_h2d'] = self.stats.get('t_h2d', 0.0) + (t_h2d - t0)
         self.stats['t_fwd'] = self.stats.get('t_fwd', 0.0) + (t_fwd - t_h2d)
         self.stats['t_d2h'] = self.stats.get('t_d2h', 0.0) + (t_d2h - t_fwd)
         self.stats['n_passes_timed'] = self.stats.get('n_passes_timed', 0) + 1
 
-        self._distribute(group, policies, values)
+        self._distribute(group, pol_full, packed_np, values)
 
     def _put_response(self, worker_id: int, payload) -> None:
         """Deliver a response to a worker's queue without silent drops.
@@ -722,17 +823,50 @@ class GPUInferenceServer:
                   f"{worker_id}; DROPPED response {req_id} after 2s retry -- "
                   f"that client will hang unless it recovers")
 
-    def _distribute(self, group, policies, values):
-        """Split a group's mega-batch results back to the individual workers."""
-        offset = 0
+    def _distribute(self, group, full_policies, packed_priors, values):
+        """Split a group's mega-batch results back to the individual workers.
+
+        ``full_policies`` holds the complete policy vector rows for full
+        (non-gather) items, in the same order those items appear in
+        ``group``.  ``packed_priors`` (when not None) holds the gathered
+        priors rows ``(total_gather_samples, gather_moves)`` for gather
+        items, likewise in group order.  ``values`` is indexed by pass
+        position for all items.
+        """
+        gather_off = 0
+        pass_off = 0
         for item in group:
             bs = item['batch_size']
-            item_policies = policies[offset:offset + bs]
-            item_values = values[offset:offset + bs]
-            offset += bs
+            item_abs = pass_off  # absolute row span of this item in the pass
+            pass_off += bs
+            item_values = values[item_abs:item_abs + bs]
 
             worker_id = item['worker_id']
             request_id = item['request_id']
+
+            if item.get('gather') and item['is_shm'] and packed_priors is not None:
+                item_priors = packed_priors[gather_off:gather_off + bs]
+                gather_off += bs
+                # ── Shared-memory gathered response path ──
+                if (item['is_shm'] and self.shared_buffers is not None
+                        and worker_id in self.shared_buffers):
+                    buf = self.shared_buffers[worker_id]
+                    t0 = time.perf_counter()
+                    SharedMemoryTransport.write_priors_values(
+                        buf, item_priors, item_values, item['slot']
+                    )
+                    self.stats['shm_write_time'] += time.perf_counter() - t0
+                    self._put_response(worker_id, (request_id, bs))
+                    continue
+                # Gather item on the fallback (queue) path: send whatever we
+                # have; only reached if buffers were dropped mid-run.
+                self._put_response(worker_id,
+                                   (request_id, item_priors, item_values))
+                continue
+
+            # Full rows live at the item's ABSOLUTE pass position (pol_full
+            # is the whole unpadded pass), so slice by the absolute offset.
+            item_policies = full_policies[item_abs:item_abs + bs]
 
             # ── Shared-memory response path ──
             if (item['is_shm'] and self.shared_buffers is not None
@@ -756,9 +890,15 @@ class GPUInferenceServer:
             self._put_response(worker_id,
                                (request_id, item_policies, item_values))
 
-        # Safety assertion: offset must equal total samples in this group
-        assert offset == sum(it['batch_size'] for it in group), \
-            f"Offset tracking error: offset={offset} != total={sum(it['batch_size'] for it in group)}"
+        # Safety assertion: all rows must be consumed exactly once
+        assert pass_off == sum(it['batch_size'] for it in group), \
+            (f"Pass-row tracking error: pass_off={pass_off} != "
+             f"total={sum(it['batch_size'] for it in group)}")
+        if packed_priors is not None:
+            gather_total = sum(it['batch_size'] for it in group
+                               if (it.get('gather') and it['is_shm']))
+            assert gather_off == gather_total, \
+                f"Gather-row tracking error: {gather_off} != {gather_total}"
 
     def _forward_worker(self, device):
         """Forward-worker thread: pulls groups and runs GPU + distribute.

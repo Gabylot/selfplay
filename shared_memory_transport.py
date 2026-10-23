@@ -77,10 +77,18 @@ class WorkerSharedBuffers:
     response_values : mp.Array
         Flat shared array backing the response value vector
         ``(max_batch,)`` float32.
+    request_indices : mp.Array
+        Gathered-response request side: legal-move policy indices per
+        sample ``(max_batch, gather_moves)`` uint16 (0 when fewer legal
+        moves than ``gather_moves``).
+    request_counts : mp.Array
+        Number of valid indices per sample ``(max_batch,)`` uint16.
     max_batch : int
         Maximum batch size the buffers can hold.
     state_dtype : np.dtype
         Numpy dtype used for states and policies.
+    gather_moves : int
+        Width of the packed-legal-priors layout (min(256, num_actions)).
     """
 
     def __init__(self, max_batch: int, state_dtype=np.float16, num_slots: int = 1,
@@ -92,10 +100,17 @@ class WorkerSharedBuffers:
         slot_stride = max_batch
         self.num_planes = game_api.num_planes()
         self.num_actions = game_api.num_actions()
+        # Width of the gathered-priors layout.  Chess positions have at most
+        # 218 legal moves; 256 gives headroom and stays far below the full
+        # action space (4672), so the gather response occupies only the first
+        # ``gather_moves`` columns of the existing policy region.
+        self.gather_moves = min(256, self.num_actions)
 
         state_elems = max_batch * self.num_planes * game_api.board_h() * game_api.board_w() * self.num_slots
         policy_elems = max_batch * self.num_actions * self.num_slots
         value_elems = max_batch * self.num_slots
+        index_elems = max_batch * self.gather_moves * self.num_slots
+        count_elems = max_batch * self.num_slots
 
         # mp.Array typecode: 'f' = float32, 'd' = float64, 'h' = float16
         # States can be float16 (binary board planes -- no precision loss).
@@ -122,11 +137,14 @@ class WorkerSharedBuffers:
         self.request_states = mp.Array(state_tc, state_elems, lock=False)
         self.response_policies = mp.Array(policy_tc, policy_elems, lock=False)
         self.response_values = mp.Array('f', value_elems, lock=False)
+        self.request_indices = mp.Array('H', index_elems, lock=False)
+        self.request_counts = mp.Array('H', count_elems, lock=False)
 
     def close(self):
         """Release the underlying shared-memory segments for this worker."""
         for arr in (self.request_states, self.response_policies,
-                    self.response_values):
+                    self.response_values, self.request_indices,
+                    self.request_counts):
             try:
                 if hasattr(arr, 'close'):
                     arr.close()
@@ -168,6 +186,42 @@ policy buffer, shaped ``(batch_size, num_actions)``.
             batch_size, self.num_actions
         )
         
+
+    def request_indices_np(self, batch_size: int, slot: int = 0) -> np.ndarray:
+        """Numpy view of *slot*'s request legal-index table
+        (``(batch_size, gather_moves)`` uint16)."""
+        off = self._slot_off(slot, self.gather_moves)
+        flat = np.frombuffer(
+            _get_raw_array(self.request_indices), dtype=np.uint16,
+        )
+        return flat[off:off + batch_size * self.gather_moves].reshape(
+            batch_size, self.gather_moves
+        )
+
+    def request_counts_np(self, batch_size: int, slot: int = 0) -> np.ndarray:
+        """Numpy view of *slot*'s request per-sample index counts
+        (``(batch_size,)`` uint16)."""
+        off = self._slot_off(slot, 1)
+        flat = np.frombuffer(
+            _get_raw_array(self.request_counts), dtype=np.uint16,
+        )
+        return flat[off:off + batch_size]
+
+    def response_priors_np(self, batch_size: int, slot: int = 0) -> np.ndarray:
+        """Numpy view of *slot*'s gathered-priors region: the first
+        ``gather_moves`` columns of the policy region, shaped
+        ``(batch_size, gather_moves)``.
+
+        Dtype matches ``policy_dtype`` (float16 or float32) -- identical
+        quantization to the full-policy download.
+        """
+        start = self._slot_off(slot, self.num_actions)
+        flat = np.frombuffer(
+            _get_raw_array(self.response_policies), dtype=self.policy_dtype,
+        )
+        return flat[start:start + batch_size * self.gather_moves].reshape(
+            batch_size, self.gather_moves
+        )
 
     def response_values_np(self, batch_size: int, slot: int = 0) -> np.ndarray:
         """Return a numpy view of the first *batch_size* elements of *slot*'s
@@ -298,3 +352,81 @@ class SharedMemoryTransport:
                     slot: int = 0) -> np.ndarray:
         """Read values from the response shared buffer for *slot* as float32."""
         return buf.response_values_np(batch_size, slot).copy()
+
+    # ── Gathered-policy (legal priors only) protocol ─────────────────────
+
+    @staticmethod
+    def write_gather_indices(buf: WorkerSharedBuffers,
+                             legal_indices, slot: int = 0):
+        """Write per-sample legal-move policy indices for a gather request.
+
+        ``legal_indices`` is a list of per-sample integer arrays (variable
+        length).  Each sample's count is written to the counts region and
+        its indices zero-padded to ``gather_moves`` columns.
+
+        Raises ValueError if any sample exceeds ``gather_moves`` indices.
+        """
+        gm = buf.gather_moves
+        n = len(legal_indices)
+        if n > buf.max_batch:
+            raise ValueError(
+                f"Gather request batch {n} exceeds buffer capacity {buf.max_batch}"
+            )
+        idx_view = buf.request_indices_np(n, slot)
+        cnt_view = buf.request_counts_np(n, slot)
+        for k, idx in enumerate(legal_indices):
+            c = len(idx)
+            if c > gm:
+                raise ValueError(
+                    f"Sample {k} has {c} legal moves > gather width {gm}; "
+                    f"caller must split or fall back to the full-policy path"
+                )
+            if c:
+                idx_view[k, :c] = idx
+                if c < gm:
+                    idx_view[k, c:] = 0
+            cnt_view[k] = c
+
+    @staticmethod
+    def read_gather_requests(buf: WorkerSharedBuffers, batch_size: int,
+                             slot: int = 0):
+        """Server side: read a request's legal-index table and per-sample
+        counts.  Returns ``(indices uint16 (bs, gather_moves), counts (bs,))``
+        -- zero-copy views, server consumes them before responding."""
+        return (buf.request_indices_np(batch_size, slot).copy(),
+                buf.request_counts_np(batch_size, slot).copy())
+
+    @staticmethod
+    def write_priors_values(buf: WorkerSharedBuffers,
+                            priors: np.ndarray, values: np.ndarray,
+                            slot: int = 0):
+        """Write gathered priors ``(batch, gather_moves)`` and values into
+        the response buffers for *slot*.  ``priors`` must already be at the
+        response dtype (the server produces it on-device)."""
+        n = len(priors)
+        if n > buf.max_batch:
+            raise ValueError(
+                f"Batch size {n} exceeds shared buffer capacity {buf.max_batch}"
+            )
+        pri_view = buf.response_priors_np(n, slot)
+        np.copyto(pri_view, priors)
+        val_view = buf.response_values_np(n, slot)
+        np.copyto(val_view, values)
+
+    @staticmethod
+    def read_gathered_priors(buf: WorkerSharedBuffers, counts, slot: int = 0):
+        """Client side: unpack per-sample prior arrays (variable length).
+
+        ``counts`` is the per-sample count list/array used for the request.
+        Returns a list of ``policy_dtype`` float arrays, one per sample.
+        """
+        gm = buf.gather_moves
+        flat = buf.response_priors_np(len(counts), slot)
+        out = []
+        for k, c in enumerate(counts):
+            c = int(c)
+            if c:
+                out.append(flat[k, :c].copy())
+            else:
+                out.append(np.zeros(0, dtype=buf.policy_dtype))
+        return out
