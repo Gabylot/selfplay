@@ -90,7 +90,8 @@ def main():
 
     # --- 3. Test MCTS ---
     print("\n--- 3. Testing MCTS ---")
-    mcts = MCTS(network, num_simulations=10, c_puct=1.5)
+    mcts = MCTS(network, num_simulations=10, c_puct=1.5,
+                force_mate_in_one=getattr(config.mcts, 'force_mate_in_one', False))
     root = mcts.get_root(board)
     visit_policy, best_move, stats = mcts.search(root)
     assert best_move is not None, "MCTS returned no move"

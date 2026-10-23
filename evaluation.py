@@ -197,6 +197,7 @@ def play_match(network_a: AlphaZeroNet, network_b: AlphaZeroNet,
             c_virtual_loss=getattr(config.mcts, 'c_virtual_loss', 0.5),
             mate_seeding=getattr(config.mcts, 'mate_seeding', False),
             min_fresh_sims=getattr(config.mcts, 'min_fresh_sims', 64),
+            force_mate_in_one=getattr(config.mcts, 'force_mate_in_one', False),
         )
         mcts_b = MCTS(
             network=network_b,

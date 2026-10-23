@@ -496,12 +496,16 @@ def run_training(config, gui_enabled=False, num_workers=None):
                     avg_mcts_depth=gi['avg_mcts_depth'],
                     num_positions=gi['num_positions'],
                     material_diff=gi.get('material_diff', 0))
+        # Per-game mean of actually-run simulations (forced mate-in-one
+        # moves ran no search and are excluded from the list upstream).
+        avg_sims_per_move = (float(np.mean(gi['fresh_sims']))
+                             if gi.get('fresh_sims') else 0.0)
         stats.log_mcts_stats(game_id=game_id, step=step,
                              avg_tree_depth=gi['avg_mcts_depth'],
-                             avg_sims_per_move=config.mcts.num_simulations)
+                             avg_sims_per_move=avg_sims_per_move)
         tb.log_mcts_stats(game_id=game_id, step=step,
                           avg_tree_depth=gi['avg_mcts_depth'],
-                          avg_sims_per_move=config.mcts.num_simulations)
+                          avg_sims_per_move=avg_sims_per_move)
 
         # Rolling chess-quality metrics (cheap per-game record; the heavier
         # computation runs only every ~100 games).
@@ -1296,7 +1300,8 @@ def run_sanity_check(config):
     m = game_api.mask(state); print(f"Mask sum: {m.sum():.0f}")
     me = MCTS(net, num_simulations=10, c_puct=1.5,
               mate_seeding=getattr(lc.mcts, 'mate_seeding', False),
-              min_fresh_sims=getattr(lc.mcts, 'min_fresh_sims', 64))
+              min_fresh_sims=getattr(lc.mcts, 'min_fresh_sims', 64),
+              force_mate_in_one=getattr(lc.mcts, 'force_mate_in_one', False))
     root = me.get_root(state)
     vp,bm,st = me.search(root)
     print(f"MCTS best: {game_api.move_str(bm)}  depth: {st['avg_depth']:.2f}")

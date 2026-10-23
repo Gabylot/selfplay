@@ -23,8 +23,9 @@ mcts:
   dirichlet_epsilon: 0.3     # Weight of noise vs root prior
   batch_size: 8               # Batch size for tree-parallel MCTS (1 = sequential, no virtual loss)
   c_virtual_loss: 0.5         # Virtual loss penalty for batch MCTS
-  mate_seeding: true          # Give each mating root move one terminal pre-visit before search
-  min_fresh_sims: 64          # Minimum new simulations after tree reuse (0 = old max(0, budget-root.N))
+  mate_seeding: false          # Give each mating root move one terminal pre-visit before search
+  min_fresh_sims: 0          # Minimum new simulations after tree reuse (0 = old max(0, budget-root.N))
+  force_mate_in_one: true     # Play an immediate checkmate one-hot at the root at any temperature
 
 # --- Self-Play ---
 selfplay:
@@ -76,6 +77,10 @@ selfplay:
   force_mate: false
   force_mate_max_plies: 5
   force_mate_gate_pieces: 8
+  # Length-discounted checkmate value: in a game ending in checkmate, the
+  # target of a position `d` plies before the mating move is
+  # outcome * plies-to-move * mate_value_discount ** d (1.0 = flat ±1).
+  mate_value_discount: 0.995
   # Deeper proof search for very sparse positions (<= 4 pieces), where the
   # search tree is small enough to stay cheap.  Converts longer endgames
   # (e.g. KR vs K mate-in-4/5) that the shallow 5-ply limit misses.

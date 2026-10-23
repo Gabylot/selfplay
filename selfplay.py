@@ -110,6 +110,7 @@ def _make_engine(config, net, noise=True, force_mate=False):
         adjudicate_scaling=getattr(config.selfplay, 'adjudicate_scaling', 9.0),
         mate_seeding=getattr(config.mcts, 'mate_seeding', False),
         min_fresh_sims=getattr(config.mcts, 'min_fresh_sims', 64),
+        force_mate_in_one=getattr(config.mcts, 'force_mate_in_one', False),
         inference_pipeline=getattr(config.inference, 'client_concurrency', 1)
             if getattr(config, 'inference', None) else 1,
         **mcts_kwargs,
@@ -139,6 +140,7 @@ def _run_game(config, mcts_engine, piece_values, on_move=None,
         fen=getattr(config.selfplay, 'start_fen', None),
         start_pieces=getattr(config.selfplay, 'start_pieces', None),
         start_colors_random=getattr(config.selfplay, 'start_colors_random', False),
+        mate_value_discount=getattr(config.selfplay, 'mate_value_discount', 0.995),
     )
 
 
@@ -873,7 +875,7 @@ def play_one_game(mcts_engine, max_game_length=150, adjudicate_material=True,
                   adjudicate_graded=True, adjudicate_scaling=9.0,
                   endgame_temperature=None, endgame_piece_gate=6,
                   endgame_num_simulations=0, fen=None, start_pieces=None,
-                  start_colors_random=False):
+                  start_colors_random=False, mate_value_discount=0.995):
     if piece_values is None:
         piece_values = {'P': 1, 'N': 3, 'B': 3, 'R': 5, 'Q': 9}
 
@@ -894,6 +896,7 @@ def play_one_game(mcts_engine, max_game_length=150, adjudicate_material=True,
     fresh_sims_per_move = []
     inherited_root_n_per_move = []
     floor_fired_per_move = []
+    forced_moves_count = 0
     move_count = 0
     termination = "unknown"
     outcome = 0.0
@@ -958,10 +961,21 @@ def play_one_game(mcts_engine, max_game_length=150, adjudicate_material=True,
                             cp, np.asarray(legal_mask).astype(np.uint8)))
         mcts_stats_list.append(stats)
 
-        effort = _search_effort_fields(stats)
-        fresh_sims_per_move.append(effort.get('fresh_sims', 0))
-        inherited_root_n_per_move.append(effort.get('inherited_root_n', 0))
-        floor_fired_per_move.append(effort.get('floor_fired', False))
+        # A forced root mate played without running a search: exclude the
+        # move from the per-move effort statistics entirely.
+        is_forced = bool(stats.get('forced_mate'))
+        if is_forced:
+            forced_moves_count += 1
+            effort = {}
+        else:
+            effort = _search_effort_fields(stats)
+
+        if 'fresh_sims' in effort:
+            fresh_sims_per_move.append(effort['fresh_sims'])
+        if 'inherited_root_n' in effort:
+            inherited_root_n_per_move.append(effort['inherited_root_n'])
+        if 'floor_fired' in effort:
+            floor_fired_per_move.append(bool(effort['floor_fired']))
 
         mcts_move_data = {
             'selected_move': game_api.move_str(selected_move),
@@ -972,6 +986,9 @@ def play_one_game(mcts_engine, max_game_length=150, adjudicate_material=True,
             'sims':           int(stats.get('num_simulations')
                                   or sum(c['N'] for c in move_candidates)),
         }
+        if is_forced:
+            # GUI flag for the snapshot panel; visit/effort data is empty.
+            mcts_move_data['forced'] = True
         mcts_move_data.update(effort)
         game_api.apply(board, selected_move)
         move_count += 1
@@ -994,8 +1011,24 @@ def play_one_game(mcts_engine, max_game_length=150, adjudicate_material=True,
     termination = _res['termination']
     result_str = _res['result_str']
 
-    game_data = [(s, p, outcome * pl, m) for s, p, pl, m in game_states]
-    avg_depth = float(np.mean([s.get('avg_depth', 0) for s in mcts_stats_list])) if mcts_stats_list else 0.0
+    # Length-discounted checkmate value: a mate seen `d` plies before it is
+    # delivered scores outcome * pl * gamma ** d instead of exactly +/-1, so
+    # faster mates train stronger.  Only games ending in a real checkmate are
+    # discounted; draws / cap lengths / adjudicated games are unchanged.
+    if termination == "checkmate" and mate_value_discount < 1.0:
+        n_states = len(game_states)
+        game_data = []
+        for i, (s, p, pl, m) in enumerate(game_states):
+            d = n_states - i  # 1 for the mating move's own position
+            game_data.append(
+                (s, p, outcome * pl * (mate_value_discount ** d), m))
+    else:
+        game_data = [(s, p, outcome * pl, m) for s, p, pl, m in game_states]
+    # Forced mate-in-one moves ran no search: exclude them from the
+    # avg-depth / sims-per-move statistics.
+    searched_stats = [s for s in mcts_stats_list if not s.get('forced_mate')]
+    avg_depth = (float(np.mean([s.get('avg_depth', 0) for s in searched_stats]))
+                 if searched_stats else 0.0)
 
     return game_data, {
         'result': outcome,
@@ -1008,6 +1041,8 @@ def play_one_game(mcts_engine, max_game_length=150, adjudicate_material=True,
         'fresh_sims': fresh_sims_per_move,
         'inherited_root_n': inherited_root_n_per_move,
         'floor_fired': floor_fired_per_move,
+        'forced_moves': forced_moves_count,
+        'searched_moves': len(searched_stats),
     }
 
 
@@ -1072,6 +1107,9 @@ def _mcts_child_stats(engine, root, mv, topn=8, search_stats=None):
                        for c in engine.get_root_child_stats(root)[:topn]],
     }
     out.update(_search_effort_fields(search_stats))
+    if search_stats and search_stats.get('forced_mate'):
+        # Forced root mate: no visit data to show; flag the move instead.
+        out['forced'] = True
     return out
 
 

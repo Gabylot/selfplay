@@ -50,7 +50,8 @@ class _RNode:
     a Python handle; the arena owns everything else.
     """
 
-    __slots__ = ('rs_id', '_eng_ref', '_children', 'mate_seeded')
+    __slots__ = ('rs_id', '_eng_ref', '_children', 'mate_seeded',
+                 'mate_searched', 'forced_mate')
 
     def __init__(self, eng, rs_id):
         # Weak back-reference: the engine owns its _RNodes, so a strong ref
@@ -60,6 +61,8 @@ class _RNode:
         self.rs_id = rs_id
         self._children = None
         self.mate_seeded = False
+        self.mate_searched = False
+        self.forced_mate = None  # (action_idx, move) when the root offers mate-in-1
 
     @property
     def _eng(self):
@@ -93,6 +96,7 @@ class RustMCTS:
                  adjudicate_material=True, piece_values=None,
                  adjudicate_graded=True, adjudicate_scaling=9.0,
                  mate_seeding=False, min_fresh_sims=64,
+                 force_mate_in_one=False,
                  inference_pipeline=1, dll_path=None, **kwargs):
         self.network = network
         self.num_simulations = int(num_simulations)
@@ -109,6 +113,7 @@ class RustMCTS:
         self.c_virtual_loss = c_virtual_loss
         self.mate_seeding = mate_seeding
         self.min_fresh_sims = max(0, int(min_fresh_sims))
+        self.force_mate_in_one = bool(force_mate_in_one)
         self.inference_pipeline = max(1, int(inference_pipeline))
         self.profile = False
 
@@ -301,6 +306,8 @@ class RustMCTS:
         # intact (board_of walks parents).
         self.board_of(child.rs_id)
         child.mate_seeded = False
+        child.mate_searched = False
+        child.forced_mate = None
         return child
 
     def _child_for_move(self, root, move):
@@ -323,6 +330,16 @@ class RustMCTS:
     def search(self, root):
         """Run MCTS from root. Returns (visit_policy, best_move, stats)."""
         self._use()
+
+        # Immediate-mate override: detect before expansion so a decided root
+        # never touches the network and runs zero simulations.
+        if self.force_mate_in_one and game_api.is_game("chess") \
+                and self._find_forced_mate(root):
+            visit_policy = np.zeros(game_api.num_actions(), dtype=np.float32)
+            visit_policy[root.forced_mate[0]] = 1.0
+            return visit_policy, root.forced_mate[1], \
+                self._forced_mate_stats(root)
+
         if not root.is_expanded:
             self._expand_node(root.rs_id)
 
@@ -672,9 +689,72 @@ class RustMCTS:
             self._tvalue[child.rs_id] = -1.0
             self._lib.mcts_rs_backprop(child.rs_id, -1.0)
 
+    def _find_forced_mate(self, root):
+        """Detect an immediate checkmate at the root and cache the move.
+
+        Mirrors ``mcts.MCTS._find_forced_mate``: runs once per root, scans
+        every legal root move, and picks the first mating move in canonical
+        policy-index order -- no dependence on visit counts.  On a fresh
+        (unexpanded) root the probe boards are built directly from the root
+        position, so neither arena expansion nor a network call happens.
+
+        Returns True when a mating move was found (cached in
+        ``root.forced_mate``), False otherwise.
+        """
+        if root.mate_searched:
+            return root.forced_mate is not None
+        root.mate_searched = True
+
+        if not root.is_expanded:
+            board = self.board_of(root.rs_id)
+            best = None
+            for move in game_api.legal_moves(board):
+                probe = board.copy()
+                game_api.apply(probe, move)
+                if not probe.is_checkmate():
+                    continue
+                idx = move_to_policy_index(move, board)
+                if idx is None:
+                    continue
+                if best is None or idx < best[0]:
+                    best = (int(idx), move)
+            if best is not None:
+                root.forced_mate = best
+            return best is not None
+
+        # Child-keyed scan for already-expanded / reused roots.
+        for action_idx, child in sorted(root.children.items()):
+            if self.board_of(child.rs_id).is_checkmate():
+                root.forced_mate = (int(action_idx), self._moves.get(child.rs_id))
+                return True
+        return False
+
+    def _forced_mate_stats(self, root):
+        """Stats dict for a short-circuited forced-mate move (mirrors MCTS)."""
+        inherited_root_n = int(self._N(root.rs_id))
+        return {
+            'avg_depth': 0.0,
+            'max_depth': 0,
+            'num_simulations': 0,
+            'inherited_root_n': inherited_root_n,
+            'budget_new_sims': max(0, self.num_simulations - inherited_root_n),
+            'target_new_sims': 0,
+            'min_fresh_sims': self.min_fresh_sims,
+            'reused_root': bool(inherited_root_n > 0),
+            'floor_fired': False,
+            'forced_mate': True,
+        }
+
     def _get_visit_policy(self, root):
         children = root.children
         visit_policy = np.zeros(game_api.num_actions(), dtype=np.float32)
+
+        # Immediate mate found at the root: one-hot policy, forced move.
+        forced = getattr(root, 'forced_mate', None)
+        if forced is not None:
+            visit_policy[forced[0]] = 1.0
+            return visit_policy, forced[1]
+
         if not children:
             return visit_policy, None
 
@@ -702,6 +782,14 @@ class RustMCTS:
         """
         self._use()
         visit_policy = np.zeros(game_api.num_actions(), dtype=np.float32)
+
+        # Immediate mate found at the root: one-hot policy, forced move,
+        # independent of temperature.
+        forced = getattr(root, 'forced_mate', None)
+        if forced is not None:
+            visit_policy[forced[0]] = 1.0
+            return visit_policy, forced[1]
+
         children = root.children
         if not children:
             return visit_policy, None

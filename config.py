@@ -42,6 +42,10 @@ def load_config(path: Optional[str] = None) -> dict:
             "c_virtual_loss": 0.5,
             "mate_seeding": False,
             "min_fresh_sims": 64,
+            # One-hot override that plays an immediate checkmate at the root
+            # (draw regardless of visit competition). Mirrors mate_seeding but
+            # takes over move selection.
+            "force_mate_in_one": False,
             # Use the Rust MCTS backend (rust_mcts.RustMCTS) for self-play.
             # Same move-selection targets as the Python engine at ~2x speed;
             # set false to force the pure-Python mcts.MCTS path.
@@ -92,6 +96,11 @@ def load_config(path: Optional[str] = None) -> dict:
             # (e.g. KR vs K mate-in-4/5) that the shallow limit misses.
             "force_mate_deep_plies": 9,
             "force_mate_deep_gate_pieces": 4,
+            # Length-discounted checkmate value: in a game that ends in
+            # checkmate, the target value of a position `d` plies before the
+            # mating move is outcome * plies-to-move * gamma ** d (gamma=1.0
+            # reproduces the flat +/-1 targets).
+            "mate_value_discount": 0.995,
         },
         "buffer": {
             "max_size": 150000,

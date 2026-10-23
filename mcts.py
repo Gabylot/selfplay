@@ -46,7 +46,8 @@ class MCTSNode:
                  'N', 'W', 'Q', 'P', 'P_orig', 'is_expanded',
                  'legal_moves_cached', 'visit_count', 'virtual_loss',
                  '_game_over_cached', '_terminal_value_cached',
-                 '_mate_seeded', '_position_hash', 'depth', 'rs_id']
+                 '_mate_seeded', '_mate_searched', '_forced_mate',
+                 '_position_hash', 'depth', 'rs_id']
 
     def __init__(self, board: Optional[chess.Board] = None,
                  parent: Optional['MCTSNode'] = None,
@@ -70,6 +71,8 @@ class MCTSNode:
         self._game_over_cached: Optional[bool] = None  # None = not yet checked
         self._terminal_value_cached: Optional[float] = None  # Cached terminal value
         self._mate_seeded: bool = False  # Root already received mate-seeding visits
+        self._mate_searched: bool = False  # Root already got an immediate-mate scan
+        self._forced_mate = None  # (action_idx, move) when the root offers mate-in-1
         self._position_hash: Optional[int] = None  # Zobrist hash, cached on first materialisation
         # Cached depth from root — avoids O(depth) walk in _node_depth()
         self.depth = 0 if parent is None else parent.depth + 1
@@ -100,6 +103,8 @@ class MCTSNode:
         node._game_over_cached = None
         node._terminal_value_cached = None
         node._mate_seeded = False
+        node._mate_searched = False
+        node._forced_mate = None
         node._position_hash = None
         node.depth = parent.depth + 1
         return node
@@ -161,6 +166,7 @@ class MCTS:
                  adjudicate_scaling: float = 9.0,
                  mate_seeding: bool = False,
                  min_fresh_sims: int = 64,
+                 force_mate_in_one: bool = False,
                  inference_pipeline: int = 1):
         """
         Args:
@@ -185,6 +191,9 @@ class MCTS:
                 tree reuse, even when the recycled root already has the full
                 visit budget.  0 reproduces the historical
                 ``max(0, num_simulations - root.N)`` behaviour.
+            force_mate_in_one: If True and the root position has an immediate
+                checkmate, return that move one-hot in the visit policy and
+                as the selected move at every temperature.
         """
         self.network = network
         self.num_simulations = num_simulations
@@ -202,6 +211,7 @@ class MCTS:
         self.adjudicate_scaling = adjudicate_scaling
         self.mate_seeding = mate_seeding
         self.min_fresh_sims = max(0, int(min_fresh_sims))
+        self.force_mate_in_one = bool(force_mate_in_one)
 
         # Async inference pipelining: number of leaf-batches kept in flight so
         # tree work (selection / expansion / backprop) overlaps the network
@@ -265,6 +275,8 @@ class MCTS:
             # benefits from accumulated visit information.
             child.visit_count = 0
             child._mate_seeded = False
+            child._mate_searched = False
+            child._forced_mate = None
 
             return child
 
@@ -287,6 +299,14 @@ class MCTS:
             best_move: The selected move
             stats: Dictionary with search statistics (avg_depth, etc.)
         """
+        # Immediate-mate override: detect before expansion so a decided root
+        # never touches the network and runs zero simulations.
+        if (self.force_mate_in_one and game_api.is_game("chess")
+                and self._find_forced_mate(root)):
+            visit_policy = np.zeros(game_api.num_actions(), dtype=np.float32)
+            visit_policy[root._forced_mate[0]] = 1.0
+            return visit_policy, root._forced_mate[1], self._forced_mate_stats(root)
+
         # Expand root node first
         if not root.is_expanded:
             self._expand_node(root)
@@ -955,6 +975,68 @@ class MCTS:
             child._terminal_value_cached = -1.0
             self._backpropagate(child, -1.0)
 
+    def _find_forced_mate(self, root: MCTSNode) -> bool:
+        """Detect an immediate checkmate at the root and cache the move.
+
+        Runs once per root, scans every legal root move, and picks the first
+        mating move in canonical policy-index order -- no dependence on visit
+        counts or on how little any child was searched.  On a fresh
+        (unexpanded) root the probe boards are built directly from the root
+        position, so neither expansion, children, nor a network call are made.
+
+        Returns True when a mating move was found (cached in
+        ``root._forced_mate``), False otherwise.
+        """
+        if root._mate_searched:
+            return root._forced_mate is not None
+        root._mate_searched = True
+
+        if not root.is_expanded:
+            # Pre-expansion scan: one probe board per legal move, no children.
+            board = root.board
+            best = None
+            for move in game_api.legal_moves(board):
+                probe = board.copy()
+                game_api.apply(probe, move)
+                if not probe.is_checkmate():
+                    continue
+                idx = move_to_policy_index(move, board)
+                if idx is None:
+                    continue
+                if best is None or idx < best[0]:
+                    best = (idx, move)
+            if best is not None:
+                root._forced_mate = best
+            return best is not None
+
+        # Child-keyed scan for already-expanded / reused roots.
+        for action_idx, child in sorted(root.children.items()):
+            if child.board.is_checkmate():
+                root._forced_mate = (action_idx, child.move)
+                return True
+        return False
+
+    def _forced_mate_stats(self, root: MCTSNode) -> dict:
+        """Stats dict for a short-circuited forced-mate move.
+
+        ``num_simulations`` / ``avg_depth`` are 0 (no search ran); the
+        ``forced_mate`` flag lets the self-play loop drop this move from the
+        per-move effort statistics.
+        """
+        inherited_root_n = int(root.N)
+        return {
+            'avg_depth': 0.0,
+            'max_depth': 0,
+            'num_simulations': 0,
+            'inherited_root_n': inherited_root_n,
+            'budget_new_sims': max(0, self.num_simulations - inherited_root_n),
+            'target_new_sims': 0,
+            'min_fresh_sims': self.min_fresh_sims,
+            'reused_root': bool(inherited_root_n > 0),
+            'floor_fired': False,
+            'forced_mate': True,
+        }
+
     def _get_visit_policy(self, root: MCTSNode) -> Tuple[np.ndarray, chess.Move]:
         """Compute visit count distribution and select move.
 
@@ -967,6 +1049,12 @@ class MCTS:
             best_move: Selected move (most visited)
         """
         visit_policy = np.zeros(game_api.num_actions(), dtype=np.float32)
+
+        # Immediate mate found at the root: one-hot policy, forced move.
+        forced = getattr(root, '_forced_mate', None)
+        if forced is not None:
+            visit_policy[forced[0]] = 1.0
+            return visit_policy, forced[1]
 
         if not root.children:
             # No children -- return empty
@@ -1025,6 +1113,13 @@ class MCTS:
             move: Selected move
         """
         visit_policy = np.zeros(game_api.num_actions(), dtype=np.float32)
+
+        # Immediate mate found at the root: one-hot policy, forced move,
+        # independent of temperature.
+        forced = getattr(root, '_forced_mate', None)
+        if forced is not None:
+            visit_policy[forced[0]] = 1.0
+            return visit_policy, forced[1]
 
         if not root.children:
             return visit_policy, None

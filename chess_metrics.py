@@ -109,6 +109,27 @@ def fresh_sim_stats(games):
     }
 
 
+def forced_mate_stats(games):
+    """Forced mate-in-one diagnostics across the window.
+
+    ``forced_moves`` counts root positions where the engine played an
+    immediate checkmate without running a search (``force_mate_in_one``).
+    Those moves are excluded from the fresh-sims statistics list, so the
+    denominator is searched moves + forced moves.
+    """
+    forced = 0
+    moves = 0
+    for g in games:
+        forced += int(g.get('forced_moves', 0) or 0)
+        moves += len(g.get('fresh_sims') or []) + int(g.get('forced_moves', 0) or 0)
+    if not moves:
+        return {}
+    return {
+        'forced_mate_moves_mean': float(forced) / len(games),
+        'forced_mate_share': float(forced) / moves,
+    }
+
+
 # ── policy metrics (prior vs visit) ─────────────────────────────────────────
 
 def _log_pos(x):
@@ -240,6 +261,7 @@ class RollingChessStats:
             'length': int(game_info['length']),
             'fresh_sims': list(game_info.get('fresh_sims') or []),
             'floor_fired': list(game_info.get('floor_fired') or []),
+            'forced_moves': int(game_info.get('forced_moves', 0) or 0),
         })
         rec = []
         for ply in self.phase_plies:
@@ -263,6 +285,7 @@ class RollingChessStats:
         out.update(termination_mix(self._games))
         out.update(length_stats(self._games))
         out.update(fresh_sim_stats(self._games))
+        out.update(forced_mate_stats(self._games))
         return out
 
     def compute(self, predict_batch, sample_batch):
